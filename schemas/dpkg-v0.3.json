@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dpkg.spec/schemas/dpkg-v0.3.json",
+  "title": "DPKG Aggregate Schema v0.3",
+  "description": "Aggregate schema bundling manifest, claim frontmatter, and provenance event definitions via $ref. External readers pin this URL.",
+  "type": "object",
+  "properties": {
+    "manifest": {
+      "$ref": "https://dpkg.spec/schemas/manifest.schema.json"
+    },
+    "claim_frontmatter": {
+      "$ref": "https://dpkg.spec/schemas/claim-frontmatter.schema.json"
+    },
+    "provenance_event": {
+      "$ref": "https://dpkg.spec/schemas/provenance-event.schema.json"
+    }
+  },
+  "$defs": {
+    "manifest": {
+      "$ref": "https://dpkg.spec/schemas/manifest.schema.json"
+    },
+    "claim_frontmatter": {
+      "$ref": "https://dpkg.spec/schemas/claim-frontmatter.schema.json"
+    },
+    "provenance_event": {
+      "$ref": "https://dpkg.spec/schemas/provenance-event.schema.json"
+    }
+  }
+}

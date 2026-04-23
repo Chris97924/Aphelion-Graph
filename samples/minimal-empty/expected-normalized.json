@@ -1,0 +1,1 @@
+{"$schema":"../../schemas/expected-normalized-v0.3.json","expected_normalized_version":"0.3","notes":{"claim_ids":[],"demonstrates":"smallest legal DPKG: zero claims, empty provenance file","event_count":0,"final_states":{}},"validator_verdict":"valid"}

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dpkg.spec/schemas/diff-v0.3.json",
+  "title": "DPKG Diff v0.3",
+  "description": "Machine contract for the output of `dpkg diff`. Four layers: manifest, claim set, per-claim evidence, provenance timeline.",
+  "type": "object",
+  "required": [
+    "diff_spec_version",
+    "a",
+    "b",
+    "manifest_diff",
+    "claim_set_diff",
+    "per_claim_evidence_diff",
+    "provenance_timeline_diff"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "diff_spec_version": {"type": "string", "const": "0.3.0"},
+    "a": {"type": "string"},
+    "b": {"type": "string"},
+    "manifest_diff": {
+      "type": "object",
+      "required": ["added_fields", "removed_fields", "changed_fields"],
+      "additionalProperties": false,
+      "properties": {
+        "added_fields": {"type": "array", "items": {"type": "string"}},
+        "removed_fields": {"type": "array", "items": {"type": "string"}},
+        "changed_fields": {"type": "object"}
+      }
+    },
+    "claim_set_diff": {
+      "type": "object",
+      "required": ["added_claim_ids", "removed_claim_ids", "changed_claim_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "added_claim_ids": {"type": "array", "items": {"type": "string"}},
+        "removed_claim_ids": {"type": "array", "items": {"type": "string"}},
+        "changed_claim_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "per_claim_evidence_diff": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "hash_change": {
+            "type": "object",
+            "required": ["before", "after"],
+            "properties": {"before": {}, "after": {}}
+          },
+          "state_change": {
+            "type": "object",
+            "required": ["before", "after"],
+            "properties": {"before": {}, "after": {}}
+          },
+          "tags": {
+            "type": "object",
+            "required": ["added", "removed"],
+            "properties": {
+              "added": {"type": "array", "items": {"type": "string"}},
+              "removed": {"type": "array", "items": {"type": "string"}}
+            }
+          },
+          "labels": {
+            "type": "object",
+            "required": ["added", "removed"],
+            "properties": {
+              "added": {"type": "array", "items": {"type": "string"}},
+              "removed": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      }
+    },
+    "provenance_timeline_diff": {
+      "type": "object",
+      "required": ["added_event_ids", "removed_event_ids", "reordered_event_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "added_event_ids": {"type": "array", "items": {"type": "string"}},
+        "removed_event_ids": {"type": "array", "items": {"type": "string"}},
+        "reordered_event_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dpkg.spec/schemas/expected-normalized-v0.3.json",
+  "title": "DPKG Sample Expected Normalized View",
+  "description": "Machine-checkable snapshot that sample producers agree on. A conformant DPKG reader that normalizes sample inputs MUST match the claim_ids / event_count / final_states / validator_verdict declared here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["expected_normalized_version", "validator_verdict", "notes"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "expected_normalized_version": {
+      "type": "string",
+      "const": "0.3"
+    },
+    "validator_verdict": {
+      "type": "string",
+      "enum": ["valid", "invalid"]
+    },
+    "error_code": {
+      "type": "string",
+      "pattern": "^ERR-(SYN|SEM)-[A-Z0-9-]+$",
+      "description": "Required when validator_verdict = invalid."
+    },
+    "notes": {
+      "type": "object",
+      "description": "Free-form but machine-checkable: claim_ids, event_count, final_states, plus any sample-specific keys.",
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "validator_verdict": { "const": "invalid" } } },
+      "then": { "required": ["error_code"] }
+    }
+  ]
+}

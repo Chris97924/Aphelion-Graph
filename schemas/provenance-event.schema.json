@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dpkg.spec/schemas/provenance-event.schema.json",
+  "title": "DPKG Provenance Event",
+  "description": "One line of provenance.jsonl. See spec/provenance.md and spec/identity-event.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["actor", "claim_id", "event_id", "event_type", "timestamp"],
+  "properties": {
+    "actor": { "type": "string", "minLength": 1 },
+    "claim_id": { "$ref": "#/$defs/UuidV7" },
+    "claim_instance_id": { "$ref": "#/$defs/UuidV7" },
+    "event_id": { "$ref": "#/$defs/UuidV7" },
+    "event_type": {
+      "type": "string",
+      "enum": ["create", "publish", "reaffirm", "revise", "supersede", "withdraw"]
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Application-defined; validators MUST ignore."
+    },
+    "prev_event_id": { "$ref": "#/$defs/UuidV7" },
+    "reason": { "type": "string", "minLength": 1 },
+    "superseded_by_claim_id": { "$ref": "#/$defs/UuidV7" },
+    "timestamp": { "$ref": "#/$defs/TimestampUtcZ" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "event_type": { "enum": ["create", "revise", "supersede"] } },
+        "required": ["event_type"]
+      },
+      "then": { "required": ["claim_instance_id"] }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "enum": ["reaffirm", "withdraw", "publish"] } },
+        "required": ["event_type"]
+      },
+      "then": { "not": { "required": ["claim_instance_id"] } }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "supersede" } },
+        "required": ["event_type"]
+      },
+      "then": { "required": ["superseded_by_claim_id"] }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "not": { "const": "create" } } },
+        "required": ["event_type"]
+      },
+      "then": { "required": ["prev_event_id"] }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "create" } },
+        "required": ["event_type"]
+      },
+      "then": { "not": { "required": ["prev_event_id"] } }
+    }
+  ],
+  "$defs": {
+    "UuidV7": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "TimestampUtcZ": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{3})?Z$"
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"$schema":"../../schemas/expected-normalized-v0.3.json","expected_normalized_version":"0.3","notes":{"claim_ids":["01930001-0000-7000-8000-00000000aaaa"],"demonstrates":"single supports-relationship claim with one create event","event_count":1,"final_states":{"01930001-0000-7000-8000-00000000aaaa":"active"}},"validator_verdict":"valid"}

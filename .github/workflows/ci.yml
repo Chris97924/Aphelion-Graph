@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows + py3.11 listed first: per 2026-04-19 cp950 precedent it is
+        # the most fragile cell, so surfacing failures there earliest saves
+        # the later cells from wasted runtime.
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.10", "3.12"]
+
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests with coverage
+        run: |
+          pytest --cov=src --cov-report=term-missing --cov-fail-under=80
+
+      - name: Smoke test init -> validate -> verify (bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/dpkg-smoke"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          dpkg --version
+          dpkg init "$WORK/pkg"
+          dpkg validate "$WORK/pkg"
+          dpkg pack "$WORK/pkg" "$WORK/out.dpkg.tar"
+          dpkg unpack "$WORK/out.dpkg.tar" "$WORK/unpacked"
+          dpkg verify "$WORK/unpacked"
+
+      - name: Smoke test init -> validate -> verify (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'dpkg-smoke'
+          if (Test-Path $work) { Remove-Item -Recurse -Force $work }
+          New-Item -ItemType Directory -Path $work | Out-Null
+          dpkg --version
+          dpkg init "$work/pkg"
+          dpkg validate "$work/pkg"
+          dpkg pack "$work/pkg" "$work/out.dpkg.tar"
+          dpkg unpack "$work/out.dpkg.tar" "$work/unpacked"
+          dpkg verify "$work/unpacked"

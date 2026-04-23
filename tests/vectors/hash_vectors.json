@@ -1,0 +1,91 @@
+{
+  "rfc": "RFC 8785 + SHA-256",
+  "vectors": [
+    {
+      "canonical_bytes_hex": "7b7d",
+      "expected_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "input_payload": {},
+      "name": "empty-projection",
+      "rationale": "Empty identity projection -> {} -> SHA-256(b\"{}\")"
+    },
+    {
+      "canonical_bytes_hex": "7b2274797065223a2266616374227d",
+      "expected_hash": "43ce4032f4fd90fada6bcd85b52f95a040cc48cfe6a2b71b7cf1292ebff504fa",
+      "input_payload": {
+        "type": "fact"
+      },
+      "name": "single-ascii-type",
+      "rationale": "One ASCII string value; canonical bytes = {\"type\":\"fact\"}"
+    },
+    {
+      "canonical_bytes_hex": "7b2274797065223a2266616374227d",
+      "expected_hash": "43ce4032f4fd90fada6bcd85b52f95a040cc48cfe6a2b71b7cf1292ebff504fa",
+      "input_payload": {
+        "created_at": "2026-04-21T00:00:00Z",
+        "type": "fact",
+        "updated_at": "2026-04-22T00:00:00Z"
+      },
+      "name": "excluded-field-invariance",
+      "rationale": "created_at/updated_at are excluded; hash must match single-ascii-type"
+    },
+    {
+      "canonical_bytes_hex": "7b227375626a656374223a22636166c3a9222c2274797065223a2266616374227d",
+      "expected_hash": "ae66acad339e1dc955e713bab5ec37b357f8dd3a41c0f4d58c5394b88edf3a08",
+      "input_payload": {
+        "subject": "café",
+        "type": "fact"
+      },
+      "name": "nfc-vs-nfd",
+      "rationale": "NFD input normalizes to NFC before canonicalization"
+    },
+    {
+      "canonical_bytes_hex": "7b226c6162656c73223a7b2261223a226669727374222c227a223a226c617374227d2c2274797065223a2266616374227d",
+      "expected_hash": "a7ab0a8fcaa1a9c9cab743207c74a84c4bbbff6b3c42fb3952e5e3da74760258",
+      "input_payload": {
+        "labels": {
+          "a": "first",
+          "z": "last"
+        },
+        "type": "fact"
+      },
+      "name": "nested-labels-sort",
+      "rationale": "Nested object keys must be JCS-sorted"
+    },
+    {
+      "canonical_bytes_hex": "7b2274616773223a5b2261222c226d222c227a225d2c2274797065223a2266616374227d",
+      "expected_hash": "17575e283edececb8e4763082fc697348bd73d4a2f0780766a8a30973b9931f5",
+      "input_payload": {
+        "tags": [
+          "z",
+          "a",
+          "m"
+        ],
+        "type": "fact"
+      },
+      "name": "tags-reordered",
+      "rationale": "tags sorted ascending before canonicalization"
+    },
+    {
+      "canonical_bytes_hex": "7b2274797065223a2266616374227d",
+      "expected_hash": "43ce4032f4fd90fada6bcd85b52f95a040cc48cfe6a2b71b7cf1292ebff504fa",
+      "input_payload": {
+        "internal:debug": "x",
+        "parallax:aggregation_level": "raw",
+        "type": "fact"
+      },
+      "name": "reserved-prefix-stripped",
+      "rationale": "parallax:/internal: reserved prefixes excluded from hash"
+    },
+    {
+      "canonical_bytes_hex": "7b2274797065223a2266616374227d",
+      "expected_hash": "43ce4032f4fd90fada6bcd85b52f95a040cc48cfe6a2b71b7cf1292ebff504fa",
+      "input_payload": {
+        "claim_id": "0193xxxx",
+        "package_id": "abc",
+        "type": "fact"
+      },
+      "name": "nonidentity-dropped",
+      "rationale": "Non-identity fields (claim_id, package_id) dropped from projection"
+    }
+  ]
+}

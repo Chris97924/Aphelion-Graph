@@ -1,0 +1,1 @@
+{"$schema":"../../schemas/expected-normalized-v0.3.json","expected_normalized_version":"0.3","notes":{"claim_ids":["01930005-0000-7000-8000-00000000aaaa"],"demonstrates":"NFD input in claim body must be NFC-normalized by validator","event_count":1,"nfc_subject":"café"},"validator_verdict":"valid"}

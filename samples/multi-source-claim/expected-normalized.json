@@ -1,0 +1,1 @@
+{"$schema":"../../schemas/expected-normalized-v0.3.json","expected_normalized_version":"0.3","notes":{"claim_ids":["01930006-0000-7000-8000-00000000aaaa"],"demonstrates":"one claim reaffirmed by multiple actors keeps a single claim_instance_id","event_count":3,"source_actors":["chris","codex","gemini"]},"validator_verdict":"valid"}

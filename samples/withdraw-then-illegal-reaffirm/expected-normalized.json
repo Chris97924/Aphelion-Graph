@@ -1,0 +1,1 @@
+{"$schema":"../../schemas/expected-normalized-v0.3.json","error_code":"ERR-SEM-LIFECYCLE-ILLEGAL","expected_normalized_version":"0.3","notes":{"claim_ids":["01930008-0000-7000-8000-00000000aaaa"],"demonstrates":"reaffirm on a withdrawn claim is an illegal transition; validator MUST reject","illegal_event_id":"01930008-0000-7000-8000-eeee00000003"},"validator_verdict":"invalid"}
