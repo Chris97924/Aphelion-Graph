@@ -153,7 +153,7 @@
   3NN VERSION, 4NN FORMAT, 5NN CONSISTENCY, 6NN SECURITY) plus a 9NN GENERIC
   fallback. Single source of truth for every machine-readable error code
   emitted by the package. See `spec/error-codes.md`.
-- `aphelion.initializer` + `aphelion init` CLI subcommand: creates a Aphelion skeleton
+- `aphelion.initializer` + `aphelion init` CLI subcommand: creates an Aphelion skeleton
   (`manifest.json`, `provenance.jsonl`, `claims/`) in an empty destination.
   Default refuses an existing package; overwrite requires both `--force`
   **and** `--i-know-what-im-doing` (two-key safety gesture). Supports

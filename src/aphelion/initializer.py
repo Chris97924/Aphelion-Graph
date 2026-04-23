@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from aphelion import __version__ as DPKG_VERSION, SCHEMA_VERSION_MAX
+from aphelion import __version__ as APHELION_VERSION, SCHEMA_VERSION_MAX
 from aphelion.canonical_json import dumps as canonical_dumps, normalize
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
@@ -26,7 +26,7 @@ from aphelion.validator import TIMESTAMP_RE, UUID_V7_RE
 SUPPORTED_SPEC_VERSIONS: frozenset[str] = frozenset(
     {"0.2.0", "0.2.1", "0.2.2", "0.3.0"}
 )
-DEFAULT_SPEC_VERSION = DPKG_VERSION
+DEFAULT_SPEC_VERSION = APHELION_VERSION
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,7 @@ def _iso_now() -> str:
 
 
 def init_skeleton(opts: InitOptions) -> dict[str, Any]:
-    """Materialize a Aphelion skeleton under ``opts.dest``.
+    """Materialize an Aphelion skeleton under ``opts.dest``.
 
     Returns the written manifest dict on success. Raises :class:`SchemaError`
     on refusal (existing data, unsupported spec version, missing confirmation).

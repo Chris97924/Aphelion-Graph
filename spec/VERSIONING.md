@@ -16,7 +16,7 @@ Aphelion maintains two independent semver strings:
 
 Rationale (from xcouncil 2026-04-21 Codex observation): adapter mapping
 changes should not bump the Aphelion core. Separating the two axes lets
-Parallax evolve `exchange_profile_version` without forcing a Aphelion spec
+Parallax evolve `exchange_profile_version` without forcing an Aphelion spec
 bump, and vice versa.
 
 ## 2. What counts as a semver change

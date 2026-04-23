@@ -33,7 +33,7 @@ _TS_ANY_FRACTION_RE = re.compile(
 
 
 def check_timestamp(field: str, value: str) -> None:
-    """Raise ``SchemaError`` if ``value`` is not a Aphelion-legal timestamp."""
+    """Raise ``SchemaError`` if ``value`` is not an Aphelion-legal timestamp."""
     if not isinstance(value, str):
         raise SchemaError(
             code=ErrorCode.TYPE_MISMATCH,
@@ -57,7 +57,7 @@ def check_timestamp(field: str, value: str) -> None:
 
 
 def timestamp_to_ms(value: str) -> int:
-    """Return UTC epoch milliseconds for a Aphelion-legal timestamp.
+    """Return UTC epoch milliseconds for an Aphelion-legal timestamp.
 
     Caller is expected to have passed ``check_timestamp`` first.
     """

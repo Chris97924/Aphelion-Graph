@@ -1,6 +1,6 @@
 # Aphelion — Deterministic Package Format
 
-Reference CLI implementation (v0.2.2). **Zero runtime dependencies** (stdlib
+Reference CLI implementation (v0.3.0). **Zero runtime dependencies** (stdlib
 only). Python 3.10+.
 
 - CI: Linux / macOS / Windows × Python 3.10 / 3.11 / 3.12 — 9-cell matrix
@@ -14,8 +14,8 @@ only). Python 3.10+.
 pip install -e .
 
 # 2. Check the version — shows package + spec + schema
-aphelion --version
-# aphelion 0.2.2 (spec 0.2.2, schema 1.0)
+aphe --version
+# aphelion 0.3.0 (spec 0.3.0, schema 1.1)
 
 # 3. Create an empty skeleton
 aphelion init ./my-pkg
@@ -138,10 +138,6 @@ aphelion verify UNPACKED_DIR/
 
 See [`spec/error-codes.md`](spec/error-codes.md) for the full
 `PX_E_<CCNN>` registry.
-
-## Deferred
-
-- `diff` → v0.3.0 (semantic archive diff + Parallax exchange contract)
 
 ## Exit codes
 
