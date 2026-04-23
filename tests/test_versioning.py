@@ -16,8 +16,8 @@ import copy
 
 import pytest
 
-from dpkg.errors import SchemaError
-from dpkg.validator import (
+from aphelion.errors import SchemaError
+from aphelion.validator import (
     SEMVER_RE,
     SUPPORTED_SCHEMA_VERSIONS,
     validate_manifest,
@@ -30,7 +30,7 @@ BASE = {
     "format_version": "1.1",
     "license": "CC0-1.0",
     "package_id": "01930000-0000-7000-8000-000000000001",
-    "producer": "dpkg-test",
+    "producer": "aphelion-test",
     "provenance_path": "provenance.jsonl",
 }
 
@@ -111,7 +111,7 @@ def test_semver_accepts_prerelease_and_multidigit(value: str) -> None:
 
 def test_lenient_mode_downgrades_unknown_minor_to_warning() -> None:
     """Unknown MINOR on a known MAJOR becomes a warning in lenient mode."""
-    from dpkg.validator import validate_package
+    from aphelion.validator import validate_package
 
     m = copy.deepcopy(BASE)
     m["format_version"] = "1.99"
@@ -121,7 +121,7 @@ def test_lenient_mode_downgrades_unknown_minor_to_warning() -> None:
 
 def test_strict_mode_is_default() -> None:
     """Omitting ``mode`` behaves as ``strict``."""
-    from dpkg.validator import validate_package
+    from aphelion.validator import validate_package
 
     m = copy.deepcopy(BASE)
     m["format_version"] = "1.99"
@@ -132,7 +132,7 @@ def test_strict_mode_is_default() -> None:
 
 def test_lenient_mode_still_rejects_unknown_major() -> None:
     """Unknown MAJOR is always fatal, even lenient."""
-    from dpkg.validator import validate_package
+    from aphelion.validator import validate_package
 
     m = copy.deepcopy(BASE)
     m["format_version"] = "2.0"
@@ -142,7 +142,7 @@ def test_lenient_mode_still_rejects_unknown_major() -> None:
 
 
 def test_invalid_mode_raises_value_error() -> None:
-    from dpkg.validator import validate_package
+    from aphelion.validator import validate_package
 
     with pytest.raises(ValueError):
         validate_package(copy.deepcopy(BASE), [], mode="bogus")

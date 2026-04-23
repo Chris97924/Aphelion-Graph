@@ -1,4 +1,4 @@
-"""Canonical DPKG error code registry (v0.2.1+).
+"""Canonical Aphelion error code registry (v0.2.1+).
 
 Codes follow the scheme ``PX_E_<CCNN>`` where ``CC`` is the two-digit
 **category** band and ``NN`` is the sequence within that band:

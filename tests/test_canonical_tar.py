@@ -1,4 +1,4 @@
-"""Unit tests for dpkg.canonical_tar."""
+"""Unit tests for aphelion.canonical_tar."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import hashlib
 
 import pytest
 
-from dpkg.canonical_tar import MODE_DIR, MODE_FILE, TarMember, pack, read_members
-from dpkg.errors import SchemaError
+from aphelion.canonical_tar import MODE_DIR, MODE_FILE, TarMember, pack, read_members
+from aphelion.errors import SchemaError
 
 
 def test_deterministic_same_input_same_bytes() -> None:

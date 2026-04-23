@@ -1,4 +1,4 @@
-"""Exercise `dpkg validate` against every samples/*/ package.
+"""Exercise `aphelion validate` against every samples/*/ package.
 
 For each sample with ``validator_verdict == "valid"``, the CLI must exit 0.
 For each sample with ``validator_verdict == "invalid"``, the CLI must exit

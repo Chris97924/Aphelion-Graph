@@ -1,4 +1,4 @@
-"""Forbidden-terms scanner for the DPKG repository.
+"""Forbidden-terms scanner for the Aphelion repository.
 
 Scans text files (.md, .yml, .yaml, .json, .jsonl, .py, .toml) for any term
 listed in .forbidden-terms.txt (case-insensitive). Skips binary blobs,

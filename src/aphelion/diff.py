@@ -1,6 +1,6 @@
-"""Layered ``dpkg diff`` (v0.3.0).
+"""Layered ``aphelion diff`` (v0.3.0).
 
-Produces a four-layer diff between two on-disk DPKG packages:
+Produces a four-layer diff between two on-disk Aphelion packages:
 
 1. ``manifest_diff`` — top-level manifest field additions / removals /
    changes (excluding volatile fields such as ``created_at``).
@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from dpkg.canonical_json import loads
+from aphelion.canonical_json import loads
 
 
 _HUMAN_BANNER = (

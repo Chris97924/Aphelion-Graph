@@ -1,4 +1,4 @@
-"""Unit tests for dpkg.validator syntax-layer checks."""
+"""Unit tests for aphelion.validator syntax-layer checks."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import copy
 
 import pytest
 
-from dpkg.errors import SchemaError
-from dpkg.validator import (
+from aphelion.errors import SchemaError
+from aphelion.validator import (
     validate_manifest,
     validate_package,
     validate_provenance_event,
@@ -36,7 +36,7 @@ BASE_MANIFEST = {
     "format_version": "1.0",
     "license": "Apache-2.0",
     "package_id": UUID_PKG,
-    "producer": "dpkg-test",
+    "producer": "aphelion-test",
     "provenance_path": "provenance.jsonl",
 }
 

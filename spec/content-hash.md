@@ -1,4 +1,4 @@
-# DPKG content_hash — Canonicalization & Identity
+# Aphelion content_hash — Canonicalization & Identity
 
 **Version:** 0.3.0
 **Status:** Normative

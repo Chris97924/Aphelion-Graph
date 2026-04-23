@@ -11,11 +11,11 @@ import copy
 import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
-from dpkg.canonical_json import dumps, loads, normalize
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
-from dpkg.initializer import InitOptions, init_skeleton
-from dpkg.validator import UUID_V7_RE, validate_manifest
+from aphelion.canonical_json import dumps, loads, normalize
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
+from aphelion.initializer import InitOptions, init_skeleton
+from aphelion.validator import UUID_V7_RE, validate_manifest
 
 
 UUID = "0191aaaa-0000-7000-8000-00000000aaaa"
@@ -38,7 +38,7 @@ BASE_MANIFEST = {
     "format_version": "1.0",
     "license": "Apache-2.0",
     "package_id": UUID_PKG,
-    "producer": "dpkg-test",
+    "producer": "aphelion-test",
     "provenance_path": "provenance.jsonl",
 }
 

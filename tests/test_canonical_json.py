@@ -1,4 +1,4 @@
-"""Unit tests for dpkg.canonical_json."""
+"""Unit tests for aphelion.canonical_json."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import unicodedata
 
 import pytest
 
-from dpkg.canonical_json import dumps, loads, normalize
-from dpkg.errors import SchemaError
+from aphelion.canonical_json import dumps, loads, normalize
+from aphelion.errors import SchemaError
 
 
 def test_worked_example_matches_spec() -> None:

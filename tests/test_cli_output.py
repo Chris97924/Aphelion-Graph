@@ -1,8 +1,8 @@
 """Tests for the v0.2.2 CLI output layer (``--json`` / ``--no-color`` /
 ``--version`` dual display).
 
-These exercise the :class:`dpkg.output.Writer` integration in
-``dpkg.cli.main``. The existing ``test_cli.py`` covers error branches;
+These exercise the :class:`aphelion.output.Writer` integration in
+``aphelion.cli.main``. The existing ``test_cli.py`` covers error branches;
 this file covers the success-path output contract.
 """
 
@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from dpkg import __version__, SPEC_VERSION, SCHEMA_VERSION_MAX
-from dpkg.output import Writer, detect_color
+from aphelion import __version__, SPEC_VERSION, SCHEMA_VERSION_MAX
+from aphelion.output import Writer, detect_color
 
 from conftest import FakeTTY, run_cli as _run
 
@@ -88,7 +88,7 @@ def test_human_mode_stdout_is_plain_text(tmp_path: Path) -> None:
     assert code == 0, err
     # StringIO is not a tty -> color auto-off, output must be ANSI-free.
     assert "\x1b[" not in out
-    assert "Initialized empty DPKG skeleton" in out
+    assert "Initialized empty Aphelion skeleton" in out
     assert "Next steps:" in out
 
 
@@ -238,7 +238,7 @@ def test_full_pipeline_init_validate_pack_unpack_verify_json(tmp_path: Path) -> 
     """End-to-end smoke of the exact five-step flow the CI matrix runs,
     ensuring each command emits a parseable JSON success line."""
     pkg = tmp_path / "pkg"
-    archive = tmp_path / "out.dpkg.tar"
+    archive = tmp_path / "out.aphelion.tar"
     unpacked = tmp_path / "unpacked"
 
     for argv, expected_cmd in [

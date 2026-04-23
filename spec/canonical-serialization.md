@@ -1,4 +1,4 @@
-# DPKG Canonical Serialization Spec
+# Aphelion Canonical Serialization Spec
 
 **Version:** 1.0
 **Status:** Normative
@@ -6,7 +6,7 @@
 
 ## Purpose
 
-Two independent implementers reading this document MUST produce byte-identical DPKG artifacts from the same logical input. Reserved keywords MUST, MUST NOT, SHOULD, MAY follow RFC 2119.
+Two independent implementers reading this document MUST produce byte-identical Aphelion artifacts from the same logical input. Reserved keywords MUST, MUST NOT, SHOULD, MAY follow RFC 2119.
 
 ---
 
@@ -73,7 +73,7 @@ Any conformant implementer MUST reproduce this exact hash from the exact 20 inpu
 
 ## Rule 5 — tar Entry Canonicalization
 
-When packaging into `*.dpkg.tar`:
+When packaging into `*.aphelion.tar`:
 
 1. **Format**: POSIX ustar. **ustar `prefix`+`name` split is FORBIDDEN.** Any entry whose path exceeds 100 bytes OR contains any non-ASCII byte MUST use a pax extended header immediately preceding the ustar entry. The pax header MUST contain **exactly one record**: `path=<value>`. No `mtime`, `atime`, `ctime`, `uid`, `gid`, `uname`, `gname`, `size`, or custom records may be emitted. When future rules add additional pax records, they MUST appear in alphabetical order by key.
 2. **Entry order**: entries MUST appear in lexicographic order by full path (ASCII codepoint). Directory-prefix collisions (e.g. `claims/a.md` vs `claims/a/b.md`) resolve by direct codepoint comparison of the full path string; `.` (0x2E) < `/` (0x2F), so `claims/a.md` sorts before `claims/a/b.md`.
@@ -114,8 +114,8 @@ Given identical logical input, an implementer MUST produce identical bytes for:
 - [ ] `manifest.json` (JSON canonical form)
 - [ ] every `claim.md` (YAML canonical frontmatter + LF-normalized body)
 - [ ] `provenance.jsonl` (each line JSON-canonical, LF terminated)
-- [ ] `package.dpkg.tar` (ustar canonical form)
-- [ ] `package.dpkg.tar.gz` (see `packaging.md` Rule 3 for gzip determinism)
-- [ ] `package.dpkg.tar.gz.sha256`
+- [ ] `package.aphelion.tar` (ustar canonical form)
+- [ ] `package.aphelion.tar.gz` (see `packaging.md` Rule 3 for gzip determinism)
+- [ ] `package.aphelion.tar.gz.sha256`
 
 If any of the above differs between two conformant implementers, this document is defective — file an issue against the spec.

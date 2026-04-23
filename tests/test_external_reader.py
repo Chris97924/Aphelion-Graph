@@ -4,7 +4,7 @@ These tests guard two properties:
 
   1. The reader classifies every sample under ``samples/`` with the
      same verdict as its ``expected-normalized.json``.
-  2. The reader has zero dependencies on the ``dpkg`` or ``parallax``
+  2. The reader has zero dependencies on the ``aphelion`` or ``parallax``
      packages — it is a stdlib-only demonstration that the wire format
      is self-describing.
 """
@@ -23,10 +23,10 @@ SAMPLES = ROOT / "samples"
 
 
 def test_reader_exists_and_is_stdlib_only() -> None:
-    """Static import scan: no ``dpkg`` / ``parallax`` / ``memory`` imports."""
+    """Static import scan: no ``aphelion`` / ``parallax`` / ``memory`` imports."""
     src = READER.read_text(encoding="utf-8")
     tree = ast.parse(src)
-    forbidden = {"dpkg", "parallax", "memory"}
+    forbidden = {"aphelion", "parallax", "memory"}
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

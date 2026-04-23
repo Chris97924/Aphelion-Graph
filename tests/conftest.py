@@ -1,4 +1,4 @@
-"""Shared pytest fixture helpers for DPKG tests."""
+"""Shared pytest fixture helpers for Aphelion tests."""
 
 from __future__ import annotations
 
@@ -23,13 +23,13 @@ class FakeTTY(io.StringIO):
 
 
 def run_cli(argv: list[str]) -> tuple[int, str, str]:
-    """Invoke ``dpkg.cli.main(argv)`` with stdout/stderr captured.
+    """Invoke ``aphelion.cli.main(argv)`` with stdout/stderr captured.
 
     Returns ``(exit_code, stdout, stderr)``. ``main`` converts argparse's
     ``SystemExit`` into a return code, but we still catch ``SystemExit`` as a
     safety net for the ``--version`` action path.
     """
-    from dpkg.cli import main as cli_main
+    from aphelion.cli import main as cli_main
 
     out = io.StringIO()
     err = io.StringIO()
@@ -96,10 +96,10 @@ def tmp_source(tmp_path: Path) -> Path:
         "format_version": "1.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
-        "producer": "dpkg-test",
+        "producer": "aphelion-test",
         "provenance_path": "provenance.jsonl",
     }
-    from dpkg.canonical_json import dumps, normalize
+    from aphelion.canonical_json import dumps, normalize
 
     (src / "manifest.json").write_bytes(dumps(normalize(manifest)))
     event = {

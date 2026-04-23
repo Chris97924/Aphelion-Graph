@@ -1,6 +1,6 @@
-"""DPKG error hierarchy + machine-readable JSON error emission.
+"""Aphelion error hierarchy + machine-readable JSON error emission.
 
-All error ``code`` values are drawn from :mod:`dpkg.error_codes`. Raising code
+All error ``code`` values are drawn from :mod:`aphelion.error_codes`. Raising code
 must never hard-code a string — always pass an ``ErrorCode`` member so the
 registry stays the single source of truth.
 """
@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from typing import IO, Union
 
-from dpkg.error_codes import ErrorCode
+from aphelion.error_codes import ErrorCode
 
 
 EXIT_OK = 0
@@ -29,8 +29,8 @@ def _code_str(code: CodeLike) -> str:
 
 
 @dataclass
-class DpkgError(Exception):
-    """Base for all DPKG-level failures with a machine-readable code."""
+class AphelionError(Exception):
+    """Base for all Aphelion-level failures with a machine-readable code."""
 
     code: CodeLike = ErrorCode.UNKNOWN
     msg: str = ""
@@ -44,26 +44,26 @@ class DpkgError(Exception):
 
 
 @dataclass
-class SchemaError(DpkgError):
+class SchemaError(AphelionError):
     """Syntax-layer failure: types, enums, required fields, format."""
 
 
 @dataclass
-class SecurityError(DpkgError):
+class SecurityError(AphelionError):
     """Archive extraction safety breach: traversal, bomb, disallowed member."""
 
 
 @dataclass
-class SemanticError(DpkgError):
+class SemanticError(AphelionError):
     """Cross-reference / consistency failure at the semantic layer."""
 
 
 @dataclass
-class VerificationError(DpkgError):
+class VerificationError(AphelionError):
     """Cryptographic / hash verification failure."""
 
 
-def emit_error(err: DpkgError, stream: IO[str] | None = None) -> None:
+def emit_error(err: AphelionError, stream: IO[str] | None = None) -> None:
     """Write a single JSON line describing the error to ``stream`` (default stderr)."""
     if stream is None:
         stream = sys.stderr
@@ -79,7 +79,7 @@ def emit_error(err: DpkgError, stream: IO[str] | None = None) -> None:
 
 
 def exit_code_for(err: BaseException) -> int:
-    """Map an exception to the canonical DPKG exit code."""
+    """Map an exception to the canonical Aphelion exit code."""
     if isinstance(err, (SchemaError, SecurityError, SemanticError, VerificationError)):
         return EXIT_VALIDATION
     return EXIT_GENERIC

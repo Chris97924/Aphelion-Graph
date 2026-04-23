@@ -1,4 +1,4 @@
-"""Targeted security-guard tests for ``dpkg.unpacker``.
+"""Targeted security-guard tests for ``aphelion.unpacker``.
 
 The fixture suite covers the common attack classes (traversal, absolute paths,
 symlink/hardlink, zip-bomb-by-file-size, file-count overflow). This file adds
@@ -25,9 +25,9 @@ from pathlib import Path
 
 import pytest
 
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SecurityError
-from dpkg.unpacker import ExtractPolicy, unpack
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SecurityError
+from aphelion.unpacker import ExtractPolicy, unpack
 
 
 def _write_tar(
@@ -75,7 +75,7 @@ def test_extract_policy_default_classmethod_returns_defaults() -> None:
 
 def test_package_total_bytes_limit_constant() -> None:
     """v0.3.0 spec/packaging.md §7 fixes 100 MiB total-archive ceiling."""
-    from dpkg.unpacker import PACKAGE_TOTAL_BYTES_LIMIT
+    from aphelion.unpacker import PACKAGE_TOTAL_BYTES_LIMIT
 
     assert PACKAGE_TOTAL_BYTES_LIMIT == 104_857_600
     assert ExtractPolicy().max_total_bytes == PACKAGE_TOTAL_BYTES_LIMIT
@@ -220,7 +220,7 @@ def test_streaming_per_file_bomb_rejected_via_chunked_loop(
     def _fake_open(*args, **kwargs):
         return _Wrapped(real_open(*args, **kwargs))
 
-    import dpkg.unpacker as unpacker_mod
+    import aphelion.unpacker as unpacker_mod
 
     monkeypatch.setattr(unpacker_mod.tarfile, "open", _fake_open)
 
@@ -260,7 +260,7 @@ def test_streaming_total_bytes_bomb_rejected(
     def _fake_open(*args, **kwargs):
         return _Wrapped(real_open(*args, **kwargs))
 
-    import dpkg.unpacker as unpacker_mod
+    import aphelion.unpacker as unpacker_mod
 
     monkeypatch.setattr(unpacker_mod.tarfile, "open", _fake_open)
 
@@ -300,7 +300,7 @@ def test_extractfile_returning_none_rejected(
     def _fake_open(*args, **kwargs):
         return _Wrapped(real_open(*args, **kwargs))
 
-    import dpkg.unpacker as unpacker_mod
+    import aphelion.unpacker as unpacker_mod
 
     monkeypatch.setattr(unpacker_mod.tarfile, "open", _fake_open)
 

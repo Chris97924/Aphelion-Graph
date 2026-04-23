@@ -1,7 +1,7 @@
 """Semantic verifier: post-unpack cross-reference checks.
 
-Raises :class:`dpkg.errors.SemanticError` / :class:`VerificationError` with
-codes drawn from :class:`dpkg.error_codes.ErrorCode` (5NN band).
+Raises :class:`aphelion.errors.SemanticError` / :class:`VerificationError` with
+codes drawn from :class:`aphelion.error_codes.ErrorCode` (5NN band).
 """
 
 from __future__ import annotations
@@ -10,10 +10,10 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from dpkg.canonical_json import loads
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SemanticError, VerificationError
-from dpkg.validator import validate_package
+from aphelion.canonical_json import loads
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SemanticError, VerificationError
+from aphelion.validator import validate_package
 
 
 def _load_events(path: Path) -> list[dict[str, Any]]:
@@ -27,7 +27,7 @@ def _load_events(path: Path) -> list[dict[str, Any]]:
 
 
 def verify(unpacked_dir: Path | str) -> None:
-    """Run the 4 semantic checks on an unpacked DPKG tree.
+    """Run the 4 semantic checks on an unpacked Aphelion tree.
 
     1. manifest hash ↔ actual claim file bytes (HASH_MISMATCH)
     2. archive file set ↔ manifest.claims paths (FILESET_DIVERGENCE)

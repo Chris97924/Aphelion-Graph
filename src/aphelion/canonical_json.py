@@ -1,4 +1,4 @@
-"""Canonical JSON serializer/parser for DPKG.
+"""Canonical JSON serializer/parser for Aphelion.
 
 Strict subset of JSON:
   * object keys sorted by Unicode codepoint
@@ -17,8 +17,8 @@ import json
 import unicodedata
 from typing import Any, Union
 
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
 
 
 JSONValue = Union[None, bool, int, str, list["JSONValue"], dict[str, "JSONValue"]]

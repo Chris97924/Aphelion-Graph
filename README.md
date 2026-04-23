@@ -1,4 +1,4 @@
-# DPKG — Deterministic Package Format
+# Aphelion — Deterministic Package Format
 
 Reference CLI implementation (v0.2.2). **Zero runtime dependencies** (stdlib
 only). Python 3.10+.
@@ -14,31 +14,31 @@ only). Python 3.10+.
 pip install -e .
 
 # 2. Check the version — shows package + spec + schema
-dpkg --version
-# dpkg 0.2.2 (spec 0.2.2, schema 1.0)
+aphelion --version
+# aphelion 0.2.2 (spec 0.2.2, schema 1.0)
 
 # 3. Create an empty skeleton
-dpkg init ./my-pkg
-#   [ok] Initialized empty DPKG skeleton in my-pkg
+aphelion init ./my-pkg
+#   [ok] Initialized empty Aphelion skeleton in my-pkg
 #   Next steps:
 #     1. Add claim files under my-pkg/claims/<uuid>.md
 #     2. Register each claim in manifest.json
-#     3. Run `dpkg validate my-pkg` to confirm.
+#     3. Run `aphelion validate my-pkg` to confirm.
 
 # 4. Validate (syntax + schema)
-dpkg validate ./my-pkg
+aphelion validate ./my-pkg
 #   [ok] my-pkg: syntax + schema OK (0 event(s))
 
 # 5. Pack -> uncompressed deterministic tar
-dpkg pack ./my-pkg ./my-pkg.dpkg.tar
-#   [ok] my-pkg -> my-pkg.dpkg.tar
+aphelion pack ./my-pkg ./my-pkg.aphelion.tar
+#   [ok] my-pkg -> my-pkg.aphelion.tar
 
 # 6. Unpack safely (streaming, path-traversal / zip-bomb hardened)
-dpkg unpack ./my-pkg.dpkg.tar ./unpacked
-#   [ok] my-pkg.dpkg.tar -> unpacked
+aphelion unpack ./my-pkg.aphelion.tar ./unpacked
+#   [ok] my-pkg.aphelion.tar -> unpacked
 
 # 7. Verify (semantic cross-reference: hash / fileset / chain / refs)
-dpkg verify ./unpacked
+aphelion verify ./unpacked
 #   [ok] unpacked: semantic cross-reference OK
 ```
 
@@ -56,7 +56,7 @@ Color is automatically disabled when stdout is not a tty or when the
 files / CI logs stays clean without any flag.
 
 ```bash
-$ dpkg --json validate ./my-pkg
+$ aphelion --json validate ./my-pkg
 {"command":"validate","event_count":0,"ok":true,"source":"./my-pkg","summary":"./my-pkg: syntax + schema OK (0 event(s))"}
 ```
 
@@ -64,7 +64,7 @@ Errors are **always** JSON lines on stderr (with or without `--json`) so
 shell pipelines can branch on the error code field:
 
 ```bash
-$ dpkg validate ./broken 2>&1 >/dev/null | head -1
+$ aphelion validate ./broken 2>&1 >/dev/null | head -1
 {"code":"PX_E_4001","msg":"...","severity":"error"}
 ```
 
@@ -72,12 +72,12 @@ $ dpkg validate ./broken 2>&1 >/dev/null | head -1
 
 ### `init`
 
-Create an empty DPKG skeleton. Default **refuses** an existing
+Create an empty Aphelion skeleton. Default **refuses** an existing
 `manifest.json` / `provenance.jsonl` to protect existing data; overwriting
 requires both `--force` **and** `--i-know-what-im-doing`.
 
 ```bash
-dpkg init DEST [--spec-version 0.2.2] [--force --i-know-what-im-doing]
+aphelion init DEST [--spec-version 0.2.2] [--force --i-know-what-im-doing]
 ```
 
 ### `validate`
@@ -86,7 +86,7 @@ Syntax-layer check of `manifest.json` + `provenance.jsonl` in a source
 directory. No semantic cross-referencing — that is `verify`'s job.
 
 ```bash
-dpkg validate SOURCE_DIR
+aphelion validate SOURCE_DIR
 ```
 
 ### `pack`
@@ -97,7 +97,7 @@ input. Output is an uncompressed POSIX `ustar` archive (gzip is deferred so
 implementations).
 
 ```bash
-dpkg pack SOURCE_DIR OUT.dpkg.tar
+aphelion pack SOURCE_DIR OUT.aphelion.tar
 ```
 
 ### `unpack`
@@ -108,7 +108,7 @@ and over-budget archives. Uses `tarfile.next()` in a streaming loop —
 never `tar.extractall()`.
 
 ```bash
-dpkg unpack ARCHIVE.dpkg.tar DEST/
+aphelion unpack ARCHIVE.aphelion.tar DEST/
 ```
 
 Budget flags (conservative defaults):
@@ -133,7 +133,7 @@ Post-unpack semantic cross-reference:
    (`PX_E_5004` / `DANGLING_REFERENCE`).
 
 ```bash
-dpkg verify UNPACKED_DIR/
+aphelion verify UNPACKED_DIR/
 ```
 
 See [`spec/error-codes.md`](spec/error-codes.md) for the full
@@ -152,10 +152,10 @@ See [`spec/error-codes.md`](spec/error-codes.md) for the full
 
 ## Spec
 
-`dpkg --version` reports three numbers:
+`aphelion --version` reports three numbers:
 
 - **Package** (`0.3.0`) — the version of this CLI / Python library.
-- **Spec** (`0.3.0`) — the version of the on-disk DPKG format this build
+- **Spec** (`0.3.0`) — the version of the on-disk Aphelion format this build
   targets (spec version is tracked independently from package version so
   maintenance releases can ship without bumping the format).
 - **Schema** (`1.1`) — the `format_version` field written into new
@@ -168,8 +168,8 @@ every conformant implementer must reproduce (worked example:
 
 ## External Reader Conformance
 
-DPKG ships a stdlib-only reference reader at
-`scripts/external_reader.py` (~170 LOC, no `import dpkg`). It
+Aphelion ships a stdlib-only reference reader at
+`scripts/external_reader.py` (~170 LOC, no `import aphelion`). It
 demonstrates the wire format is self-describing: an independent
 reader can classify every sample under `samples/` as valid / invalid
 without touching the reference validator.
@@ -184,4 +184,4 @@ python scripts/external_reader.py samples/architecture-claim/
 
 Exit code is `0` on agreement, `1` on mismatch.
 `tests/test_external_reader.py` guards the stdlib-only contract via an
-AST scan that forbids any `dpkg` / `parallax` / `memory` imports.
+AST scan that forbids any `aphelion` / `parallax` / `memory` imports.

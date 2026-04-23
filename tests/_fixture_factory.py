@@ -1,4 +1,4 @@
-"""Programmatic fixture builders for DPKG v0.2.0 golden tests.
+"""Programmatic fixture builders for Aphelion v0.2.0 golden tests.
 
 Fixtures are generated at import time so they're diffable + reproducible.
 Each builder returns (name, source_dir_factory, expected_outcome).
@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from dpkg.canonical_json import dumps as canonical_dumps
-from dpkg.canonical_json import normalize
+from aphelion.canonical_json import dumps as canonical_dumps
+from aphelion.canonical_json import normalize
 
 
 UUID_PKG = "0191aaaa-0000-7000-8000-000000000001"
@@ -86,7 +86,7 @@ def _build_minimal(
         "format_version": "1.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
-        "producer": "dpkg-test",
+        "producer": "aphelion-test",
         "provenance_path": "provenance.jsonl",
     }
     if extra_manifest:
@@ -132,7 +132,7 @@ def build_valid_empty_vault(dest: Path) -> None:
         "format_version": "1.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
-        "producer": "dpkg-test",
+        "producer": "aphelion-test",
         "provenance_path": "provenance.jsonl",
     }
     _write(dest / "manifest.json", canonical_dumps(normalize(manifest)))
@@ -184,7 +184,7 @@ def build_valid_multi_claim(dest: Path) -> None:
         "format_version": "1.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
-        "producer": "dpkg-test",
+        "producer": "aphelion-test",
         "provenance_path": "provenance.jsonl",
     }
     _write(dest / "manifest.json", canonical_dumps(normalize(manifest)))
@@ -213,8 +213,8 @@ def build_valid_multi_claim(dest: Path) -> None:
 
 
 def build_valid_init_generated(dest: Path) -> None:
-    """Skeleton produced by ``dpkg init`` — deterministic via fixed overrides."""
-    from dpkg.initializer import InitOptions, init_skeleton
+    """Skeleton produced by ``aphelion init`` — deterministic via fixed overrides."""
+    from aphelion.initializer import InitOptions, init_skeleton
 
     init_skeleton(
         InitOptions(
@@ -496,7 +496,7 @@ def build_archive_dotdot_traversal(dest: Path) -> None:
 
 
 def build_archive_absolute_path(dest: Path) -> None:
-    info = tarfile.TarInfo(name="/etc/passwd.dpkg")
+    info = tarfile.TarInfo(name="/etc/passwd.aphelion")
     info.type = tarfile.REGTYPE
     info.mode = 0o644
     _write_raw_tar(dest / "evil.tar", [(info, b"owned\n")])
@@ -574,7 +574,7 @@ CASES: list[tuple[FixtureCase, Callable[[Path], None]]] = [
     (FixtureCase("valid", "nfd-string", 0, None, "NFD input normalized at insert time"), build_valid_nfd_string),
     (FixtureCase("valid", "minimal-single-claim", 0, None, "single claim baseline"), build_valid_minimal_single_claim),
     (FixtureCase("valid", "multi-claim", 0, None, "two claims, two events"), build_valid_multi_claim),
-    (FixtureCase("valid", "init-generated", 0, None, "skeleton produced by `dpkg init`"), build_valid_init_generated),
+    (FixtureCase("valid", "init-generated", 0, None, "skeleton produced by `aphelion init`"), build_valid_init_generated),
     (FixtureCase("valid", "notice-path", 0, None, "manifest with optional notice_path"), build_valid_notice_path),
     # invalid-syntax
     (FixtureCase("invalid-syntax", "malformed-trailing-comma", 3, "PX_E_4006", ""), build_invalid_malformed_trailing_comma),

@@ -1,4 +1,4 @@
-# DPKG Claim Frontmatter Field Table
+# Aphelion Claim Frontmatter Field Table
 
 **Version:** 1.0
 **Status:** Normative
@@ -55,5 +55,5 @@ tags:
 type: "user_preference"
 updated_at: "2026-04-21T00:00:00Z"
 ---
-Chris prefers per-claim SHA-256 as the DPKG content-hash granularity.
+Chris prefers per-claim SHA-256 as the Aphelion content-hash granularity.
 ```

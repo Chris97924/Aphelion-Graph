@@ -1,4 +1,4 @@
-"""Human / machine output writer for the DPKG CLI.
+"""Human / machine output writer for the Aphelion CLI.
 
 Two orthogonal axes:
 
@@ -9,7 +9,7 @@ Two orthogonal axes:
   sequences. Auto-detected (tty + ``NO_COLOR`` env respect) but can be forced
   off via the CLI flag or the env var.
 
-The error path (``dpkg.errors.emit_error``) stays JSON-on-stderr regardless
+The error path (``aphelion.errors.emit_error``) stays JSON-on-stderr regardless
 of ``json_mode`` so scripts can parse failures without opting into
 ``--json``. ``json_mode`` only controls success output on stdout.
 """
@@ -81,7 +81,7 @@ def detect_color(stream: IO[str] | None = None) -> bool:
 class Writer:
     """Bound output policy for a single CLI invocation.
 
-    Instances are created once in :func:`dpkg.cli.main` after flag parsing
+    Instances are created once in :func:`aphelion.cli.main` after flag parsing
     and threaded through the subcommand handlers. Frozen so handlers can't
     accidentally mutate the mode mid-run.
     """

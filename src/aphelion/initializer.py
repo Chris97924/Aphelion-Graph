@@ -1,7 +1,7 @@
-"""``dpkg init`` — create an empty DPKG skeleton in a directory.
+"""``aphelion init`` — create an empty Aphelion skeleton in a directory.
 
 A skeleton contains a valid ``manifest.json`` (zero claims) and an empty
-``provenance.jsonl``; running ``dpkg validate`` against the result must
+``provenance.jsonl``; running ``aphelion validate`` against the result must
 succeed. The command refuses by default if the destination already holds a
 manifest — to overwrite, callers must pass **both** ``force=True`` and
 ``confirmed=True``, an explicit two-key gesture chosen to prevent accidental
@@ -16,11 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from dpkg import __version__ as DPKG_VERSION, SCHEMA_VERSION_MAX
-from dpkg.canonical_json import dumps as canonical_dumps, normalize
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
-from dpkg.validator import TIMESTAMP_RE, UUID_V7_RE
+from aphelion import __version__ as DPKG_VERSION, SCHEMA_VERSION_MAX
+from aphelion.canonical_json import dumps as canonical_dumps, normalize
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
+from aphelion.validator import TIMESTAMP_RE, UUID_V7_RE
 
 
 SUPPORTED_SPEC_VERSIONS: frozenset[str] = frozenset(
@@ -33,7 +33,7 @@ DEFAULT_SPEC_VERSION = DPKG_VERSION
 class InitOptions:
     dest: Path
     spec_version: str = DEFAULT_SPEC_VERSION
-    producer: str = "dpkg-init"
+    producer: str = "aphelion-init"
     license: str = "Apache-2.0"
     force: bool = False
     confirmed: bool = False  # must pair with force=True; cannot be silently assumed
@@ -65,7 +65,7 @@ def _iso_now() -> str:
 
 
 def init_skeleton(opts: InitOptions) -> dict[str, Any]:
-    """Materialize a DPKG skeleton under ``opts.dest``.
+    """Materialize a Aphelion skeleton under ``opts.dest``.
 
     Returns the written manifest dict on success. Raises :class:`SchemaError`
     on refusal (existing data, unsupported spec version, missing confirmation).
@@ -127,7 +127,7 @@ def init_skeleton(opts: InitOptions) -> dict[str, Any]:
             code=ErrorCode.INIT_MISSING_CONFIRMATION,
             msg=(
                 "force=True requires an explicit confirmation flag "
-                "(--i-know-what-im-doing) to destroy existing DPKG state."
+                "(--i-know-what-im-doing) to destroy existing Aphelion state."
             ),
             path=str(dest),
         )

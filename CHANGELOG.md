@@ -1,13 +1,23 @@
 # Changelog
 
-## [0.3.0] — 2026-04-21
+## [0.3.0] — 2026-04-23
+
+### Renamed
+
+- Package renamed from `dpkg` to `aphelion`; CLI command changed to `aphe`
+  (shorter type for frequent invocation). Wire format field
+  `dpkg_spec_version`, schema artifact filenames (`schemas/dpkg-v0.3.json`,
+  `schemas/diff-v0.3.json`, `schemas/expected-normalized-v0.3.json`), and
+  error-code prefix `PX_E_*` are preserved verbatim: those are v0.3
+  wire/ecosystem contracts and will be re-spec'd in v0.4 when the format
+  itself advances. Archive extension changed `.dpkg.tar` → `.aphelion.tar`.
 
 ### Added
 
 - `format_version` 1.1 — the wire-schema bump accepted alongside 1.0.
   `manifest.schema.json` `format_version` is now `enum: ["1.0", "1.1"]`;
   the validator accepts both, packers emit 1.1 for new skeletons.
-- `dpkg.lifecycle` — state-machine enforcement module (pure stdlib).
+- `aphelion.lifecycle` — state-machine enforcement module (pure stdlib).
   Walks provenance per `claim_id` in canonical `(occurred_at_ms,
   event_id_lex)` order, raising `PX_E_5101`
   (`ERR-SEM-LIFECYCLE-ILLEGAL`) on illegal transitions and
@@ -15,13 +25,13 @@
   `target_claim_instance_id`. Wired into `validate_package` as the
   third pass so every validate call enforces semantic lifecycle.
 - `target_claim_instance_id` enforcement (spec §5.5) —
-  `dpkg.lifecycle` rejects `create` / `publish` that carry the field
+  `aphelion.lifecycle` rejects `create` / `publish` that carry the field
   (→ `PX_E_5101`, neither has a prior instance to point at) and
   `reaffirm` / `revise` / `supersede` / `withdraw` that omit it
   (→ `PX_E_5102` for `reaffirm`, `PX_E_5101` for the other three).
-  `dpkg.validator` additionally pattern-checks the field against
+  `aphelion.validator` additionally pattern-checks the field against
   UUID-v7 (`PX_E_4001`) at the schema layer.
-- `dpkg diff <a> <b>` command + `dpkg.diff` module — layered diff
+- `aphelion diff <a> <b>` command + `aphelion.diff` module — layered diff
   (manifest / claim-set / per-claim evidence / provenance timeline).
   `--json` emits a structured payload validated against
   `schemas/diff-v0.3.json` (`diff_spec_version: "0.3.0"`); the
@@ -29,7 +39,7 @@
   `"NOTE: Human-readable diff is informational only; the JSON form
   (--json) is the machine contract"` banner. Exit 0 iff the diff is
   empty.
-- `dpkg validate --strict` / `--lenient` mutually-exclusive modes
+- `aphelion validate --strict` / `--lenient` mutually-exclusive modes
   (default strict).
 - `schemas/dpkg-v0.3.json` — aggregate JSON Schema that `$ref`s
   manifest / claim-frontmatter / provenance-event, giving an external
@@ -39,7 +49,7 @@
   `expected-normalized.json` fixture companion format.
 - `scripts/external_reader.py` — stdlib-only reference reader
   (~160 LOC) that classifies every sample under `samples/` without
-  importing `dpkg` / `parallax` / `memory`. Proves the wire format
+  importing `aphelion` / `parallax` / `memory`. Proves the wire format
   is self-describing. `tests/test_external_reader.py` guards the
   stdlib-only contract via AST scan and the verdict contract via
   subprocess exit code.
@@ -59,7 +69,7 @@
   public leaking of pre-rename terms. Pre-commit hook installable
   separately.
 - Reserved namespace prefixes `parallax:` / `internal:` — opaque
-  pass-through in DPKG. Excluded from content-hash computation.
+  pass-through in Aphelion. Excluded from content-hash computation.
   Adapter layer MUST strip them on export.
 - Version axes separated: `format_version` (wire, semver MAJOR.MINOR)
   and `dpkg_spec_version` (release, semver). Unknown MAJOR is
@@ -71,7 +81,7 @@
   100 MiB, `max_files` 10 000, `max_file_bytes` 25 MiB,
   `max_compression_ratio` 100, `max_path_length` 512. Module
   constants `PACKAGE_TOTAL_BYTES_LIMIT` and
-  `PACKAGE_SINGLE_FILE_BYTES_LIMIT` exported by `dpkg.unpacker`.
+  `PACKAGE_SINGLE_FILE_BYTES_LIMIT` exported by `aphelion.unpacker`.
 - Error code bands documented: 1NN TYPE, 2NN STRUCTURE, 3NN VERSION,
   4NN FORMAT, 5NN CONSISTENCY, 6NN SECURITY.
 
@@ -98,18 +108,18 @@
   saves runtime on the other 8. Each cell runs `pytest --cov ... --cov-fail-under=80`
   plus a `init → validate → pack → unpack → verify` smoke test (bash on
   Linux/macOS, PowerShell on Windows).
-- `dpkg.output.Writer` + `detect_color`: bound output policy (`json_mode`,
+- `aphelion.output.Writer` + `detect_color`: bound output policy (`json_mode`,
   `color`, stdout) threaded through every subcommand. Color is auto-off for
   non-tty streams and when `NO_COLOR` is set (per https://no-color.org).
-- `dpkg --json`: global flag that switches success output on stdout to a
+- `aphelion --json`: global flag that switches success output on stdout to a
   single JSON line `{"ok": true, "command": ..., "summary": ..., ...}`
   suitable for shell pipelines. Errors stay as JSON lines on stderr whether
   or not `--json` is passed, preserving the v0.2.1 error contract.
-- `dpkg --no-color`: force plain text even when stdout is a tty.
-- `dpkg --version` dual display: now reports package + spec + schema
-  (`dpkg 0.2.2 (spec 0.2.2, schema 1.0)`) so users never have to guess
+- `aphelion --no-color`: force plain text even when stdout is a tty.
+- `aphelion --version` dual display: now reports package + spec + schema
+  (`aphelion 0.2.2 (spec 0.2.2, schema 1.0)`) so users never have to guess
   which number their validator cares about. Closes Top-5 risk #5.
-- `SPEC_VERSION` constant in `dpkg.__init__` (tracked independently from
+- `SPEC_VERSION` constant in `aphelion.__init__` (tracked independently from
   `__version__` so a maintenance release can ship without bumping the
   on-disk format).
 - `tests/test_cli_output.py`: 15 tests covering --json structure, ANSI
@@ -120,9 +130,9 @@
 
 ### Changed
 
-- `dpkg.initializer.SUPPORTED_SPEC_VERSIONS` accepts `0.2.2` in addition to
+- `aphelion.initializer.SUPPORTED_SPEC_VERSIONS` accepts `0.2.2` in addition to
   `0.2.0` / `0.2.1`.
-- `src/dpkg/cli.py` refactored to use `Writer` for success output; error
+- `src/aphelion/cli.py` refactored to use `Writer` for success output; error
   handling paths (`DpkgError` / `FileNotFoundError` / catch-all) unchanged.
 
 ### Risk mitigations (v0.2.2 Top-5)
@@ -138,12 +148,12 @@
 
 ### Added
 
-- `dpkg.error_codes`: canonical `ErrorCode` registry using the
+- `aphelion.error_codes`: canonical `ErrorCode` registry using the
   `PX_E_<CCNN>` scheme across six category bands (1NN TYPE, 2NN STRUCTURE,
   3NN VERSION, 4NN FORMAT, 5NN CONSISTENCY, 6NN SECURITY) plus a 9NN GENERIC
   fallback. Single source of truth for every machine-readable error code
   emitted by the package. See `spec/error-codes.md`.
-- `dpkg.initializer` + `dpkg init` CLI subcommand: creates a DPKG skeleton
+- `aphelion.initializer` + `aphelion init` CLI subcommand: creates a Aphelion skeleton
   (`manifest.json`, `provenance.jsonl`, `claims/`) in an empty destination.
   Default refuses an existing package; overwrite requires both `--force`
   **and** `--i-know-what-im-doing` (two-key safety gesture). Supports
@@ -164,34 +174,34 @@
 ### Coverage
 
 - 123 tests pass (up from 89 baseline).
-- `dpkg.validator`: 99%, `dpkg.verifier`: 96%, `dpkg.initializer`: 98%,
-  `dpkg.error_codes`: 98%, package total: 93%.
+- `aphelion.validator`: 99%, `aphelion.verifier`: 96%, `aphelion.initializer`: 98%,
+  `aphelion.error_codes`: 98%, package total: 93%.
 
 ## [0.2.0] — 2026-04-21
 
 ### Added
 
-- `dpkg.canonical_json`: deterministic JSON serializer (NFC at insert time,
+- `aphelion.canonical_json`: deterministic JSON serializer (NFC at insert time,
   duplicate-key rejection, NaN/Infinity rejection, float rejection). Reproduces
   the spec worked example (`{"a":"café","b":2}\n`) to SHA-256
   `d2995dc401d3e4b85320775178dbf4cff5393f8ba3b6f63c489ea7acde97f682`.
-- `dpkg.canonical_tar`: deterministic uncompressed POSIX ustar writer with
+- `aphelion.canonical_tar`: deterministic uncompressed POSIX ustar writer with
   fixed mtime/uid/gid/uname/gname, NFC-sorted member order, and rejection of
   symlink/hardlink/device/fifo members.
-- `dpkg.errors`: exception hierarchy (`DpkgError`, `SchemaError`,
+- `aphelion.errors`: exception hierarchy (`DpkgError`, `SchemaError`,
   `SecurityError`, `SemanticError`, `VerificationError`) with
   machine-readable codes and single-line JSON emission to stderr.
-- `dpkg.validator`: hand-coded strict-subset validator for `manifest.json`
+- `aphelion.validator`: hand-coded strict-subset validator for `manifest.json`
   and `provenance.jsonl` events (no `jsonschema` dependency).
-- `dpkg.packer`: deterministic source-dir → `.dpkg.tar` packing with hash
+- `aphelion.packer`: deterministic source-dir → `.aphelion.tar` packing with hash
   recomputation and re-canonicalization.
-- `dpkg.unpacker`: safe streaming extract with budgets for file count,
+- `aphelion.unpacker`: safe streaming extract with budgets for file count,
   total bytes, per-file bytes, compression ratio, and path length. Rejects
   path traversal, absolute paths, Windows drive paths, backslashes,
   symlinks, hardlinks, devices, and fifos.
-- `dpkg.verifier`: four-check semantic verification (hash, fileset, chain,
+- `aphelion.verifier`: four-check semantic verification (hash, fileset, chain,
   refs).
-- `dpkg.cli`: `argparse`-based CLI exposing `validate`, `pack`, `unpack`,
+- `aphelion.cli`: `argparse`-based CLI exposing `validate`, `pack`, `unpack`,
   `verify` (`init` deferred to v0.2.1; `diff` deferred to v0.3.0).
 - Golden fixture suite: 33 cases across `valid/` (8), `invalid-syntax/` (10),
   `invalid-semantic/` (6), `archive-security/` (7), and `round-trip/` (4),

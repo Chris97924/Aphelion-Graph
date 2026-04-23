@@ -1,4 +1,4 @@
-"""Canonical uncompressed tar writer for DPKG.
+"""Canonical uncompressed tar writer for Aphelion.
 
 POSIX ustar format, with every source of non-determinism nailed down:
   * mtime=0, uid=0, gid=0, uname='', gname=''
@@ -15,8 +15,8 @@ import tarfile
 import unicodedata
 from dataclasses import dataclass
 
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
 
 
 MODE_FILE = 0o644

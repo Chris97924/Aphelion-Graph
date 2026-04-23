@@ -1,16 +1,16 @@
-"""Minimal independent DPKG reader.
+"""Minimal independent Aphelion reader.
 
 Purpose
 -------
-This script is a *third-party* demonstration that DPKG packages can be
+This script is a *third-party* demonstration that Aphelion packages can be
 read and semantically classified (valid / invalid) without importing
-the ``dpkg`` reference validator or any Parallax code. It exists to
+the ``aphelion`` reference validator or any Parallax code. It exists to
 prove the wire format is self-describing.
 
 Contract
 --------
 - stdlib only: ``json`` / ``pathlib`` / ``sys`` / ``hashlib``.
-- Must NOT ``import dpkg`` or ``import parallax`` / ``import memory``.
+- Must NOT ``import aphelion`` or ``import parallax`` / ``import memory``.
 - Must run under Python 3.11+.
 - Exit codes:
     0 — every sample's classification matches its expected verdict
@@ -143,7 +143,7 @@ def emit_sample_json(sample: Path) -> dict:
     The shape deliberately mirrors the fields consumers actually test
     for — ``validator_verdict``, optional ``error_code``, and a
     minimal ``notes`` block capturing claim_ids / event_count /
-    final_states — without claiming to reproduce the full DPKG
+    final_states — without claiming to reproduce the full Aphelion
     canonical output.
     """
     packages = _iter_packages(sample)
@@ -233,11 +233,11 @@ def run(samples_root: Path) -> int:
     return 0
 
 
-def _forbid_dpkg_import() -> None:
-    """Fail loudly if a future edit re-introduces a dpkg / parallax
+def _forbid_validator_import() -> None:
+    """Fail loudly if a future edit re-introduces an aphelion / parallax
     import. This is the single authoritative guard of the 'no
     dependency on the reference validator' contract."""
-    forbidden = {"dpkg", "parallax", "memory"}
+    forbidden = {"aphelion", "parallax", "memory"}
     for mod in list(sys.modules):
         top = mod.split(".", 1)[0]
         if top in forbidden:
@@ -248,7 +248,7 @@ def _forbid_dpkg_import() -> None:
 
 
 if __name__ == "__main__":
-    _forbid_dpkg_import()
+    _forbid_validator_import()
     target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("samples")
     # Single-sample mode iff the target itself carries an
     # ``expected-normalized.json``; otherwise treat as samples-root.

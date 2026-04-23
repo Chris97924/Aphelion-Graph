@@ -6,7 +6,7 @@ Covers the strict subset of the published JSON schemas for:
 
 Does NOT perform semantic/cross-reference checks - those live in verifier.py.
 
-All raised codes come from :class:`dpkg.error_codes.ErrorCode`.
+All raised codes come from :class:`aphelion.error_codes.ErrorCode`.
 """
 
 from __future__ import annotations
@@ -14,9 +14,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from dpkg import SCHEMA_VERSION_MAX
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
+from aphelion import SCHEMA_VERSION_MAX
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
 
 
 UUID_V7_RE = re.compile(
@@ -328,7 +328,7 @@ def validate_package(manifest_obj: Any, events: list[Any],
             raise
     # Lifecycle walk — imported lazily so the shape-only validators above
     # stay available even if lifecycle.py is stripped in a minimal build.
-    from dpkg.lifecycle import check_lifecycle
+    from aphelion.lifecycle import check_lifecycle
 
     check_lifecycle(events)
     return warnings

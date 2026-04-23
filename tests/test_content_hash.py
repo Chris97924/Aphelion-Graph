@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from dpkg.content_hash import (
+from aphelion.content_hash import (
     EXCLUDED_KEYS,
     IDENTITY_FIELDS,
     RESERVED_PREFIXES,

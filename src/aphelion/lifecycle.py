@@ -4,7 +4,7 @@ Walks the events belonging to a single ``claim_id`` and verifies each
 transition against the matrix in ``spec/lifecycle-state-machine.md``.
 
 Pure stdlib. Does not import the rest of the validator pipeline; suitable
-for use inside either ``dpkg validate`` (the independent CLI) or an
+for use inside either ``aphelion validate`` (the independent CLI) or an
 external reader.
 """
 
@@ -15,8 +15,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
 
 
 # --- Timestamp rules (§6 of spec/lifecycle-state-machine.md) -----------------
@@ -33,7 +33,7 @@ _TS_ANY_FRACTION_RE = re.compile(
 
 
 def check_timestamp(field: str, value: str) -> None:
-    """Raise ``SchemaError`` if ``value`` is not a DPKG-legal timestamp."""
+    """Raise ``SchemaError`` if ``value`` is not a Aphelion-legal timestamp."""
     if not isinstance(value, str):
         raise SchemaError(
             code=ErrorCode.TYPE_MISMATCH,
@@ -46,7 +46,7 @@ def check_timestamp(field: str, value: str) -> None:
             code=ErrorCode.TIMESTAMP_SUBMS_PRECISION,
             msg=(
                 f"field {field!r}: timestamp {value!r} has sub-millisecond "
-                "precision or non-Z offset; DPKG requires UTC Z with at most "
+                "precision or non-Z offset; Aphelion requires UTC Z with at most "
                 "millisecond precision"
             ),
         )
@@ -57,7 +57,7 @@ def check_timestamp(field: str, value: str) -> None:
 
 
 def timestamp_to_ms(value: str) -> int:
-    """Return UTC epoch milliseconds for a DPKG-legal timestamp.
+    """Return UTC epoch milliseconds for a Aphelion-legal timestamp.
 
     Caller is expected to have passed ``check_timestamp`` first.
     """
@@ -65,7 +65,7 @@ def timestamp_to_ms(value: str) -> int:
     if m is None:
         raise SchemaError(
             code=ErrorCode.PATTERN_MISMATCH,
-            msg=f"timestamp {value!r} is not DPKG-canonical",
+            msg=f"timestamp {value!r} is not Aphelion-canonical",
         )
     y, mo, d, h, mi, s, frac = m.groups()
     dt = datetime(

@@ -1,4 +1,4 @@
-# DPKG Validator Spec
+# Aphelion Validator Spec
 
 **Version:** 1.0
 **Status:** Normative
@@ -11,7 +11,7 @@
 > truth. This document is retained for the layer-ordering contract; the
 > concrete code strings in the tables are being migrated.
 
-A DPKG validator runs in three ordered layers. Each layer has a machine-readable error-code namespace. Validators MUST halt on the first `ERROR` in a layer before proceeding to the next (fail-fast per layer).
+A Aphelion validator runs in three ordered layers. Each layer has a machine-readable error-code namespace. Validators MUST halt on the first `ERROR` in a layer before proceeding to the next (fail-fast per layer).
 
 ## Layers
 
@@ -130,7 +130,7 @@ emitted. The tables below are retained as the conceptual contract.
 | `ERR-SEM-014` | ERROR | Semantic | `claim_instance_id` on reaffirm/withdraw event (MUST be absent) at line {line} |
 | `ERR-SEM-015` | ERROR | Semantic | `claim_instance_id` missing on create/revise/supersede event at line {line} |
 | `ERR-SEM-016` | ERROR | Semantic | `created_at` later than `updated_at` in claim {claim_id} |
-| `ERR-SEM-017` | ERROR | Semantic | package.dpkg.tar.gz sha256 mismatch: expected {expected}, got {actual} |
+| `ERR-SEM-017` | ERROR | Semantic | package.aphelion.tar.gz sha256 mismatch: expected {expected}, got {actual} |
 | `ERR-SEM-018` | ERROR | Semantic | signature invalid for declared `public_key` |
 | `ERR-SEM-019` | WARN  | Semantic | package contains withdrawn claim with no `withdrawn_reason`: {claim_id} |
 | `ERR-SEM-020` | ERROR | Semantic | manifest/frontmatter mirror conflict at field {field} for {claim_id} |
@@ -143,7 +143,7 @@ Validators MUST be able to emit a JSON report in this shape:
 
 ```json
 {
-  "package_path": "…/foo.dpkg.tar.gz",
+  "package_path": "…/foo.aphelion.tar.gz",
   "format_version": "1.0",
   "layer_results": [
     {"layer": "syntax",   "passed": true,  "findings": []},

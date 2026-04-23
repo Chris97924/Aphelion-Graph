@@ -1,4 +1,4 @@
-"""Direct unit tests for ``dpkg.packer`` error paths and optional files."""
+"""Direct unit tests for ``aphelion.packer`` error paths and optional files."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from dpkg.canonical_json import dumps, normalize
-from dpkg.canonical_tar import read_members
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
-from dpkg.packer import _load_events, _read_bytes, pack
+from aphelion.canonical_json import dumps, normalize
+from aphelion.canonical_tar import read_members
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
+from aphelion.packer import _load_events, _read_bytes, pack
 
 
 UUID_PKG = "0191aaaa-0000-7000-8000-000000000001"
@@ -44,7 +44,7 @@ def _build_minimal(dest: Path) -> Path:
         "format_version": "1.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
-        "producer": "dpkg-test",
+        "producer": "aphelion-test",
         "provenance_path": "provenance.jsonl",
     }
     (dest / "manifest.json").write_bytes(dumps(normalize(manifest)))
@@ -125,7 +125,7 @@ def test_load_events_path_decoration_tracks_line_number(tmp_path: Path) -> None:
 def test_pack_includes_notice_file_when_present(tmp_path: Path) -> None:
     src = _build_minimal(tmp_path / "src")
     (src / "NOTICE").write_bytes(b"Copyright Owner\n")
-    out = tmp_path / "out.dpkg.tar"
+    out = tmp_path / "out.aphelion.tar"
     pack(src, out)
 
     unpacked = read_members(out.read_bytes())
@@ -137,7 +137,7 @@ def test_pack_includes_notice_file_when_present(tmp_path: Path) -> None:
 
 def test_pack_skips_notice_when_absent(tmp_path: Path) -> None:
     src = _build_minimal(tmp_path / "src")
-    out = tmp_path / "out.dpkg.tar"
+    out = tmp_path / "out.aphelion.tar"
     pack(src, out)
     unpacked = read_members(out.read_bytes())
     member_names = {m.path for m in unpacked}

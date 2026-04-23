@@ -1,15 +1,15 @@
-"""Unit tests for dpkg.errors + dpkg.error_codes."""
+"""Unit tests for aphelion.errors + aphelion.error_codes."""
 
 from __future__ import annotations
 
 import io
 import json
 
-from dpkg.error_codes import ALL_CODES, ErrorCode, category_of
-from dpkg.errors import (
+from aphelion.error_codes import ALL_CODES, ErrorCode, category_of
+from aphelion.errors import (
     EXIT_GENERIC,
     EXIT_VALIDATION,
-    DpkgError,
+    AphelionError,
     SchemaError,
     SecurityError,
     SemanticError,
@@ -44,7 +44,7 @@ def test_exit_code_mapping() -> None:
     assert exit_code_for(SecurityError(code=ErrorCode.UNKNOWN, msg="")) == EXIT_VALIDATION
     assert exit_code_for(SemanticError(code=ErrorCode.UNKNOWN, msg="")) == EXIT_VALIDATION
     assert exit_code_for(VerificationError(code=ErrorCode.UNKNOWN, msg="")) == EXIT_VALIDATION
-    assert exit_code_for(DpkgError(code=ErrorCode.UNKNOWN, msg="")) == EXIT_GENERIC
+    assert exit_code_for(AphelionError(code=ErrorCode.UNKNOWN, msg="")) == EXIT_GENERIC
     assert exit_code_for(RuntimeError("x")) == EXIT_GENERIC
 
 

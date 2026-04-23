@@ -16,7 +16,7 @@ from typing import Optional
 
 import pytest
 
-from dpkg.cli import main as cli_main
+from aphelion.cli import main as cli_main
 from tests._fixture_factory import CASES, materialize_all
 
 
@@ -71,7 +71,7 @@ def test_valid_validate_passes(name: str) -> None:
 )
 def test_valid_pack_and_verify(tmp_path: Path, name: str) -> None:
     src = FIXTURES / "valid" / name
-    archive = tmp_path / f"{name}.dpkg.tar"
+    archive = tmp_path / f"{name}.aphelion.tar"
     code, _, err = _run_cli(["pack", str(src), str(archive)])
     assert code == 0, err
     dest = tmp_path / "unpacked"

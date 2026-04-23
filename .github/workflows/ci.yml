@@ -45,27 +45,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          WORK="$RUNNER_TEMP/dpkg-smoke"
+          WORK="$RUNNER_TEMP/aphelion-smoke"
           rm -rf "$WORK"
           mkdir -p "$WORK"
-          dpkg --version
-          dpkg init "$WORK/pkg"
-          dpkg validate "$WORK/pkg"
-          dpkg pack "$WORK/pkg" "$WORK/out.dpkg.tar"
-          dpkg unpack "$WORK/out.dpkg.tar" "$WORK/unpacked"
-          dpkg verify "$WORK/unpacked"
+          aphe --version
+          aphe init "$WORK/pkg"
+          aphe validate "$WORK/pkg"
+          aphe pack "$WORK/pkg" "$WORK/out.aphelion.tar"
+          aphe unpack "$WORK/out.aphelion.tar" "$WORK/unpacked"
+          aphe verify "$WORK/unpacked"
 
       - name: Smoke test init -> validate -> verify (PowerShell)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $work = Join-Path $env:RUNNER_TEMP 'dpkg-smoke'
+          $work = Join-Path $env:RUNNER_TEMP 'aphelion-smoke'
           if (Test-Path $work) { Remove-Item -Recurse -Force $work }
           New-Item -ItemType Directory -Path $work | Out-Null
-          dpkg --version
-          dpkg init "$work/pkg"
-          dpkg validate "$work/pkg"
-          dpkg pack "$work/pkg" "$work/out.dpkg.tar"
-          dpkg unpack "$work/out.dpkg.tar" "$work/unpacked"
-          dpkg verify "$work/unpacked"
+          aphe --version
+          aphe init "$work/pkg"
+          aphe validate "$work/pkg"
+          aphe pack "$work/pkg" "$work/out.aphelion.tar"
+          aphe unpack "$work/out.aphelion.tar" "$work/unpacked"
+          aphe verify "$work/unpacked"

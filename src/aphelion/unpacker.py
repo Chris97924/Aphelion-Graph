@@ -1,7 +1,7 @@
-"""Safe streaming tar extractor for DPKG archives.
+"""Safe streaming tar extractor for Aphelion archives.
 
 Every known tar-extraction attack is rejected with a SecurityError and a
-distinct PX_E_6NNN code (see :mod:`dpkg.error_codes`):
+distinct PX_E_6NNN code (see :mod:`aphelion.error_codes`):
   * path traversal ('..' / absolute / Windows drive / backslash)
   * duplicate normalized paths
   * disallowed member types (symlink, hardlink, device, fifo)
@@ -17,8 +17,8 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SecurityError
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SecurityError
 
 
 WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
@@ -92,7 +92,7 @@ def unpack(
     dest_dir: Path | str,
     policy: ExtractPolicy | None = None,
 ) -> Path:
-    """Safely extract a canonical .dpkg.tar into dest_dir.
+    """Safely extract a canonical .aphelion.tar into dest_dir.
 
     Uses a streaming tarfile.next() loop - NEVER tar.extractall(), because
     extractall won't catch zip-bomb-class expansion until it's already disk-bound.

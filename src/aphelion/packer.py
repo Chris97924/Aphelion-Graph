@@ -1,15 +1,15 @@
-"""Deterministic pack command: source_dir -> *.dpkg.tar."""
+"""Deterministic pack command: source_dir -> *.aphelion.tar."""
 
 from __future__ import annotations
 
 import hashlib
 from pathlib import Path
 
-from dpkg.canonical_json import dumps, loads, normalize
-from dpkg.canonical_tar import TarMember, pack as tar_pack
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
-from dpkg.validator import validate_package
+from aphelion.canonical_json import dumps, loads, normalize
+from aphelion.canonical_tar import TarMember, pack as tar_pack
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
+from aphelion.validator import validate_package
 
 
 def _read_bytes(path: Path) -> bytes:
@@ -38,7 +38,7 @@ def _load_events(path: Path) -> list[dict]:
 
 
 def pack(source_dir: Path | str, out_path: Path | str) -> Path:
-    """Pack source_dir into a canonical .dpkg.tar file at out_path.
+    """Pack source_dir into a canonical .aphelion.tar file at out_path.
 
     source_dir must contain:
       * manifest.json

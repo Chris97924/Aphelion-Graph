@@ -1,4 +1,4 @@
-# DPKG Provenance Event Semantics
+# Aphelion Provenance Event Semantics
 
 **Version:** 1.0
 **Status:** Normative

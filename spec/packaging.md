@@ -1,4 +1,4 @@
-# DPKG Packaging Spec
+# Aphelion Packaging Spec
 
 **Version:** 1.0
 **Status:** Normative
@@ -6,7 +6,7 @@
 
 ## Package Layout
 
-A DPKG package is a `tar.gz` archive containing:
+A Aphelion package is a `tar.gz` archive containing:
 
 ```
 manifest.json
@@ -37,7 +37,7 @@ Follow `canonical-serialization.md` Rule 5 exactly:
 
 ## Rule 2 — gzip Production
 
-The uncompressed `*.dpkg.tar` stream is the canonical reproducibility surface (see Rule 4). The `*.dpkg.tar.gz` artifact is **conditionally reproducible**: two implementers produce byte-identical `.tar.gz` only if both use the same deflate encoder with the same parameters. Standard `zlib`/`gzip` at "level 6" does NOT meet this bar — zlib 1.2 vs 1.3, Go `compress/gzip`, and Node `zlib` produce different deflate streams for identical input because match-finder heuristics differ.
+The uncompressed `*.aphelion.tar` stream is the canonical reproducibility surface (see Rule 4). The `*.aphelion.tar.gz` artifact is **conditionally reproducible**: two implementers produce byte-identical `.tar.gz` only if both use the same deflate encoder with the same parameters. Standard `zlib`/`gzip` at "level 6" does NOT meet this bar — zlib 1.2 vs 1.3, Go `compress/gzip`, and Node `zlib` produce different deflate streams for identical input because match-finder heuristics differ.
 
 ### Rule 2.a — Artifact header (MUST)
 
@@ -52,13 +52,13 @@ Every conformant producer MUST emit the following gzip header bytes regardless o
 
 ### Rule 2.b — Reference compressor (SHOULD for byte-identity)
 
-To achieve byte-identical `*.dpkg.tar.gz` across independent implementers, producers SHOULD use **Zopfli** with parameters `numiterations=15, blocksplitting=true, blocksplittinglast=false`. Zopfli is deterministic across ports (google/zopfli and its language bindings produce identical deflate output for identical input).
+To achieve byte-identical `*.aphelion.tar.gz` across independent implementers, producers SHOULD use **Zopfli** with parameters `numiterations=15, blocksplitting=true, blocksplittinglast=false`. Zopfli is deterministic across ports (google/zopfli and its language bindings produce identical deflate output for identical input).
 
 Producers that use a non-Zopfli compressor (stdlib `gzip` at any level) MUST still comply with Rule 2.a, but MUST NOT claim artifact-level byte-identity; their packages remain conformant but the `.tar.gz.sha256` is implementation-local.
 
 ### Rule 2.c — Verification
 
-Artifact byte-identity is VERIFIED only via `*.dpkg.tar.sha256` (the tar-stream digest). `*.dpkg.tar.gz.sha256` is a transport checksum, not a reproducibility witness, unless Rule 2.b is followed.
+Artifact byte-identity is VERIFIED only via `*.aphelion.tar.sha256` (the tar-stream digest). `*.aphelion.tar.gz.sha256` is a transport checksum, not a reproducibility witness, unless Rule 2.b is followed.
 
 ## Rule 3 — sha256 Production
 
@@ -77,20 +77,20 @@ Concretely, the hashed byte stream is:
 
 No part is excluded. No part is hashed twice. The hash input is byte-exact with the claim file's tar-entry payload. Implementers MUST NOT hash a JSON projection of the frontmatter, the body alone, or any other subset.
 
-### 3.b Package digest (`*.dpkg.tar.sha256`)
+### 3.b Package digest (`*.aphelion.tar.sha256`)
 
-SHA-256 over `*.dpkg.tar` bytes (the uncompressed canonical tar stream). This is the canonical package fingerprint for signing and external reference.
+SHA-256 over `*.aphelion.tar` bytes (the uncompressed canonical tar stream). This is the canonical package fingerprint for signing and external reference.
 
-### 3.c Artifact digest (`*.dpkg.tar.gz.sha256`)
+### 3.c Artifact digest (`*.aphelion.tar.gz.sha256`)
 
-SHA-256 over `*.dpkg.tar.gz` bytes (the compressed on-disk artifact). Used by transports (HTTP `Content-SHA256`, mirror verification).
+SHA-256 over `*.aphelion.tar.gz` bytes (the compressed on-disk artifact). Used by transports (HTTP `Content-SHA256`, mirror verification).
 
 Per-claim digests are carried inside `manifest.json`. The package and artifact digests MUST be distributed alongside the artifact:
 
 ```
-package.dpkg.tar.gz             (artifact)
-package.dpkg.tar.sha256         (hex, lowercase, 64 chars, LF terminated)
-package.dpkg.tar.gz.sha256      (hex, lowercase, 64 chars, LF terminated)
+package.aphelion.tar.gz             (artifact)
+package.aphelion.tar.sha256         (hex, lowercase, 64 chars, LF terminated)
+package.aphelion.tar.gz.sha256      (hex, lowercase, 64 chars, LF terminated)
 ```
 
 Each `.sha256` file contains exactly `<64 hex chars><LF>` — no filename, no algorithm prefix, no second field.
@@ -102,9 +102,9 @@ Given identical logical inputs (same claims, same provenance events, same manife
 - `manifest.json`
 - `provenance.jsonl`
 - `claims/*.md` files
-- `package.dpkg.tar` stream (and therefore identical `package.dpkg.tar.sha256`)
+- `package.aphelion.tar` stream (and therefore identical `package.aphelion.tar.sha256`)
 
-`package.dpkg.tar.gz` byte-identity is **conditional** on Rule 2.b: guaranteed only when both implementers use Zopfli with the specified parameters. Standard-library gzip producers remain conformant but are not expected to agree on the `.tar.gz` bytes — their conformance is judged against the `.tar.sha256`, not the `.tar.gz.sha256`.
+`package.aphelion.tar.gz` byte-identity is **conditional** on Rule 2.b: guaranteed only when both implementers use Zopfli with the specified parameters. Standard-library gzip producers remain conformant but are not expected to agree on the `.tar.gz` bytes — their conformance is judged against the `.tar.sha256`, not the `.tar.gz.sha256`.
 
 Deviation from the MUST byte-identity surface is a spec defect or an implementation defect, never "expected variance".
 
@@ -131,7 +131,7 @@ Forbidden archive features (MUST reject at unpack time):
 - Device nodes (`CHRTYPE`, `BLKTYPE`, `FIFOTYPE`).
 - Absolute paths (leading `/`).
 - Parent-directory traversal (any path segment equal to `..`).
-- Nested archives (`*.tar`, `*.zip`, `*.tar.gz` inside the DPKG archive).
+- Nested archives (`*.tar`, `*.zip`, `*.tar.gz` inside the Aphelion archive).
 - Windows drive prefixes (`C:\`) and backslash separators.
 
 Filename rules inside the archive:
@@ -154,11 +154,11 @@ implementers SHOULD match these or be stricter.
 | `max_path_length` | 512 bytes (NFC-normalized) | Matches long-filename paxheader bounds |
 
 The constant `PACKAGE_TOTAL_BYTES_LIMIT = 104_857_600` in
-`src/dpkg/unpacker.py` is normative and mirrored in this document.
+`src/aphelion/unpacker.py` is normative and mirrored in this document.
 
 ## Rule 8 — Archive Digest vs Content Hash (DISTINCT)
 
-The **archive digest** (`*.dpkg.tar.sha256`, Rule 3.b) and the
+The **archive digest** (`*.aphelion.tar.sha256`, Rule 3.b) and the
 **claim content hash** (`content_hash` computed per
 `spec/content-hash.md`) are two different digests serving different
 purposes:

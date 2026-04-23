@@ -1,4 +1,4 @@
-# DPKG Versioning Policy
+# Aphelion Versioning Policy
 
 **Version:** 0.3.0
 **Status:** Normative
@@ -6,17 +6,17 @@
 
 ## 1. Two independent version axes
 
-DPKG maintains two independent semver strings:
+Aphelion maintains two independent semver strings:
 
 | Field | Location | What it tracks |
 |---|---|---|
-| `format_version` | `manifest.json` (required) | Wire-shape MAJOR.MINOR of the DPKG on-tar layout. Pinned set of valid values per release line. |
-| `dpkg_spec_version` | `manifest.json` (optional) | Human-facing DPKG spec release label (e.g. `"0.3.0"`). |
-| `exchange_profile_version` | `manifest.json` (optional) | Version of a specific adapter's exchange profile (e.g. Parallax mapping). Opaque to DPKG validator. |
+| `format_version` | `manifest.json` (required) | Wire-shape MAJOR.MINOR of the Aphelion on-tar layout. Pinned set of valid values per release line. |
+| `dpkg_spec_version` | `manifest.json` (optional) | Human-facing Aphelion spec release label (e.g. `"0.3.0"`). |
+| `exchange_profile_version` | `manifest.json` (optional) | Version of a specific adapter's exchange profile (e.g. Parallax mapping). Opaque to Aphelion validator. |
 
 Rationale (from xcouncil 2026-04-21 Codex observation): adapter mapping
-changes should not bump the DPKG core. Separating the two axes lets
-Parallax evolve `exchange_profile_version` without forcing a DPKG spec
+changes should not bump the Aphelion core. Separating the two axes lets
+Parallax evolve `exchange_profile_version` without forcing a Aphelion spec
 bump, and vice versa.
 
 ## 2. What counts as a semver change

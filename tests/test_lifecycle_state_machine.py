@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from dpkg.errors import SchemaError
-from dpkg.lifecycle import (
+from aphelion.errors import SchemaError
+from aphelion.lifecycle import (
     check_lifecycle,
     check_timestamp,
     timestamp_to_ms,

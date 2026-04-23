@@ -1,6 +1,6 @@
 """CLI error-branch tests.
 
-Covers the exception handling paths in ``dpkg.cli.main`` that the fixture
+Covers the exception handling paths in ``aphelion.cli.main`` that the fixture
 suite does not naturally exercise:
 
   * blank line in provenance.jsonl (``continue``)
@@ -8,7 +8,7 @@ suite does not naturally exercise:
   * argparse SystemExit pass-through for usage errors
   * FileNotFoundError -> MISSING_FILE
   * catch-all Exception -> UNKNOWN with exit 1
-  * ``python -m dpkg`` module entrypoint
+  * ``python -m aphelion`` module entrypoint
 """
 
 from __future__ import annotations
@@ -20,9 +20,9 @@ from pathlib import Path
 
 import pytest
 
-from dpkg.canonical_json import dumps, normalize
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
+from aphelion.canonical_json import dumps, normalize
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
 
 from conftest import run_cli as _run
 
@@ -73,7 +73,7 @@ def _minimal_source(dest: Path) -> Path:
         "format_version": "1.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
-        "producer": "dpkg-test",
+        "producer": "aphelion-test",
         "provenance_path": "provenance.jsonl",
     }
     (dest / "manifest.json").write_bytes(dumps(normalize(manifest)))
@@ -155,7 +155,7 @@ def test_main_generic_exception_emits_unknown(
         raise RuntimeError("unexpected boom")
 
     # Monkeypatch inside the lazily-imported module used by _cmd_validate.
-    import dpkg.validator as validator_mod
+    import aphelion.validator as validator_mod
 
     monkeypatch.setattr(validator_mod, "validate_package", _boom)
 
@@ -178,7 +178,7 @@ def test_main_schema_error_from_command_returns_exit_3(
     def _fail(_manifest: dict, _events: list, **_kwargs) -> None:
         raise SchemaError(code=ErrorCode.TYPE_MISMATCH, msg="boom")
 
-    import dpkg.validator as validator_mod
+    import aphelion.validator as validator_mod
 
     monkeypatch.setattr(validator_mod, "validate_package", _fail)
     code, _, err = _run(["validate", str(src)])
@@ -192,14 +192,14 @@ def test_main_schema_error_from_command_returns_exit_3(
 
 
 def test_module_entrypoint_runs_via_python_dash_m(tmp_path: Path) -> None:
-    """`python -m dpkg --version` exits cleanly via the __main__ block."""
+    """`python -m aphelion --version` exits cleanly via the __main__ block."""
     repo_root = Path(__file__).resolve().parent.parent
     env = {
         **dict(__import__("os").environ),
         "PYTHONPATH": str(repo_root / "src"),
     }
     result = subprocess.run(
-        [sys.executable, "-m", "dpkg", "--version"],
+        [sys.executable, "-m", "aphelion", "--version"],
         capture_output=True,
         text=True,
         env=env,
@@ -207,4 +207,4 @@ def test_module_entrypoint_runs_via_python_dash_m(tmp_path: Path) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert "dpkg" in result.stdout.lower()
+    assert "aphelion" in result.stdout.lower()

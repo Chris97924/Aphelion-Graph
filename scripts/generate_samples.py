@@ -1,4 +1,4 @@
-"""Generate the v0.3.0 sample suite under C:/Users/user/dpkg/samples/.
+"""Generate the v0.3.0 sample suite under C:/Users/user/aphelion/samples/.
 
 Each sample directory contains:
   - manifest.json             (canonical, one-line JSON)
@@ -74,7 +74,7 @@ def _manifest(n: str, claims: list[dict]) -> dict:
         "format_version": "1.0",
         "license": "Apache-2.0",
         "package_id": PKG.format(n=n),
-        "producer": "dpkg-sample-gen",
+        "producer": "aphelion-sample-gen",
         "provenance_path": "provenance.jsonl",
     }
 
@@ -148,11 +148,11 @@ def build_architecture_claim() -> None:
             "predicate": "supports",
             "source": "adr-0001",
             "state": "active",
-            "subject": "DPKG",
+            "subject": "Aphelion",
             "type": "architecture_decision",
             "updated_at": "2026-04-21T00:00:00Z",
         },
-        "DPKG adopts per-claim SHA-256 as the content-hash granularity.",
+        "Aphelion adopts per-claim SHA-256 as the content-hash granularity.",
     )
     events = [_event(n, "00000001", "create", claim_id, instance_id)]
     base = SAMPLES_DIR / "architecture-claim"
@@ -174,7 +174,7 @@ def build_architecture_claim() -> None:
     _write(
         base / "README.md",
         "# Sample: architecture-claim\n\n"
-        "Canonical single-claim DPKG demonstrating a `supports`-relationship "
+        "Canonical single-claim Aphelion demonstrating a `supports`-relationship "
         "architecture decision. Expected verdict: valid.\n\n"
         "- 1 claim, state=active\n- 1 create event\n- No revisions, no withdraws\n",
     )
@@ -202,11 +202,11 @@ def build_contradictory_claim() -> None:
             "predicate": "supports",
             "source": "chris",
             "state": "active",
-            "subject": "DPKG",
+            "subject": "Aphelion",
             "type": "architecture_opinion",
             "updated_at": "2026-04-21T00:00:00Z",
         },
-        "DPKG should support memory aggregation directly.",
+        "Aphelion should support memory aggregation directly.",
     )
     claim_b = _claim_md(
         {
@@ -217,11 +217,11 @@ def build_contradictory_claim() -> None:
             "predicate": "rejects",
             "source": "xcouncil",
             "state": "active",
-            "subject": "DPKG",
+            "subject": "Aphelion",
             "type": "architecture_opinion",
             "updated_at": "2026-04-21T00:00:01Z",
         },
-        "DPKG MUST NOT include aggregation; that is an application concern.",
+        "Aphelion MUST NOT include aggregation; that is an application concern.",
     )
     events = [
         _event(n, "00000001", "create", a, ia, "2026-04-21T00:00:00Z"),
@@ -252,7 +252,7 @@ def build_contradictory_claim() -> None:
         "# Sample: contradictory-claim\n\n"
         "Two concurrently-active claims whose `predicate` values contradict "
         "(`supports` vs `rejects`) on the same `(subject, object)` pair. "
-        "DPKG stores polarity without merging; reconciliation is the "
+        "Aphelion stores polarity without merging; reconciliation is the "
         "consumer's job. Expected verdict: valid.\n",
     )
 
@@ -333,14 +333,14 @@ def build_minimal_empty() -> None:
                 "claim_ids": [],
                 "event_count": 0,
                 "final_states": {},
-                "demonstrates": "smallest legal DPKG: zero claims, empty provenance file",
+                "demonstrates": "smallest legal Aphelion: zero claims, empty provenance file",
             },
         ),
     )
     _write(
         base / "README.md",
         "# Sample: minimal-empty\n\n"
-        "Legal-but-empty DPKG: `manifest.claims = []`, `provenance.jsonl` is "
+        "Legal-but-empty Aphelion: `manifest.claims = []`, `provenance.jsonl` is "
         "an empty file (still present). Tests the zero-row edge of every "
         "schema. Expected verdict: valid.\n",
     )

@@ -99,7 +99,7 @@ def canonical_bytes(projection: dict[str, Any]) -> bytes:
     """Render a projected payload as RFC 8785 JCS-canonical bytes.
 
     Python's json.dumps with sort_keys=True and compact separators
-    matches RFC 8785 for the subset of JSON DPKG allows (no raw floats
+    matches RFC 8785 for the subset of JSON Aphelion allows (no raw floats
     in identity fields apart from ``confidence``, which is expected to
     be pre-formatted). Non-ASCII characters are emitted as raw UTF-8
     (ensure_ascii=False), matching JCS §3.2.

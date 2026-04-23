@@ -1,11 +1,11 @@
-"""Tests for ``dpkg.diff.diff_packages`` and the ``dpkg diff`` CLI."""
+"""Tests for ``aphelion.diff.diff_packages`` and the ``aphelion diff`` CLI."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from dpkg.diff import diff_packages, is_empty
+from aphelion.diff import diff_packages, is_empty
 from tests.conftest import run_cli
 
 

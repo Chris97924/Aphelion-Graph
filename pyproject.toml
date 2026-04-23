@@ -3,24 +3,24 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dpkg"
+name = "aphelion"
 version = "0.3.0"
-description = "DPKG reference implementation - deterministic package format"
+description = "Aphelion reference implementation - deterministic package format"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 readme = "README.md"
-authors = [{ name = "DPKG Contributors" }]
+authors = [{ name = "Aphelion Contributors" }]
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "coverage>=7.0"]
 
 [project.scripts]
-dpkg = "dpkg.cli:main"
+aphe = "aphelion.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

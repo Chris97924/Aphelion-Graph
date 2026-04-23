@@ -1,4 +1,4 @@
-# DPKG Schema Responsibility Matrix
+# Aphelion Schema Responsibility Matrix
 
 **Version:** 1.0
 **Status:** Normative
@@ -8,9 +8,9 @@
 
 | Tag | Meaning |
 |---|---|
-| `format-required` | DPKG format mandates the field. Missing → validator ERROR. |
-| `format-optional` | DPKG format recognizes the field. Producers MAY emit; consumers MUST handle absence. |
-| `application-defined` | Out of DPKG's concern. Applications may add, DPKG validators MUST ignore. |
+| `format-required` | Aphelion format mandates the field. Missing → validator ERROR. |
+| `format-optional` | Aphelion format recognizes the field. Producers MAY emit; consumers MUST handle absence. |
+| `application-defined` | Out of Aphelion's concern. Applications may add, Aphelion validators MUST ignore. |
 
 ## Mirror Conflict Rule
 
@@ -107,6 +107,6 @@ All other fields are single-homed. Specifically:
 ## Rule Summary
 
 - No field listed above is ambiguous. Every name maps to exactly one owner tag.
-- Validators MUST treat `application-defined` fields as pass-through: ignored for DPKG correctness, preserved on round-trip.
+- Validators MUST treat `application-defined` fields as pass-through: ignored for Aphelion correctness, preserved on round-trip.
 - Producers MUST NOT name their own fields using any of the `format-required` or `format-optional` names for different purposes.
 - On `manifest.json` vs claim frontmatter mismatch for a mirrored field (`claim_id`, `claim_instance_id`, `state`): the `manifest.json` value is canonical.

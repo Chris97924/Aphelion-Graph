@@ -1,4 +1,4 @@
-# DPKG Identity & Event Semantics
+# Aphelion Identity & Event Semantics
 
 **Version:** 1.0
 **Status:** Normative
@@ -6,11 +6,11 @@
 
 ## 1. Identifier Taxonomy
 
-DPKG defines four identifier classes. Each has a distinct scope and stability rule.
+Aphelion defines four identifier classes. Each has a distinct scope and stability rule.
 
 | Identifier | Scope | Format | Stability |
 |---|---|---|---|
-| `package_id` | one DPKG package | UUID v7 | Immutable for the lifetime of the package |
+| `package_id` | one Aphelion package | UUID v7 | Immutable for the lifetime of the package |
 | `claim_id` | one logical claim (lineage root) | UUID v7 | Immutable across revisions of the same claim |
 | `claim_instance_id` | one snapshot of a claim | UUID v7 | Unique per revision; changes on revise/supersede |
 | `event_id` | one provenance event | UUID v7 | Immutable; uniquely identifies a line in `provenance.jsonl` |

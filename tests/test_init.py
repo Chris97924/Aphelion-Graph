@@ -1,4 +1,4 @@
-"""Unit tests for ``dpkg init`` (initializer + CLI wiring)."""
+"""Unit tests for ``aphelion init`` (initializer + CLI wiring)."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from dpkg.canonical_json import loads
-from dpkg.cli import main as cli_main
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import SchemaError
-from dpkg.initializer import InitOptions, init_skeleton
-from dpkg.validator import validate_package
+from aphelion.canonical_json import loads
+from aphelion.cli import main as cli_main
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError
+from aphelion.initializer import InitOptions, init_skeleton
+from aphelion.validator import validate_package
 
 
 def _run(argv: list[str]) -> tuple[int, str, str]:
@@ -42,7 +42,7 @@ def _error_code(stderr: str) -> str | None:
 def test_init_creates_skeleton_in_empty_dir(tmp_path: Path) -> None:
     code, out, err = _run(["init", str(tmp_path / "pkg")])
     assert code == 0, err
-    assert "Initialized empty DPKG skeleton" in out
+    assert "Initialized empty Aphelion skeleton" in out
     assert (tmp_path / "pkg" / "manifest.json").is_file()
     assert (tmp_path / "pkg" / "provenance.jsonl").is_file()
     assert (tmp_path / "pkg" / "claims").is_dir()

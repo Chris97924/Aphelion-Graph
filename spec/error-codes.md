@@ -1,4 +1,4 @@
-# DPKG Error Code Registry (v0.3.0)
+# Aphelion Error Code Registry (v0.3.0)
 
 ## v0.3.0 additions (semantic aliases)
 
@@ -17,9 +17,9 @@ the PX code form is preferred in validator output.
 
 ---
 
-# DPKG Error Code Registry (v0.2.1 — historical legend)
+# Aphelion Error Code Registry (v0.2.1 — historical legend)
 
-Every machine-readable error emitted by DPKG carries a `code` field of the
+Every machine-readable error emitted by Aphelion carries a `code` field of the
 form `PX_E_<CCNN>` where `CC` identifies one of six categories:
 
 | Band  | Category       | Meaning                                                                 |
@@ -31,10 +31,10 @@ form `PX_E_<CCNN>` where `CC` identifies one of six categories:
 | 5NN   | CONSISTENCY    | Cross-reference failures (hash, fileset, chain, dangling reference).   |
 | 6NN   | SECURITY       | Archive-extraction safety breach (traversal, bomb, bad member type…).   |
 
-The canonical source of truth is [`src/dpkg/error_codes.py`][impl].
+The canonical source of truth is [`src/aphelion/error_codes.py`][impl].
 All raise sites import the `ErrorCode` enum — no string literals.
 
-[impl]: ../src/dpkg/error_codes.py
+[impl]: ../src/aphelion/error_codes.py
 
 ## 1NN — TYPE
 
@@ -51,7 +51,7 @@ All raise sites import the `ErrorCode` enum — no string literals.
 | PX_E_2003  | EMPTY_VALUE                | String field is empty where non-empty is required (license, producer). |
 | PX_E_2004  | FORBIDDEN_FIELD            | Field is present where it must be absent (e.g. `create` + `prev_event_id`). |
 | PX_E_2005  | MISSING_FILE               | Filesystem I/O: required input file not found.                         |
-| PX_E_2006  | INIT_REFUSES_EXISTING      | `dpkg init` refuses — destination already holds a manifest.            |
+| PX_E_2006  | INIT_REFUSES_EXISTING      | `aphelion init` refuses — destination already holds a manifest.            |
 | PX_E_2007  | INIT_MISSING_CONFIRMATION  | `--force` used without `--i-know-what-im-doing`.                       |
 
 ## 3NN — VERSION

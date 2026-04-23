@@ -1,12 +1,12 @@
-"""DPKG reference CLI entrypoint.
+"""Aphelion reference CLI entrypoint.
 
 Six commands (v0.3.0):
-  init      - create an empty DPKG skeleton in a directory
+  init      - create an empty Aphelion skeleton in a directory
   validate  - syntax + lifecycle check of manifest + provenance
-  pack      - deterministic source_dir -> .dpkg.tar
+  pack      - deterministic source_dir -> .aphelion.tar
   unpack    - safe streaming extract
   verify    - post-unpack semantic cross-reference check
-  diff      - layered diff between two unpacked DPKG packages
+  diff      - layered diff between two unpacked Aphelion packages
 
 Global flags (accepted before or after the subcommand):
   --json        emit a JSON line on stdout instead of human text
@@ -21,28 +21,28 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-from dpkg import __version__, SCHEMA_VERSION_MAX, SPEC_VERSION
-from dpkg.canonical_json import loads
-from dpkg.error_codes import ErrorCode
-from dpkg.errors import (
+from aphelion import __version__, SCHEMA_VERSION_MAX, SPEC_VERSION
+from aphelion.canonical_json import loads
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import (
     EXIT_OK,
     EXIT_USAGE,
     EXIT_VALIDATION,
-    DpkgError,
+    AphelionError,
     SchemaError,
     emit_error,
     exit_code_for,
 )
-from dpkg.output import Writer, detect_color
+from aphelion.output import Writer, detect_color
 
 
 VERSION_STRING = (
-    f"dpkg {__version__} (spec {SPEC_VERSION}, schema {SCHEMA_VERSION_MAX})"
+    f"aphelion {__version__} (spec {SPEC_VERSION}, schema {SCHEMA_VERSION_MAX})"
 )
 
 
 def _cmd_init(args: argparse.Namespace, writer: Writer) -> int:
-    from dpkg.initializer import InitOptions, init_skeleton
+    from aphelion.initializer import InitOptions, init_skeleton
 
     dest = Path(args.dest)
     opts = InitOptions(
@@ -54,18 +54,18 @@ def _cmd_init(args: argparse.Namespace, writer: Writer) -> int:
     init_skeleton(opts)
     writer.success(
         "init",
-        summary=f"Initialized empty DPKG skeleton in {dest}",
+        summary=f"Initialized empty Aphelion skeleton in {dest}",
         data={"dest": str(dest), "spec_version": args.spec_version},
     )
     writer.hint("Next steps:")
     writer.hint(f"  1. Add claim files under {dest / 'claims'}/<uuid>.md")
     writer.hint("  2. Register each claim in manifest.json")
-    writer.hint(f"  3. Run `dpkg validate {dest}` to confirm.")
+    writer.hint(f"  3. Run `aphelion validate {dest}` to confirm.")
     return EXIT_OK
 
 
 def _cmd_validate(args: argparse.Namespace, writer: Writer) -> int:
-    from dpkg.validator import validate_package
+    from aphelion.validator import validate_package
 
     source = Path(args.source)
     manifest = loads((source / "manifest.json").read_bytes())
@@ -99,7 +99,7 @@ def _cmd_validate(args: argparse.Namespace, writer: Writer) -> int:
 
 
 def _cmd_pack(args: argparse.Namespace, writer: Writer) -> int:
-    from dpkg.packer import pack as do_pack
+    from aphelion.packer import pack as do_pack
 
     do_pack(args.source, args.output)
     out = Path(args.output)
@@ -113,7 +113,7 @@ def _cmd_pack(args: argparse.Namespace, writer: Writer) -> int:
 
 
 def _cmd_unpack(args: argparse.Namespace, writer: Writer) -> int:
-    from dpkg.unpacker import ExtractPolicy, unpack as do_unpack
+    from aphelion.unpacker import ExtractPolicy, unpack as do_unpack
 
     policy = ExtractPolicy(
         max_files=args.max_files,
@@ -132,7 +132,7 @@ def _cmd_unpack(args: argparse.Namespace, writer: Writer) -> int:
 
 
 def _cmd_diff(args: argparse.Namespace, writer: Writer) -> int:
-    from dpkg.diff import diff_packages, is_empty, render_human
+    from aphelion.diff import diff_packages, is_empty, render_human
 
     result = diff_packages(args.a, args.b)
     if args.json_mode:
@@ -148,7 +148,7 @@ def _cmd_diff(args: argparse.Namespace, writer: Writer) -> int:
 
 
 def _cmd_verify(args: argparse.Namespace, writer: Writer) -> int:
-    from dpkg.verifier import verify as do_verify
+    from aphelion.verifier import verify as do_verify
 
     do_verify(args.dir)
     writer.success(
@@ -160,7 +160,7 @@ def _cmd_verify(args: argparse.Namespace, writer: Writer) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="dpkg", description="DPKG reference CLI")
+    parser = argparse.ArgumentParser(prog="aphelion", description="Aphelion reference CLI")
     parser.add_argument("--version", action="version", version=VERSION_STRING)
     parser.add_argument(
         "--json",
@@ -176,7 +176,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_init = sub.add_parser("init", help="create an empty DPKG skeleton in DEST")
+    p_init = sub.add_parser("init", help="create an empty Aphelion skeleton in DEST")
     p_init.add_argument("dest", help="destination directory")
     p_init.add_argument(
         "--spec-version",
@@ -186,7 +186,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_init.add_argument(
         "--force",
         action="store_true",
-        help="allow overwriting an existing DPKG skeleton (REQUIRES --i-know-what-im-doing)",
+        help="allow overwriting an existing Aphelion skeleton (REQUIRES --i-know-what-im-doing)",
     )
     p_init.add_argument(
         "--i-know-what-im-doing",
@@ -215,13 +215,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_val.set_defaults(func=_cmd_validate, validate_mode="strict")
 
-    p_pack = sub.add_parser("pack", help="deterministic pack: source_dir -> .dpkg.tar")
+    p_pack = sub.add_parser("pack", help="deterministic pack: source_dir -> .aphelion.tar")
     p_pack.add_argument("source", help="source directory")
-    p_pack.add_argument("output", help="output .dpkg.tar path")
+    p_pack.add_argument("output", help="output .aphelion.tar path")
     p_pack.set_defaults(func=_cmd_pack)
 
-    p_unp = sub.add_parser("unpack", help="safe streaming extract of a .dpkg.tar")
-    p_unp.add_argument("archive", help=".dpkg.tar archive path")
+    p_unp = sub.add_parser("unpack", help="safe streaming extract of a .aphelion.tar")
+    p_unp.add_argument("archive", help=".aphelion.tar archive path")
     p_unp.add_argument("dest", help="destination directory")
     p_unp.add_argument("--max-files", type=int, default=10_000)
     p_unp.add_argument("--max-total-bytes", type=int, default=100 * 1024 * 1024)
@@ -231,10 +231,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_unp.set_defaults(func=_cmd_unpack)
 
     p_ver = sub.add_parser("verify", help="semantic cross-reference check on an unpacked tree")
-    p_ver.add_argument("dir", help="unpacked DPKG directory")
+    p_ver.add_argument("dir", help="unpacked Aphelion directory")
     p_ver.set_defaults(func=_cmd_verify)
 
-    p_diff = sub.add_parser("diff", help="layered diff between two unpacked DPKG packages")
+    p_diff = sub.add_parser("diff", help="layered diff between two unpacked Aphelion packages")
     p_diff.add_argument("a", help="path to package A (unpacked directory)")
     p_diff.add_argument("b", help="path to package B (unpacked directory)")
     p_diff.set_defaults(func=_cmd_diff)
@@ -264,7 +264,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     writer = _build_writer(args)
     try:
         return args.func(args, writer)
-    except DpkgError as err:
+    except AphelionError as err:
         emit_error(err)
         return exit_code_for(err)
     except FileNotFoundError as err:

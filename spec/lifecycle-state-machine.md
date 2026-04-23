@@ -1,4 +1,4 @@
-# DPKG Lifecycle State Machine
+# Aphelion Lifecycle State Machine
 
 **Version:** 0.3.0
 **Status:** Normative
