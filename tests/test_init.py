@@ -50,7 +50,7 @@ def test_init_creates_skeleton_in_empty_dir(tmp_path: Path) -> None:
 
 def test_init_output_is_validate_clean(tmp_path: Path) -> None:
     dest = tmp_path / "pkg"
-    init_skeleton(InitOptions(dest=dest, spec_version="0.2.1"))
+    init_skeleton(InitOptions(dest=dest, spec_version="0.4.0"))
     manifest = loads((dest / "manifest.json").read_bytes())
     validate_package(manifest, [])
 
@@ -82,8 +82,7 @@ def test_init_force_with_confirmation_overwrites(tmp_path: Path) -> None:
 
 
 def test_init_accepts_supported_spec_versions(tmp_path: Path) -> None:
-    init_skeleton(InitOptions(dest=tmp_path / "a", spec_version="0.2.0"))
-    init_skeleton(InitOptions(dest=tmp_path / "b", spec_version="0.2.1"))
+    init_skeleton(InitOptions(dest=tmp_path / "a", spec_version="0.4.0"))
 
 
 def test_init_rejects_unsupported_spec_version(tmp_path: Path) -> None:
@@ -119,10 +118,11 @@ def test_init_refuses_when_dest_is_a_file(tmp_path: Path) -> None:
     assert exc.value.code == ErrorCode.INIT_REFUSES_EXISTING
 
 
-def test_init_writes_spec_version_extension(tmp_path: Path) -> None:
-    init_skeleton(InitOptions(dest=tmp_path / "pkg", spec_version="0.2.1"))
+def test_init_writes_aphelion_spec_version(tmp_path: Path) -> None:
+    init_skeleton(InitOptions(dest=tmp_path / "pkg", spec_version="0.4.0"))
     manifest = loads((tmp_path / "pkg" / "manifest.json").read_bytes())
-    assert manifest["extensions"]["dpkg_spec_version"] == "0.2.1"
+    assert manifest["aphelion_spec_version"] == "0.4.0"
+    assert manifest["format_version"] == "2.0"
 
 
 # ---------- Override pre-validation (UUID_V7_RE / TIMESTAMP_RE) ----------

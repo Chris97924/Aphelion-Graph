@@ -27,9 +27,10 @@ def _write_pkg(
 ) -> Path:
     base.mkdir(parents=True, exist_ok=True)
     manifest = {
+        "aphelion_spec_version": "0.4.0",
         "claims": claims,
         "created_at": "2026-04-21T00:00:00Z",
-        "format_version": "1.1",
+        "format_version": "2.0",
         "license": "CC0-1.0",
         "package_id": package_id,
         "producer": "test",
@@ -149,7 +150,7 @@ def test_diff_output_validates_against_schema(tmp_path: Path) -> None:
         "provenance_timeline_diff",
     }
     assert required <= diff.keys()
-    assert diff["diff_spec_version"] == "0.3.0"
+    assert diff["diff_spec_version"] == "0.4.0"
 
 
 # ---------- CLI integration -------------------------------------------------
@@ -171,7 +172,7 @@ def test_cli_diff_json_mode(tmp_path: Path) -> None:
     assert code == 0
     payload = json.loads(out.strip().splitlines()[0])
     assert payload["command"] == "diff"
-    assert payload["diff_spec_version"] == "0.3.0"
+    assert payload["diff_spec_version"] == "0.4.0"
 
 
 def test_cli_diff_exits_nonzero_on_difference(tmp_path: Path) -> None:

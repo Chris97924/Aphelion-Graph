@@ -23,9 +23,7 @@ from aphelion.errors import SchemaError
 from aphelion.validator import TIMESTAMP_RE, UUID_V7_RE
 
 
-SUPPORTED_SPEC_VERSIONS: frozenset[str] = frozenset(
-    {"0.2.0", "0.2.1", "0.2.2", "0.3.0"}
-)
+SUPPORTED_SPEC_VERSIONS: frozenset[str] = frozenset({"0.4.0"})
 DEFAULT_SPEC_VERSION = APHELION_VERSION
 
 
@@ -143,9 +141,7 @@ def init_skeleton(opts: InitOptions) -> dict[str, Any]:
         "package_id": opts.package_id or _new_uuid_v7(),
         "producer": opts.producer,
         "provenance_path": "provenance.jsonl",
-        "extensions": {
-            "dpkg_spec_version": opts.spec_version,
-        },
+        "aphelion_spec_version": opts.spec_version,
     }
     manifest_bytes = canonical_dumps(normalize(manifest))
     manifest_path.write_bytes(manifest_bytes)

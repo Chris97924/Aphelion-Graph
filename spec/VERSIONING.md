@@ -1,8 +1,8 @@
 # Aphelion Versioning Policy
 
-**Version:** 0.3.0
+**Version:** 0.4.0
 **Status:** Normative
-**Date:** 2026-04-21
+**Date:** 2026-04-24
 
 ## 1. Two independent version axes
 
@@ -11,7 +11,7 @@ Aphelion maintains two independent semver strings:
 | Field | Location | What it tracks |
 |---|---|---|
 | `format_version` | `manifest.json` (required) | Wire-shape MAJOR.MINOR of the Aphelion on-tar layout. Pinned set of valid values per release line. |
-| `dpkg_spec_version` | `manifest.json` (optional) | Human-facing Aphelion spec release label (e.g. `"0.3.0"`). |
+| `aphelion_spec_version` | `manifest.json` (optional) | Human-facing Aphelion spec release label (e.g. `"0.3.0"`). |
 | `exchange_profile_version` | `manifest.json` (optional) | Version of a specific adapter's exchange profile (e.g. Parallax mapping). Opaque to Aphelion validator. |
 
 Rationale (from xcouncil 2026-04-21 Codex observation): adapter mapping
@@ -44,15 +44,18 @@ bump, and vice versa.
 
 ## 3. `format_version` handling by the validator
 
-- **Known MAJOR.MINOR** (currently `1.0` and `1.1`): accept.
-- **Known MAJOR, unknown MINOR** (e.g. `1.99`): emit a warning to
+- **Known MAJOR.MINOR** (currently `2.0` only): accept.
+- **Known MAJOR, unknown MINOR** (e.g. `2.99`): emit a warning to
   stderr naming the unknown minor, continue validation in additive
   mode (unknown optional fields tolerated in `--lenient`, rejected in
   `--strict`).
-- **Unknown MAJOR** (e.g. `2.0`): reject with
-  `ERR-SYN-VERSION-UNKNOWN-MAJOR`, exit non-zero in any mode.
+- **Unknown MAJOR** (e.g. `3.0`, `1.x`): reject with
+  `ERR-SYN-VERSION-UNKNOWN-MAJOR`, exit non-zero in any mode. v0.3
+  packages (`format_version` 1.0 / 1.1) are rejected for the same
+  reason; migrate them via `aphe migrate` (see
+  `spec/migration-v0.3-to-v0.4.md`).
 
-## 4. `dpkg_spec_version` and `exchange_profile_version`
+## 4. `aphelion_spec_version` and `exchange_profile_version`
 
 Both fields are optional in `manifest.json`:
 
@@ -65,22 +68,25 @@ Both fields are optional in `manifest.json`:
 
 ## 5. Three worked examples
 
-1. **Adding a new optional `exchange_profile_version` field to the
-   manifest schema.** This is MINOR. Bump `format_version` 1.0 → 1.1
-   (wire-shape minor), bump `dpkg_spec_version` 0.2.x → 0.3.0. Packages
-   with only `format_version: "1.0"` continue to validate.
+1. **v0.4 wire seal: rename `dpkg_spec_version` → `aphelion_spec_version`
+   and bump `format_version` 1.1 → 2.0.** This is MAJOR. v0.3 packages
+   cannot be validated under v0.4 without the migration tool (`aphe
+   migrate`). Rationale: the pre-rename field name leaked the legacy
+   "DPKG" brand into the wire contract; v0.3 deliberately preserved it
+   so v0.3 validators could keep reading older packages, and v0.4 is
+   where the break lands. See `spec/migration-v0.3-to-v0.4.md`.
 2. **Changing `canonical-serialization.md` Rule 1 whitespace from no
    spaces to single spaces after commas.** This is MAJOR. Every
    pre-existing package would produce different canonical bytes and
-   fail hash verification. Bump `format_version` 1.x → 2.0 and
-   `dpkg_spec_version` 0.y.z → 1.0.0.
+   fail hash verification. Bump `format_version` 2.x → 3.0 and
+   `aphelion_spec_version` 0.y.z → 1.0.0.
 3. **Fixing the typo "symantic" → "semantic" in `error-codes.md`.**
    This is PATCH. No schema or wire change. Bump only the patch digit
    in the release channel (`0.3.0` → `0.3.1`).
 
 ## 6. Release checklist
 
-When bumping `dpkg_spec_version`:
+When bumping `aphelion_spec_version`:
 
 - [ ] `pyproject.toml` version updated to match the semver tag.
 - [ ] `CHANGELOG.md` has a section for the new version listing what

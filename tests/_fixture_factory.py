@@ -73,6 +73,7 @@ def _build_minimal(
     claim_bytes = _claim_md(claim_id, title, body)
     _write(dest / claim_path, claim_bytes)
     manifest = {
+        "aphelion_spec_version": "0.4.0",
         "claims": [
             {
                 "claim_id": claim_id,
@@ -83,7 +84,7 @@ def _build_minimal(
             }
         ],
         "created_at": "2026-04-21T00:00:00Z",
-        "format_version": "1.0",
+        "format_version": "2.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
         "producer": "aphelion-test",
@@ -127,9 +128,10 @@ def build_valid_empty_vault(dest: Path) -> None:
     """manifest with zero claims."""
     dest.mkdir(parents=True, exist_ok=True)
     manifest = {
+        "aphelion_spec_version": "0.4.0",
         "claims": [],
         "created_at": "2026-04-21T00:00:00Z",
-        "format_version": "1.0",
+        "format_version": "2.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
         "producer": "aphelion-test",
@@ -180,8 +182,9 @@ def build_valid_multi_claim(dest: Path) -> None:
                 "state": "active",
             },
         ],
+        "aphelion_spec_version": "0.4.0",
         "created_at": "2026-04-21T00:00:00Z",
-        "format_version": "1.0",
+        "format_version": "2.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
         "producer": "aphelion-test",
@@ -219,7 +222,7 @@ def build_valid_init_generated(dest: Path) -> None:
     init_skeleton(
         InitOptions(
             dest=dest,
-            spec_version="0.2.1",
+            spec_version="0.4.0",
             package_id=UUID_PKG,
             created_at="2026-04-21T00:00:00Z",
         )
@@ -282,7 +285,15 @@ def build_invalid_json_parse_error(dest: Path) -> None:
 def build_invalid_schema_version_future(dest: Path) -> None:
     _build_minimal(dest)
     data = json.loads((dest / "manifest.json").read_bytes())
-    data["format_version"] = "2.0"
+    data["format_version"] = "3.0"
+    _write(dest / "manifest.json", canonical_dumps(normalize(data)))
+
+
+def build_invalid_schema_version_legacy(dest: Path) -> None:
+    """A v0.3 package (format_version 1.1) rejected by the v0.4 validator."""
+    _build_minimal(dest)
+    data = json.loads((dest / "manifest.json").read_bytes())
+    data["format_version"] = "1.1"
     _write(dest / "manifest.json", canonical_dumps(normalize(data)))
 
 
@@ -584,6 +595,7 @@ CASES: list[tuple[FixtureCase, Callable[[Path], None]]] = [
     (FixtureCase("invalid-syntax", "wrong-type", 3, "PX_E_1001", ""), build_invalid_wrong_type),
     (FixtureCase("invalid-syntax", "json-parse-error", 3, "PX_E_4006", ""), build_invalid_json_parse_error),
     (FixtureCase("invalid-syntax", "schema-version-future", 3, "PX_E_3003", ""), build_invalid_schema_version_future),
+    (FixtureCase("invalid-syntax", "schema-version-legacy", 3, "PX_E_3003", "v0.3 format rejected by v0.4 validator"), build_invalid_schema_version_legacy),
     (FixtureCase("invalid-syntax", "missing-required", 3, "PX_E_2001", ""), build_invalid_missing_required),
     (FixtureCase("invalid-syntax", "invalid-enum", 3, "PX_E_4002", ""), build_invalid_enum),
     (FixtureCase("invalid-syntax", "nan-literal", 3, "PX_E_4009", ""), build_invalid_nan),

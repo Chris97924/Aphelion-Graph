@@ -83,7 +83,7 @@ def _classify_package(pkg: Path) -> tuple[str, str | None, dict[str, str]]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     # Shape / version checks (syntax layer).
-    if manifest.get("format_version") not in {"1.0", "1.1"}:
+    if manifest.get("format_version") not in {"2.0"}:
         return "invalid", "ERR-SYN-UNKNOWN-FORMAT-VERSION", {}
 
     claim_ids = {c["claim_id"] for c in manifest.get("claims", [])}

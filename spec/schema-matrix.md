@@ -39,7 +39,7 @@ All other fields are single-homed. Specifically:
 | Field | Type | Owner |
 |---|---|---|
 | `package_id` | uuid-v7 | format-required |
-| `format_version` | string (`"1.0"`) | format-required |
+| `format_version` | string (`"2.0"`) | format-required |
 | `created_at` | iso8601-Z | format-required |
 | `producer` | string | format-required |
 | `claims` | array<object> | format-required |

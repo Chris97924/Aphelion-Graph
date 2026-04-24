@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 SAMPLES_DIR = Path(__file__).resolve().parents[1] / "samples"
-SCHEMA_URL = "../../schemas/expected-normalized-v0.3.json"
+SCHEMA_URL = "../../schemas/expected-normalized-v0.4.json"
 
 # Deterministic ids
 PKG = "0193{n}-0000-7000-8000-000000000001"
@@ -69,9 +69,10 @@ def _claim_md(frontmatter: dict, body: str) -> str:
 
 def _manifest(n: str, claims: list[dict]) -> dict:
     return {
+        "aphelion_spec_version": "0.4.0",
         "claims": claims,
         "created_at": "2026-04-21T00:00:00Z",
-        "format_version": "1.0",
+        "format_version": "2.0",
         "license": "Apache-2.0",
         "package_id": PKG.format(n=n),
         "producer": "aphelion-sample-gen",
@@ -116,7 +117,7 @@ def _event(n: str, suffix: str, event_type: str, claim_id: str,
 def _expected(verdict: str, notes: dict, error_code: str | None = None) -> dict:
     out: dict = {
         "$schema": SCHEMA_URL,
-        "expected_normalized_version": "0.3",
+        "expected_normalized_version": "0.4",
         "validator_verdict": verdict,
         "notes": notes,
     }

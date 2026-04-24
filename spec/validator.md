@@ -144,7 +144,7 @@ Validators MUST be able to emit a JSON report in this shape:
 ```json
 {
   "package_path": "…/foo.aphelion.tar.gz",
-  "format_version": "1.0",
+  "format_version": "2.0",
   "layer_results": [
     {"layer": "syntax",   "passed": true,  "findings": []},
     {"layer": "schema",   "passed": false, "findings": [

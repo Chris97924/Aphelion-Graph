@@ -32,8 +32,9 @@ BASE_MANIFEST = {
             "state": "active",
         }
     ],
+    "aphelion_spec_version": "0.4.0",
     "created_at": "2026-04-21T00:00:00Z",
-    "format_version": "1.0",
+    "format_version": "2.0",
     "license": "Apache-2.0",
     "package_id": UUID_PKG,
     "producer": "aphelion-test",
@@ -76,7 +77,7 @@ def test_manifest_wrong_type() -> None:
 
 def test_manifest_bad_version() -> None:
     m = copy.deepcopy(BASE_MANIFEST)
-    m["format_version"] = "2.0"
+    m["format_version"] = "3.0"
     with pytest.raises(SchemaError) as exc:
         validate_manifest(m)
     assert exc.value.code == "PX_E_3003"

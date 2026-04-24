@@ -61,7 +61,7 @@ Notes:
   (see §4).
 - Archive-level metadata (tar mtime/uid/gid/atime, file permission bits,
   `package_id`, `producer`, `license`, `signature`, `format_version`,
-  `dpkg_spec_version`, `exchange_profile_version`) is excluded.
+  `aphelion_spec_version`, `exchange_profile_version`) is excluded.
 
 ## 4. Explicit exclusion list
 
@@ -125,11 +125,12 @@ Authoritative test vectors live at `tests/vectors/hash_vectors.json`.
 Every conformant implementation MUST reproduce the `expected_hash` for
 every entry. See also `tests/test_content_hash.py`.
 
-## 8. Migration from format_version 1.0
+## 8. Migration from format_version 1.x (v0.3)
 
-The v1.0 hash in `manifest.json.claims[].hash` was defined against the
-older `canonical-serialization.md` Rule 1. For claims authored under
-format_version 1.1 the `hash` field MUST be computed per this document.
-Validators MAY accept either form when operating in `--lenient` mode on
-packages with `format_version: "1.0"`. Strict mode requires v0.3
-canonical hashing whenever `dpkg_spec_version >= "0.3.0"`.
+The v1.x hash in `manifest.json.claims[].hash` was defined against the
+older `canonical-serialization.md` Rule 1 as extended by v0.3. For
+claims authored under format_version 2.0 the `hash` field MUST be
+computed per this document. v0.4 validators reject v1.x packages
+directly; run `aphe migrate` (see `spec/migration-v0.3-to-v0.4.md`) to
+lift the manifest, then re-validate. Strict mode requires v0.4
+canonical hashing whenever `aphelion_spec_version >= "0.4.0"`.

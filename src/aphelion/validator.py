@@ -41,17 +41,18 @@ MANIFEST_REQUIRED = {
     "provenance_path",
 }
 MANIFEST_ALLOWED = MANIFEST_REQUIRED | {
-    "dpkg_spec_version",
+    "aphelion_spec_version",
     "exchange_profile_version",
     "extensions",
     "notice_path",
     "signature",
 }
 
-# v0.3.0 accepts 1.0 (legacy) and 1.1 (current wire shape).
-SUPPORTED_SCHEMA_VERSIONS: set[str] = {"1.0", "1.1"}
+# v0.4.0 wire is format_version 2.0 only. v0.3 (1.0/1.1) packages are
+# rejected; the migration path is `aphe migrate` (see aphelion.migrate).
+SUPPORTED_SCHEMA_VERSIONS: set[str] = {"2.0"}
 
-# Semver pattern used for dpkg_spec_version / exchange_profile_version.
+# Semver pattern used for aphelion_spec_version / exchange_profile_version.
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$")
 
 CLAIM_ENTRY_REQUIRED = {"claim_id", "claim_instance_id", "hash", "path", "state"}
@@ -187,7 +188,7 @@ def validate_manifest(obj: Any, mode: str = "strict",
     if "notice_path" in obj:
         _check_type("notice_path", obj["notice_path"], str)
         _check_pattern("notice_path", obj["notice_path"], LABEL_PATH_RE)
-    for semver_field in ("dpkg_spec_version", "exchange_profile_version"):
+    for semver_field in ("aphelion_spec_version", "exchange_profile_version"):
         if semver_field in obj:
             _check_type(semver_field, obj[semver_field], str)
             if not SEMVER_RE.match(obj[semver_field]):

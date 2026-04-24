@@ -1,6 +1,6 @@
 # Aphelion — Deterministic Package Format
 
-Reference CLI implementation (v0.3.0). **Zero runtime dependencies** (stdlib
+Reference CLI implementation (v0.4.0). **Zero runtime dependencies** (stdlib
 only). Python 3.10+.
 
 - CI: Linux / macOS / Windows × Python 3.10 / 3.11 / 3.12 — 9-cell matrix
@@ -15,7 +15,7 @@ pip install -e .
 
 # 2. Check the version — shows package + spec + schema
 aphe --version
-# aphelion 0.3.0 (spec 0.3.0, schema 1.1)
+# aphelion 0.4.0 (spec 0.4.0, schema 2.0)
 
 # 3. Create an empty skeleton
 aphelion init ./my-pkg
@@ -77,7 +77,7 @@ Create an empty Aphelion skeleton. Default **refuses** an existing
 requires both `--force` **and** `--i-know-what-im-doing`.
 
 ```bash
-aphelion init DEST [--spec-version 0.2.2] [--force --i-know-what-im-doing]
+aphelion init DEST [--spec-version 0.4.0] [--force --i-know-what-im-doing]
 ```
 
 ### `validate`
@@ -139,6 +139,18 @@ aphelion verify UNPACKED_DIR/
 See [`spec/error-codes.md`](spec/error-codes.md) for the full
 `PX_E_<CCNN>` registry.
 
+### `migrate`
+
+One-shot v0.3 → v0.4 wire migration. Works on unpacked directories or
+`.aphelion.tar` archives. See `spec/migration-v0.3-to-v0.4.md` for the
+normative contract.
+
+```bash
+aphe migrate SRC DST [--force]
+# Directory in -> directory out (matches source shape)
+# .aphelion.tar in -> .aphelion.tar out
+```
+
 ## Exit codes
 
 - `0` success
@@ -150,12 +162,14 @@ See [`spec/error-codes.md`](spec/error-codes.md) for the full
 
 `aphelion --version` reports three numbers:
 
-- **Package** (`0.3.0`) — the version of this CLI / Python library.
-- **Spec** (`0.3.0`) — the version of the on-disk Aphelion format this build
+- **Package** (`0.4.0`) — the version of this CLI / Python library.
+- **Spec** (`0.4.0`) — the version of the on-disk Aphelion format this build
   targets (spec version is tracked independently from package version so
   maintenance releases can ship without bumping the format).
-- **Schema** (`1.1`) — the `format_version` field written into new
-  `manifest.json` files; `1.0` packages still validate.
+- **Schema** (`2.0`) — the `format_version` field written into new
+  `manifest.json` files. v0.3 packages (`1.0` / `1.1`) are rejected;
+  run `aphe migrate SRC DST` to lift them first (see
+  `spec/migration-v0.3-to-v0.4.md`).
 
 See `spec/canonical-serialization.md` for the canonical byte-level contract
 every conformant implementer must reproduce (worked example:

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://dpkg.spec/schemas/manifest.schema.json",
-  "title": "DPKG Manifest",
+  "$id": "https://aphelion.spec/schemas/manifest.schema.json",
+  "title": "Aphelion Manifest",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -20,12 +20,12 @@
       "minItems": 0,
       "uniqueItems": true
     },
-    "created_at": { "$ref": "#/$defs/TimestampUtcZ" },
-    "dpkg_spec_version": {
+    "aphelion_spec_version": {
       "type": "string",
       "pattern": "^\\d+\\.\\d+\\.\\d+$",
       "description": "Optional — semver release label distinct from format_version (wire shape)."
     },
+    "created_at": { "$ref": "#/$defs/TimestampUtcZ" },
     "exchange_profile_version": {
       "type": "string",
       "pattern": "^\\d+\\.\\d+\\.\\d+$",
@@ -37,7 +37,7 @@
     },
     "format_version": {
       "type": "string",
-      "enum": ["1.0", "1.1"]
+      "enum": ["2.0"]
     },
     "license": {
       "type": "string",

@@ -1,1 +1,1 @@
-{"claims":"not a list","created_at":"2026-04-21T00:00:00Z","format_version":"1.0","license":"Apache-2.0","package_id":"0191aaaa-0000-7000-8000-000000000001","producer":"aphelion-test","provenance_path":"provenance.jsonl"}
+{"aphelion_spec_version":"0.4.0","claims":"not a list","created_at":"2026-04-21T00:00:00Z","format_version":"2.0","license":"Apache-2.0","package_id":"0191aaaa-0000-7000-8000-000000000001","producer":"aphelion-test","provenance_path":"provenance.jsonl"}

@@ -143,7 +143,7 @@ def diff_packages(a_path: Path | str, b_path: Path | str) -> dict[str, Any]:
     claims_a = _index_claims(manifest_a)
     claims_b = _index_claims(manifest_b)
     return {
-        "diff_spec_version": "0.3.0",
+        "diff_spec_version": "0.4.0",
         "a": str(a_path),
         "b": str(b_path),
         "manifest_diff": _manifest_diff(manifest_a, manifest_b),

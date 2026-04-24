@@ -1,12 +1,13 @@
 """Aphelion reference CLI entrypoint.
 
-Six commands (v0.3.0):
+Seven commands (v0.4.0):
   init      - create an empty Aphelion skeleton in a directory
   validate  - syntax + lifecycle check of manifest + provenance
   pack      - deterministic source_dir -> .aphelion.tar
   unpack    - safe streaming extract
   verify    - post-unpack semantic cross-reference check
   diff      - layered diff between two unpacked Aphelion packages
+  migrate   - one-shot v0.3 -> v0.4 wire migration
 
 Global flags (accepted before or after the subcommand):
   --json        emit a JSON line on stdout instead of human text
@@ -147,6 +148,23 @@ def _cmd_diff(args: argparse.Namespace, writer: Writer) -> int:
     return EXIT_OK if is_empty(result) else 1
 
 
+def _cmd_migrate(args: argparse.Namespace, writer: Writer) -> int:
+    from aphelion.migrate import MigrateOptions, migrate
+
+    opts = MigrateOptions(
+        src=Path(args.src),
+        dst=Path(args.dst),
+        force=args.force,
+    )
+    out = migrate(opts)
+    writer.success(
+        "migrate",
+        summary=f"{args.src} -> {args.dst} (v0.3 -> v0.4)",
+        data={"src": str(args.src), "dst": str(args.dst), "output": str(out)},
+    )
+    return EXIT_OK
+
+
 def _cmd_verify(args: argparse.Namespace, writer: Writer) -> int:
     from aphelion.verifier import verify as do_verify
 
@@ -238,6 +256,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("a", help="path to package A (unpacked directory)")
     p_diff.add_argument("b", help="path to package B (unpacked directory)")
     p_diff.set_defaults(func=_cmd_diff)
+
+    p_mig = sub.add_parser(
+        "migrate",
+        help="one-shot v0.3 -> v0.4 wire migration (dir->dir or tar->tar)",
+    )
+    p_mig.add_argument("src", help="source v0.3 Aphelion (unpacked dir or .aphelion.tar)")
+    p_mig.add_argument("dst", help="destination v0.4 Aphelion (matches src shape)")
+    p_mig.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing destination",
+    )
+    p_mig.set_defaults(func=_cmd_migrate)
 
     return parser
 

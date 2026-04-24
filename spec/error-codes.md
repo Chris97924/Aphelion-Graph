@@ -1,11 +1,11 @@
-# Aphelion Error Code Registry (v0.3.0)
+# Aphelion Error Code Registry (v0.4.0)
 
 ## v0.3.0 additions (semantic aliases)
 
 | PX code      | Semantic alias                     | Condition                                         |
 |--------------|------------------------------------|---------------------------------------------------|
-| PX_E_3003    | ERR-SYN-VERSION-UNKNOWN-MAJOR      | `manifest.format_version` has unknown MAJOR.      |
-| PX_E_3004    | ERR-SYN-VERSION-NOT-SEMVER         | `dpkg_spec_version` / `exchange_profile_version` not X.Y.Z. |
+| PX_E_3003    | ERR-SYN-VERSION-UNKNOWN-MAJOR      | `manifest.format_version` has unknown MAJOR (incl. legacy 1.x under v0.4). |
+| PX_E_3004    | ERR-SYN-VERSION-NOT-SEMVER         | `aphelion_spec_version` / `exchange_profile_version` not X.Y.Z. |
 | PX_E_3005    | ERR-SYN-TIMESTAMP-NS               | Timestamp has sub-ms precision or non-`Z` offset. |
 | PX_E_5101    | ERR-SEM-LIFECYCLE-ILLEGAL          | Illegal state transition per lifecycle matrix.    |
 | PX_E_5102    | ERR-SEM-REAFFIRM-MISSING-TARGET    | `reaffirm` event lacks `target_claim_instance_id`. |

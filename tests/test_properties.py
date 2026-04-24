@@ -34,8 +34,9 @@ BASE_MANIFEST = {
             "state": "active",
         }
     ],
+    "aphelion_spec_version": "0.4.0",
     "created_at": "2026-04-21T00:00:00Z",
-    "format_version": "1.0",
+    "format_version": "2.0",
     "license": "Apache-2.0",
     "package_id": UUID_PKG,
     "producer": "aphelion-test",
@@ -103,15 +104,17 @@ _field_name = st.text(
 ).filter(
     lambda s: s
     not in {
+        "aphelion_spec_version",
         "claims",
         "created_at",
+        "exchange_profile_version",
+        "extensions",
         "format_version",
         "license",
+        "notice_path",
         "package_id",
         "producer",
         "provenance_path",
-        "extensions",
-        "notice_path",
         "signature",
     }
 )

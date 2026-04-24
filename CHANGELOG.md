@@ -1,5 +1,78 @@
 # Changelog
 
+## [0.4.0] — 2026-04-24
+
+### Breaking (wire seal)
+
+- `manifest.format_version` is now `"2.0"` only. v0.3 packages
+  (`"1.0"` / `"1.1"`) are rejected with `PX_E_3003`
+  (`ERR-SYN-VERSION-UNKNOWN-MAJOR`) in both `--strict` and `--lenient`.
+  Migrate legacy packages via `aphe migrate` (see below).
+- `manifest.dpkg_spec_version` renamed to `aphelion_spec_version`
+  (top-level, optional, semver). The nested
+  `extensions.dpkg_spec_version` that v0.3 `init_skeleton` wrote is
+  also gone; v0.4 `init` emits the top-level field directly.
+- `SUPPORTED_SPEC_VERSIONS` in `aphelion.initializer` narrows to
+  `{"0.4.0"}`. Asking `init` for `"0.2.x"` / `"0.3.0"` now raises
+  `UNSUPPORTED_SPEC_VERSION`; those packages belong to v0.3 and are
+  fed through `aphe migrate` instead.
+
+### Added
+
+- `aphelion.migrate` — one-shot v0.3 → v0.4 transform plus directory
+  and `.aphelion.tar` wrappers. Pure data transform (no IO) is exposed
+  as `migrate_v03_to_v04(manifest) -> manifest`; wrappers
+  `migrate_directory(src, dst)` and `migrate_archive(src, dst)` copy
+  every non-manifest byte verbatim and rewrite only `manifest.json`.
+- `aphe migrate <src> <dst> [--force]` CLI subcommand. Refuses to
+  overwrite an existing destination unless `--force`.
+- `schemas/aphelion-v0.4.json` — new aggregate `$ref` bundle under the
+  `https://aphelion.spec/schemas/` namespace. Replaces the
+  `https://dpkg.spec/...` URL that v0.3 artifacts used.
+- `schemas/diff-v0.4.json` + `schemas/expected-normalized-v0.4.json` —
+  v0.4-namespaced companions for the diff and sample contracts.
+- `spec/migration-v0.3-to-v0.4.md` — normative one-shot migration
+  contract and pre/post conditions.
+- `tests/test_migrate.py` — 23 tests covering the transform,
+  directory + archive wrappers (incl. size budgets, directory
+  pass-through, atomic write, force overwrite), and the `aphe
+  migrate` CLI path.
+- Fixture `invalid-syntax/schema-version-legacy` — locks the expected
+  `PX_E_3003` rejection of a `format_version: "1.1"` manifest under
+  v0.4.
+
+### Changed
+
+- `SCHEMA_VERSION_MAX` `1.1 → 2.0`; `SPEC_VERSION` `0.3.0 → 0.4.0`;
+  package `__version__` `0.3.0 → 0.4.0`.
+- `schemas/manifest.schema.json`: `$id` migrated to
+  `https://aphelion.spec/...`, title `"DPKG Manifest"` →
+  `"Aphelion Manifest"`, `format_version` enum narrowed to
+  `["2.0"]`, top-level property `dpkg_spec_version` removed in favour
+  of `aphelion_spec_version`.
+- `init_skeleton` now stamps `format_version: "2.0"` +
+  `aphelion_spec_version: "0.4.0"` (was `1.1` / extensions nested).
+- `aphelion.content_hash.EXCLUDED_KEYS`: `dpkg_spec_version` removed,
+  `aphelion_spec_version` added. Reserved-prefix exclusion unchanged.
+- `aphelion.diff` emits `diff_spec_version: "0.4.0"` and points at the
+  new `schemas/diff-v0.4.json` artifact.
+- `scripts/external_reader.py` accepts `format_version: "2.0"` only.
+- Eight canonical samples regenerated against the v0.4 wire
+  (`aphelion_spec_version` + `format_version: "2.0"` in every
+  `manifest.json`, `expected-normalized.json` pinned to
+  `expected_normalized_version: "0.4"`).
+
+### Preserved deliberately
+
+- `schemas/dpkg-v0.3.json` / `schemas/diff-v0.3.json` /
+  `schemas/expected-normalized-v0.3.json` stay verbatim as historical
+  wire artifacts referenced by v0.3 tags.
+- `PX_E_*` error-code prefix — remains the Parallax-ecosystem
+  taxonomy, unchanged across the v0.3 → v0.4 break.
+- v0.2.x / v0.3.0 `CHANGELOG` entries stay historical (references to
+  `dpkg_spec_version` in those entries describe what was true at the
+  time of shipping and are not rewritten).
+
 ## [0.3.0] — 2026-04-23
 
 ### Renamed

@@ -83,6 +83,7 @@ def tmp_source(tmp_path: Path) -> Path:
     claim_hash = hashlib.sha256(claim_bytes).hexdigest()
 
     manifest = {
+        "aphelion_spec_version": "0.4.0",
         "claims": [
             {
                 "claim_id": UUID_CLAIM_A,
@@ -93,7 +94,7 @@ def tmp_source(tmp_path: Path) -> Path:
             }
         ],
         "created_at": "2026-04-21T00:00:00Z",
-        "format_version": "1.0",
+        "format_version": "2.0",
         "license": "Apache-2.0",
         "package_id": UUID_PKG,
         "producer": "aphelion-test",

@@ -52,7 +52,7 @@ EXCLUDED_KEYS: frozenset[str] = frozenset(
         "claim_id",
         "claim_instance_id",
         "format_version",
-        "dpkg_spec_version",
+        "aphelion_spec_version",
         "exchange_profile_version",
     }
 )

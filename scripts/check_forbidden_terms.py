@@ -42,12 +42,23 @@ SKIP_RELATIVE_DIRS = (
 )
 
 # The scanner itself and the terms list mention the forbidden terms literally.
+# The migration-related files (code + tests + normative spec) must reference
+# the legacy ``dpkg_spec_version`` field by name — that is their job. The
+# CHANGELOG preserves historical mentions verbatim per the "never rewrite
+# shipped history" rule.
 SELF_EXEMPT_RELATIVE = frozenset(
     {
         Path(".forbidden-terms.txt"),
         Path("scripts") / "check_forbidden_terms.py",
         Path("tests") / "test_forbidden_terms.py",
         Path("spec") / "reserved-namespaces.md",
+        Path("CHANGELOG.md"),
+        Path("spec") / "migration-v0.3-to-v0.4.md",
+        Path("spec") / "VERSIONING.md",
+        Path("spec") / "error-codes.md",
+        Path("src") / "aphelion" / "migrate.py",
+        Path("tests") / "test_migrate.py",
+        Path("tests") / "test_versioning.py",
     }
 )
 
