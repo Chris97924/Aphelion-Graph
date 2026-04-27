@@ -11,7 +11,11 @@ All raised codes come from :class:`aphelion.error_codes.ErrorCode`.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 from aphelion import SCHEMA_VERSION_MAX
@@ -300,6 +304,142 @@ def validate_provenance_event(obj: Any) -> None:
         _check_pattern(
             "target_claim_instance_id", obj["target_claim_instance_id"], UUID_V7_RE
         )
+
+
+def validate_signatures(tar_path: Path | str) -> "tuple[Any, ...]":
+    """Verify all signatures in a .aphelion.tar against spec §5 rules.
+
+    Returns a tuple of ``SignatureEnvelope`` objects (empty tuple for unsigned packages).
+    Raises ``SignerVerificationError`` on any §5 rule violation.
+
+    Decision: presence of ``signatures.jsonl`` opts the package into §5
+    verification regardless of caller flags. The ``require_signed`` flag
+    at the verifier layer only controls whether ABSENCE of signatures is an error.
+    """
+    from aphelion.unpacker import extract_signatures_jsonl, extract_signer_manifests
+    from aphelion.sig_pack import read_signatures_jsonl
+    from aphelion.signer import (
+        HMACVerifier,
+        SignerManifest,
+        SignerVerificationError,
+        _REGISTRY,
+        _require_cryptography,
+        compute_key_fingerprint,
+        compute_package_canonical_hash,
+        parse_envelope_line,
+    )
+
+    # §5 rule 2 (implicit): read signatures.jsonl; if absent → unsigned-valid
+    sig_content = extract_signatures_jsonl(tar_path)
+    if sig_content is None:
+        return ()
+
+    # Parse and validate sort order (raises E_SIGNATURE_MALFORMED / E_SIGNATURE_ORDER)
+    envelopes = read_signatures_jsonl(sig_content)
+
+    signer_manifests_raw = extract_signer_manifests(tar_path)
+
+    # Load package canonical hash from manifest inside the tar
+    import tarfile
+    archive = Path(tar_path)
+    with tarfile.open(archive, mode="r") as tar:
+        manifest_member = tar.extractfile(tar.getmember("manifest.json"))
+        assert manifest_member is not None
+        manifest_bytes = manifest_member.read()
+        manifest_member.close()
+
+    from aphelion.canonical_json import loads as cj_loads, normalize
+    manifest_obj = normalize(cj_loads(manifest_bytes))
+    claims_tuples = [
+        (c["claim_id"], c["claim_instance_id"], c["hash"])
+        for c in manifest_obj["claims"]
+    ]
+    expected_hash = compute_package_canonical_hash(
+        format_version=manifest_obj["format_version"],
+        package_id=manifest_obj["package_id"],
+        claims=claims_tuples,
+    )
+
+    for envelope in envelopes:
+        signer_id = envelope.signer_id
+
+        # §5 rule: signers/<signer_id>.json must exist
+        if signer_id not in signer_manifests_raw:
+            raise SignerVerificationError(
+                "E_SIGNER_MISSING",
+                f"no signer manifest found for signer_id={signer_id!r}",
+            )
+
+        # Parse signer manifest
+        try:
+            raw = json.loads(signer_manifests_raw[signer_id].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SignerVerificationError(
+                "E_SIGNER_MALFORMED",
+                f"signers/{signer_id}.json is not valid JSON: {exc}",
+            ) from exc
+
+        try:
+            sm = SignerManifest(
+                signer_id=raw["signer_id"],
+                algorithm=raw["algorithm"],
+                public_key_b64=raw["public_key_b64"],
+                key_fingerprint=raw["key_fingerprint"],
+                notary_uri=raw.get("notary_uri"),
+            )
+        except (KeyError, TypeError) as exc:
+            raise SignerVerificationError(
+                "E_SIGNER_MALFORMED",
+                f"signers/{signer_id}.json missing required fields: {exc}",
+            ) from exc
+
+        # §5 rule: key_fingerprint recomputes
+        try:
+            pub_raw = base64.standard_b64decode(sm.public_key_b64)
+        except (ValueError, binascii.Error) as exc:
+            raise SignerVerificationError(
+                "E_SIGNER_MALFORMED",
+                f"public_key_b64 not valid base64: {exc}",
+            ) from exc
+
+        recomputed_fp = compute_key_fingerprint(pub_raw)
+        import hmac as _hmac
+        if not _hmac.compare_digest(recomputed_fp, sm.key_fingerprint):
+            raise SignerVerificationError(
+                "E_SIGNER_FINGERPRINT_MISMATCH",
+                f"recomputed fingerprint {recomputed_fp!r} != declared {sm.key_fingerprint!r}",
+            )
+
+        # §5 rule: package_canonical_hash recomputes
+        if not _hmac.compare_digest(envelope.package_canonical_hash, expected_hash):
+            raise SignerVerificationError(
+                "E_SIGNATURE_HASH_MISMATCH",
+                "envelope package_canonical_hash does not match recomputed value",
+            )
+
+        # §5 rule: algorithm must be in registry
+        if envelope.algorithm not in _REGISTRY:
+            raise SignerVerificationError(
+                "E_SIGNER_ALGORITHM_UNKNOWN",
+                f"algorithm {envelope.algorithm!r} not in registry",
+            )
+
+        # §5 rule: verify signature bytes
+        if envelope.algorithm == "hmac-sha256":
+            HMACVerifier().verify(envelope, sm, package_canonical_hash=expected_hash)
+        elif envelope.algorithm == "ed25519":
+            from aphelion.signer import Ed25519Verifier
+            Ed25519Verifier(public_key_b64=sm.public_key_b64).verify(
+                envelope, sm, package_canonical_hash=expected_hash
+            )
+        else:
+            # Should not reach here — algorithm check above would have raised
+            raise SignerVerificationError(
+                "E_SIGNER_ALGORITHM_UNKNOWN",
+                f"no verifier for algorithm {envelope.algorithm!r}",
+            )
+
+    return envelopes
 
 
 def validate_package(manifest_obj: Any, events: list[Any],

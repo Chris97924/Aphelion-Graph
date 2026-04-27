@@ -16,6 +16,8 @@ import tarfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SecurityError
@@ -229,3 +231,52 @@ def unpack(
                     ),
                 )
     return dest
+
+
+def extract_signatures_jsonl(tar_path: Path | str) -> bytes | None:
+    """Return raw bytes of ``signatures.jsonl`` at archive root, or ``None`` if absent.
+
+    Spec §5: presence of signatures.jsonl opts the package into v0.5 verification.
+    This is a read-only accessor that does NOT run security checks — it is only
+    used after a package has already been trust-verified at the tar level.
+    """
+    archive = Path(tar_path)
+    with tarfile.open(archive, mode="r") as tar:
+        try:
+            member = tar.getmember("signatures.jsonl")
+        except KeyError:
+            return None
+        src = tar.extractfile(member)
+        if src is None:
+            return None
+        try:
+            return src.read()
+        finally:
+            src.close()
+
+
+def extract_signer_manifests(tar_path: Path | str) -> Mapping[str, bytes]:
+    """Return a frozen mapping of ``signer_id`` → raw JSON bytes for each
+    ``signers/<signer_id>.json`` file present in the archive.
+
+    Returns an empty ``MappingProxyType`` if no ``signers/`` directory exists.
+    Spec §5: used during signature verification to locate signer manifests.
+    """
+    archive = Path(tar_path)
+    result: dict[str, bytes] = {}
+    with tarfile.open(archive, mode="r") as tar:
+        for member in tar.getmembers():
+            name = member.name
+            if name.startswith("signers/") and name.endswith(".json") and member.isreg():
+                # signer_id is the stem: signers/<signer_id>.json
+                signer_id = name[len("signers/"):-len(".json")]
+                if not signer_id:
+                    continue
+                src = tar.extractfile(member)
+                if src is None:
+                    continue
+                try:
+                    result[signer_id] = src.read()
+                finally:
+                    src.close()
+    return MappingProxyType(result)

@@ -166,13 +166,182 @@ def _cmd_migrate(args: argparse.Namespace, writer: Writer) -> int:
 
 
 def _cmd_verify(args: argparse.Namespace, writer: Writer) -> int:
-    from aphelion.verifier import verify as do_verify
+    from pathlib import Path as _Path
+    from aphelion.verifier import verify as do_verify, verify_package
+    from aphelion.signer import SignerVerificationError
 
-    do_verify(args.dir)
+    target = _Path(args.dir)
+    require_signed: bool = getattr(args, "require_signed", False)
+    require_notary: bool = getattr(args, "require_notary", False)
+    if require_notary:
+        require_signed = True
+
+    # If target is a tar file, use verify_package() (v0.5 path).
+    # If it's a directory, fall back to legacy verify() (v0.4 only).
+    if target.is_file() and (require_signed or require_notary or target.suffix in (".tar",) or str(target).endswith(".aphelion.tar")):
+        try:
+            result = verify_package(target, require_signed=require_signed, require_notary=require_notary)
+        except SignerVerificationError as exc:
+            from aphelion.errors import emit_error, SchemaError, EXIT_VALIDATION
+            from aphelion.error_codes import ErrorCode
+            import sys
+            # Emit as JSON error line to stderr then return non-zero
+            import json
+            sys.stderr.write(json.dumps({"code": exc.code, "severity": "error", "msg": str(exc)}, sort_keys=True) + "\n")
+            sys.stderr.flush()
+            return EXIT_VALIDATION
+        data: dict = {"path": str(target), "envelopes": len(result.envelopes)}
+        writer.success(
+            "verify",
+            summary=f"{target}: semantic + signature OK ({len(result.envelopes)} envelope(s))",
+            data=data,
+        )
+    else:
+        do_verify(args.dir)
+        writer.success(
+            "verify",
+            summary=f"{args.dir}: semantic cross-reference OK",
+            data={"dir": str(args.dir)},
+        )
+    return EXIT_OK
+
+
+def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
+    """Pack a signed .aphelion.tar from an existing package tar.
+
+    Reads the HMAC key (or Ed25519 private key) from --key-file,
+    computes the canonical package hash, produces a SignatureEnvelope,
+    writes/merges signatures.jsonl and signers/<signer_id>.json,
+    then repacks into --out.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from aphelion.canonical_tar import read_members, TarMember
+    from aphelion.canonical_tar import pack as tar_pack
+    from aphelion.canonical_json import loads as cj_loads, normalize, dumps as cj_dumps
+    from aphelion.signer import (
+        HMACSigner,
+        SignerVerificationError,
+        compute_package_canonical_hash,
+    )
+    from aphelion.sig_pack import write_signatures_jsonl, read_signatures_jsonl
+    import datetime
+
+    pkg_path = _Path(args.package)
+    if not pkg_path.exists():
+        from aphelion.errors import SchemaError, EXIT_VALIDATION
+        from aphelion.error_codes import ErrorCode
+        from aphelion.errors import emit_error
+        emit_error(SchemaError(code=ErrorCode.MISSING_FILE, msg=f"package not found: {pkg_path}"))
+        return EXIT_VALIDATION
+
+    key_path = _Path(args.key_file)
+    if not key_path.exists() or key_path.stat().st_size == 0:
+        from aphelion.errors import SchemaError, EXIT_VALIDATION
+        from aphelion.error_codes import ErrorCode
+        from aphelion.errors import emit_error
+        emit_error(SchemaError(code=ErrorCode.MISSING_FILE, msg=f"key file not found or empty: {key_path}"))
+        return EXIT_VALIDATION
+
+    key_bytes = key_path.read_bytes()
+    algorithm = args.algorithm
+    signer_id = args.signer_id
+
+    # Build the signer
+    try:
+        if algorithm == "hmac-sha256":
+            signer = HMACSigner(signer_id=signer_id, secret=key_bytes)
+        elif algorithm == "ed25519":
+            import base64 as _base64
+            from aphelion.signer import Ed25519Signer, _require_cryptography
+            _require_cryptography()
+            priv_b64 = _base64.standard_b64encode(key_bytes).decode("ascii")
+            signer = Ed25519Signer(signer_id=signer_id, private_key_b64=priv_b64)
+        else:
+            from aphelion.errors import SchemaError, EXIT_VALIDATION
+            from aphelion.error_codes import ErrorCode
+            from aphelion.errors import emit_error
+            emit_error(SchemaError(code=ErrorCode.ENUM_INVALID, msg=f"unknown algorithm: {algorithm!r}"))
+            return EXIT_VALIDATION
+    except SignerVerificationError as exc:
+        import sys
+        import json
+        sys.stderr.write(json.dumps({"code": exc.code, "severity": "error", "msg": str(exc)}, sort_keys=True) + "\n")
+        sys.stderr.flush()
+        return EXIT_VALIDATION
+
+    # Read existing tar members
+    members = read_members(pkg_path.read_bytes())
+
+    # Find manifest.json in tar to compute canonical hash
+    manifest_raw: bytes | None = None
+    for m in members:
+        if m.path == "manifest.json":
+            manifest_raw = m.data
+            break
+    if manifest_raw is None:
+        from aphelion.errors import SchemaError, EXIT_VALIDATION
+        from aphelion.error_codes import ErrorCode
+        from aphelion.errors import emit_error
+        emit_error(SchemaError(code=ErrorCode.MISSING_FILE, msg="manifest.json not found in archive"))
+        return EXIT_VALIDATION
+
+    manifest_obj = normalize(cj_loads(manifest_raw))
+    claims_tuples = [
+        (c["claim_id"], c["claim_instance_id"], c["hash"])
+        for c in manifest_obj["claims"]
+    ]
+    pkg_hash = compute_package_canonical_hash(
+        format_version=manifest_obj["format_version"],
+        package_id=manifest_obj["package_id"],
+        claims=claims_tuples,
+    )
+
+    signed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    envelope = signer.sign(package_canonical_hash=pkg_hash, signed_at_iso=signed_at)
+    manifest_record = signer.manifest()
+
+    # Merge with existing signatures if present
+    existing_sigs_bytes: bytes | None = None
+    for m in members:
+        if m.path == "signatures.jsonl":
+            existing_sigs_bytes = m.data
+            break
+
+    existing_envelopes: list = []
+    if existing_sigs_bytes:
+        existing_envelopes = list(read_signatures_jsonl(existing_sigs_bytes))
+
+    # Remove existing envelopes from same signer_id (replace with new one)
+    existing_envelopes = [e for e in existing_envelopes if e.signer_id != signer_id]
+    all_envelopes = existing_envelopes + [envelope]
+    new_sig_bytes = write_signatures_jsonl(all_envelopes)
+
+    manifest_json = cj_dumps(normalize({
+        "signer_id": manifest_record.signer_id,
+        "algorithm": manifest_record.algorithm,
+        "public_key_b64": manifest_record.public_key_b64,
+        "key_fingerprint": manifest_record.key_fingerprint,
+        "notary_uri": None,
+    }))
+
+    # Build new members list (replace/add signatures.jsonl + signers/<id>.json)
+    signer_manifest_path = f"signers/{signer_id}.json"
+    new_members = [
+        m for m in members
+        if m.path not in ("signatures.jsonl", signer_manifest_path)
+    ]
+    new_members.append(TarMember(path="signatures.jsonl", data=new_sig_bytes, is_dir=False))
+    new_members.append(TarMember(path=signer_manifest_path, data=manifest_json, is_dir=False))
+
+    out_path = _Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(tar_pack(new_members))
+
     writer.success(
-        "verify",
-        summary=f"{args.dir}: semantic cross-reference OK",
-        data={"dir": str(args.dir)},
+        "sign",
+        summary=f"signed {pkg_path} -> {out_path} (signer={signer_id}, algo={algorithm})",
+        data={"package": str(pkg_path), "out": str(out_path), "signer_id": signer_id, "algorithm": algorithm},
     )
     return EXIT_OK
 
@@ -248,14 +417,45 @@ def _build_parser() -> argparse.ArgumentParser:
     p_unp.add_argument("--max-path-length", type=int, default=512)
     p_unp.set_defaults(func=_cmd_unpack)
 
-    p_ver = sub.add_parser("verify", help="semantic cross-reference check on an unpacked tree")
-    p_ver.add_argument("dir", help="unpacked Aphelion directory")
-    p_ver.set_defaults(func=_cmd_verify)
+    p_ver = sub.add_parser(
+        "verify",
+        help="semantic cross-reference check (unpacked dir) or v0.5 tar verification",
+    )
+    p_ver.add_argument("dir", help="unpacked Aphelion directory or .aphelion.tar path")
+    p_ver.add_argument(
+        "--require-signed",
+        dest="require_signed",
+        action="store_true",
+        help="require at least one valid signature (E_SIGNER_REQUIRED if absent)",
+    )
+    p_ver.add_argument(
+        "--require-notary",
+        dest="require_notary",
+        action="store_true",
+        help="require notary attestation (implies --require-signed; E_SIGNER_NOTARY_REQUIRED if only local)",
+    )
+    p_ver.set_defaults(func=_cmd_verify, require_signed=False, require_notary=False)
 
     p_diff = sub.add_parser("diff", help="layered diff between two unpacked Aphelion packages")
     p_diff.add_argument("a", help="path to package A (unpacked directory)")
     p_diff.add_argument("b", help="path to package B (unpacked directory)")
     p_diff.set_defaults(func=_cmd_diff)
+
+    p_sign = sub.add_parser(
+        "sign",
+        help="sign a .aphelion.tar and write signed tar to --out",
+    )
+    p_sign.add_argument("--package", required=True, help=".aphelion.tar to sign")
+    p_sign.add_argument("--signer-id", dest="signer_id", required=True, help="signer identity string")
+    p_sign.add_argument(
+        "--algorithm",
+        choices=["hmac-sha256", "ed25519"],
+        required=True,
+        help="signing algorithm",
+    )
+    p_sign.add_argument("--key-file", dest="key_file", required=True, help="raw key bytes file")
+    p_sign.add_argument("--out", required=True, help="output .aphelion.tar path")
+    p_sign.set_defaults(func=_cmd_sign)
 
     p_mig = sub.add_parser(
         "migrate",

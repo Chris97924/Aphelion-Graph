@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.5.0] — 2026-04-27
+
+### Added (additive — v0.4 readers ignoring `signatures.jsonl` + `signers/` still validate every previously-conforming v0.4 package unchanged)
+
+- **Signer / trust extension** per `spec/v0.5-signer-trust.md`. Three roles
+  separated: `author` (v0.3 frontmatter, unchanged), `approver` (new
+  optional `approvers: [...]` frontmatter), `signer` (new package-level,
+  per-package signature envelope).
+- **`SignatureEnvelope`** + **`SignerManifest`** frozen dataclasses
+  (`src/aphelion/signer.py`). Package signatures are detached, append-only,
+  written to `signatures.jsonl` at archive root, lex-sorted by
+  `(signer_id, signed_at_iso)` for byte-deterministic round-trip.
+- **Algorithm registry**: `hmac-sha256` (TEST-ONLY reference; emits a
+  warning when verified unless `--allow-test-algorithms`) and `ed25519`
+  (RFC 8032; real impl available under `aphelion[signer]` extra requiring
+  `cryptography >= 42`; algorithm-agnostic core ships in stdlib).
+- **`src/aphelion/sig_pack.py`** — `write_signatures_jsonl` /
+  `read_signatures_jsonl` / `is_sorted_correctly`. Pure, deterministic,
+  spec §2.4 line-ordering enforced; mismatch raises
+  `E_SIGNATURE_ORDER` / `E_SIGNATURE_MALFORMED`.
+- **`src/aphelion/trust.py`** — `resolve_notary` /
+  `attestation_is_acceptable` extension-point stubs per spec §4. v0.5
+  performs zero notary I/O; every lookup yields `verified-locally`.
+  Normative resolver protocol reserved for v0.6+.
+- **Verifier integration** (`src/aphelion/verifier.py`):
+  `verify_package(tar_path, *, require_signed=False, require_notary=False)
+  -> VerifyResult`. Spec §5 verification chain runs whenever
+  `signatures.jsonl` is present in the archive, regardless of
+  `require_signed` (presence opts the package into §5). `require_signed`
+  controls whether ABSENCE is an error; `require_notary` controls whether
+  `verified-locally` is acceptable.
+- **CLI**: new `aphe sign --package … --signer-id … --algorithm
+  {hmac-sha256,ed25519} --key-file … --out …` subcommand, plus
+  `--require-signed` / `--require-notary` flags on `aphe verify`. Existing
+  CLI subcommands unchanged.
+- **`src/aphelion/unpacker.py`** — additive read-only accessors
+  `extract_signatures_jsonl(tar_path) -> bytes | None` and
+  `extract_signer_manifests(tar_path) -> Mapping[str, bytes]`.
+- **`src/aphelion/validator.py`** — `validate_signatures(tar_path)
+  -> tuple[SignatureEnvelope, ...]`, full §5 rule sequence: parse, order
+  check, manifest lookup, fingerprint recompute, canonical-hash recompute,
+  algorithm registry, signature verify.
+- Optional dependency: `aphelion[signer] = ["cryptography>=42"]`.
+- Spec error codes (§6): `E_SIGNATURE_MALFORMED`, `E_SIGNATURE_HASH_MISMATCH`,
+  `E_SIGNATURE_INVALID`, `E_SIGNATURE_ORDER`, `E_SIGNER_MISSING`,
+  `E_SIGNER_MALFORMED`, `E_SIGNER_FINGERPRINT_MISMATCH`,
+  `E_SIGNER_ALGORITHM_UNKNOWN`, `E_SIGNER_ALGORITHM_UNAVAILABLE`,
+  `E_SIGNER_REQUIRED`, `E_SIGNER_NOTARY_REQUIRED`. Documented in
+  `spec/error-codes.md`.
+
+### Tests
+
+- 412 tests GREEN (was 305 in v0.4.0). +107 in v0.5: 57 in `test_signer.py`,
+  19 in `test_sig_pack.py`, 9 in `test_trust.py`, 22 in
+  `test_verifier_signed.py`. Coverage: signer.py / sig_pack.py / trust.py
+  100%; validator.py 96%; verifier.py 97%; unpacker.py 97%; cli.py 85%.
+
+### Compatibility
+
+- v0.5 is **strictly additive**. Existing v0.4 packages verify with
+  identical behavior. v0.5 reader on an unsigned v0.4 package returns
+  `VerifyResult(envelopes=(), attestations=())` and exits 0. No v0.4 →
+  v0.5 migration is required.
+
 ## [0.4.0] — 2026-04-24
 
 ### Breaking (wire seal)

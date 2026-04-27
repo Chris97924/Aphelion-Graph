@@ -108,3 +108,25 @@ All raise sites import the `ErrorCode` enum — no string literals.
 | Code       | Name    | Condition                                      |
 |------------|---------|------------------------------------------------|
 | PX_E_9001  | UNKNOWN | Uncategorised failure (last-resort fallback).  |
+
+---
+
+## v0.5 — Signer / Trust error codes
+
+These codes are emitted by `signer.SignerVerificationError` (not `ErrorCode` enum) and
+are used by the v0.5 signature verification path in `validator.validate_signatures()` and
+`verifier.verify_package()`. See `spec/v0.5-signer-trust.md §6` for normative detail.
+
+| Code                           | Condition                                                                                 |
+|--------------------------------|-------------------------------------------------------------------------------------------|
+| `E_SIGNATURE_MALFORMED`        | `signatures.jsonl` line fails §2.2 schema (non-UTF-8, missing fields, wrong types).      |
+| `E_SIGNER_MISSING`             | Envelope references `signer_id` with no matching `signers/<signer_id>.json`.             |
+| `E_SIGNER_MALFORMED`           | `signers/<signer_id>.json` exists but fails §2.3 schema.                                  |
+| `E_SIGNER_FINGERPRINT_MISMATCH`| `key_fingerprint` in signer manifest does not recompute from `public_key_b64`.           |
+| `E_SIGNATURE_HASH_MISMATCH`    | Envelope `package_canonical_hash` does not match recomputed value from current contents. |
+| `E_SIGNER_ALGORITHM_UNKNOWN`   | `algorithm` field value is not in the §3.1 registry.                                     |
+| `E_SIGNATURE_INVALID`          | Signature bytes fail cryptographic verification against the public key.                   |
+| `E_SIGNATURE_ORDER`            | Lines in `signatures.jsonl` violate §2.4 lex-ascending sort order.                       |
+| `E_SIGNER_REQUIRED`            | Caller passed `--require-signed` but package has no `signatures.jsonl`.                  |
+| `E_SIGNER_NOTARY_REQUIRED`     | Caller passed `--require-notary` but all attestations are `"verified-locally"` only.     |
+| `E_SIGNER_ALGORITHM_UNAVAILABLE`| `cryptography` extra is not installed; `ed25519` cannot be used.                        |
