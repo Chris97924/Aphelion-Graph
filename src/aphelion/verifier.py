@@ -1,12 +1,25 @@
-"""Semantic verifier: post-unpack cross-reference checks.
+"""Semantic verifier: post-unpack cross-reference checks plus v0.5 signature verification.
 
-Raises :class:`aphelion.errors.SemanticError` / :class:`VerificationError` with
-codes drawn from :class:`aphelion.error_codes.ErrorCode` (5NN band).
+v0.4 checks (§S1–§S3):
+  Raises :class:`aphelion.errors.SemanticError` / :class:`VerificationError` with
+  codes drawn from :class:`aphelion.error_codes.ErrorCode` (5NN band).
+
+v0.5 extension:
+  ``verify_package(tar_path, *, require_signed=False, require_notary=False)``
+  runs v0.4 checks first, then validates signatures per spec §5.
+  Returns :class:`VerifyResult` (frozen dataclass) with ``envelopes`` and
+  ``attestations`` fields.
+
+Backward-compat: ``require_signed=False, require_notary=False`` preserves v0.4
+behavior. Presence of ``signatures.jsonl`` always invokes §5 — the
+``require_signed`` flag only controls whether ABSENCE of signatures is an error.
 """
 
 from __future__ import annotations
 
 import hashlib
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -152,3 +165,94 @@ def _check_provenance_refs(
                 ),
                 path=ev["event_id"],
             )
+
+
+# ---------------------------------------------------------------------------
+# v0.5 extension: VerifyResult + verify_package()
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    """Result of ``verify_package()``.
+
+    ``envelopes``: tuple of verified ``SignatureEnvelope`` objects (empty for unsigned).
+    ``attestations``: tuple of ``NotaryAttestation`` strings, one per envelope.
+    """
+
+    envelopes: tuple[Any, ...]
+    attestations: tuple[Any, ...]
+
+
+def verify_package(
+    tar_path: Path | str,
+    *,
+    require_signed: bool = False,
+    require_notary: bool = False,
+) -> VerifyResult:
+    """Verify a .aphelion.tar end-to-end (v0.4 rules + v0.5 signature rules).
+
+    Spec §5 verification order:
+    1. Unpack tar, run v0.4 semantic checks (hash, fileset, chain, refs).
+       Failure here uses v0.4 error codes; signatures are NOT checked.
+    2. Run ``validator.validate_signatures(tar_path)``. Returns envelopes tuple.
+    3. If ``require_signed=True`` and envelopes is empty: raise E_SIGNER_REQUIRED.
+    4. For each envelope, resolve notary. If ``require_notary=True`` and any
+       attestation is ``"verified-locally"`` only: raise E_SIGNER_NOTARY_REQUIRED.
+
+    Backward-compat: defaults (require_signed=False, require_notary=False) preserve
+    v0.4 behavior — unsigned packages pass, signed packages are §5-verified.
+    """
+    from aphelion.signer import SignerVerificationError, SignerManifest
+    from aphelion.trust import resolve_notary, attestation_is_acceptable
+    from aphelion.validator import validate_signatures
+
+    tar_path = Path(tar_path)
+
+    # Step 1: v0.4 checks via unpack + verify
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        from aphelion.unpacker import unpack
+        unpacked = unpack(tar_path, tmp_dir)
+        verify(unpacked)
+
+    # Step 2: v0.5 signature validation
+    envelopes = validate_signatures(tar_path)
+
+    # Step 3: require_signed check
+    if require_signed and len(envelopes) == 0:
+        raise SignerVerificationError(
+            "E_SIGNER_REQUIRED",
+            "package has no signatures but caller requires --require-signed",
+        )
+
+    # Step 4: notary resolution
+    attestations: list[Any] = []
+    for envelope in envelopes:
+        # Re-read the signer manifest to build SignerManifest for trust resolution
+        import json as _json
+        from aphelion.unpacker import extract_signer_manifests
+        from aphelion.canonical_json import normalize as cj_normalize
+
+        signer_manifests_raw = extract_signer_manifests(tar_path)
+        raw = _json.loads(signer_manifests_raw[envelope.signer_id].decode("utf-8"))
+        sm = SignerManifest(
+            signer_id=raw["signer_id"],
+            algorithm=raw["algorithm"],
+            public_key_b64=raw["public_key_b64"],
+            key_fingerprint=raw["key_fingerprint"],
+            notary_uri=raw.get("notary_uri"),
+        )
+        attestation = resolve_notary(sm)
+        attestations.append(attestation)
+
+        if require_notary and not attestation_is_acceptable(attestation, require_notary=True):
+            raise SignerVerificationError(
+                "E_SIGNER_NOTARY_REQUIRED",
+                f"signer {envelope.signer_id!r} attestation is {attestation!r} "
+                "but caller requires --require-notary",
+            )
+
+    return VerifyResult(
+        envelopes=tuple(envelopes),
+        attestations=tuple(attestations),
+    )
