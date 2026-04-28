@@ -781,6 +781,218 @@ def test_cli_aphe_verify_unsigned_with_flag_fails(tmp_path: Path) -> None:
     assert "E_SIGNER_REQUIRED" in err.getvalue()
 
 
+@pytest.mark.unit
+def test_validate_signatures_algorithm_mismatch_envelope_hmac_manifest_ed25519(
+    tmp_path: Path,
+) -> None:
+    """E_SIGNER_ALGORITHM_MISMATCH: envelope=hmac-sha256 but manifest claims ed25519."""
+    from aphelion.validator import validate_signatures
+    from aphelion.packer import pack
+    from aphelion.canonical_tar import read_members, TarMember
+    from aphelion.canonical_tar import pack as tar_pack
+
+    src = tmp_path / "src"
+    _build_minimal_source(src)
+    tar_path = tmp_path / "pkg.tar"
+    pack(src, tar_path)
+
+    manifest_obj = normalize(json.loads((src / "manifest.json").read_bytes()))
+    claims_tuples = [
+        (c["claim_id"], c["claim_instance_id"], c["hash"])
+        for c in manifest_obj["claims"]
+    ]
+    pkg_hash = compute_package_canonical_hash(
+        format_version=manifest_obj["format_version"],
+        package_id=manifest_obj["package_id"],
+        claims=claims_tuples,
+    )
+    # Envelope uses hmac-sha256 (valid HMAC signature)
+    s = HMACSigner(signer_id=SIGNER_ID, secret=SHARED_SECRET)
+    envelope = s.sign(package_canonical_hash=pkg_hash, signed_at_iso=SIGNED_AT)
+    sig_bytes = write_signatures_jsonl([envelope])
+
+    # Signer manifest lies: claims algorithm=ed25519 but fingerprint matches HMAC key
+    fp = compute_key_fingerprint(SHARED_SECRET)
+    lying_manifest = canonical_dumps(normalize({
+        "signer_id": SIGNER_ID,
+        "algorithm": "ed25519",  # mismatch: envelope says hmac-sha256
+        "public_key_b64": base64.standard_b64encode(SHARED_SECRET).decode(),
+        "key_fingerprint": fp,
+        "notary_uri": None,
+    }))
+
+    existing = read_members(tar_path.read_bytes())
+    new_tar = tar_pack(existing + [
+        TarMember(path="signatures.jsonl", data=sig_bytes, is_dir=False),
+        TarMember(path=f"signers/{SIGNER_ID}.json", data=lying_manifest, is_dir=False),
+    ])
+    tar_path.write_bytes(new_tar)
+
+    with pytest.raises(SignerVerificationError) as exc_info:
+        validate_signatures(tar_path)
+    assert exc_info.value.code == "E_SIGNER_ALGORITHM_MISMATCH"
+
+
+@pytest.mark.unit
+def test_validate_signatures_algorithm_mismatch_envelope_ed25519_manifest_hmac(
+    tmp_path: Path,
+) -> None:
+    """E_SIGNER_ALGORITHM_MISMATCH: envelope claims ed25519 but manifest says hmac-sha256."""
+    from aphelion.validator import validate_signatures
+    from aphelion.packer import pack
+    from aphelion.canonical_tar import read_members, TarMember
+    from aphelion.canonical_tar import pack as tar_pack
+
+    src = tmp_path / "src"
+    _build_minimal_source(src)
+    tar_path = tmp_path / "pkg.tar"
+    pack(src, tar_path)
+
+    manifest_obj = normalize(json.loads((src / "manifest.json").read_bytes()))
+    claims_tuples = [
+        (c["claim_id"], c["claim_instance_id"], c["hash"])
+        for c in manifest_obj["claims"]
+    ]
+    pkg_hash = compute_package_canonical_hash(
+        format_version=manifest_obj["format_version"],
+        package_id=manifest_obj["package_id"],
+        claims=claims_tuples,
+    )
+    # Craft envelope claiming ed25519 (fake signature bytes, will be rejected at mismatch check)
+    fake_envelope = SignatureEnvelope(
+        signer_id=SIGNER_ID,
+        algorithm="ed25519",
+        signed_at_iso=SIGNED_AT,
+        package_canonical_hash=pkg_hash,
+        signature_b64=base64.standard_b64encode(b"\x00" * 64).decode(),
+    )
+    sig_bytes = write_signatures_jsonl([fake_envelope])
+
+    # Signer manifest correctly says hmac-sha256
+    fp = compute_key_fingerprint(SHARED_SECRET)
+    hmac_manifest = canonical_dumps(normalize({
+        "signer_id": SIGNER_ID,
+        "algorithm": "hmac-sha256",  # mismatch: envelope says ed25519
+        "public_key_b64": base64.standard_b64encode(SHARED_SECRET).decode(),
+        "key_fingerprint": fp,
+        "notary_uri": None,
+    }))
+
+    existing = read_members(tar_path.read_bytes())
+    new_tar = tar_pack(existing + [
+        TarMember(path="signatures.jsonl", data=sig_bytes, is_dir=False),
+        TarMember(path=f"signers/{SIGNER_ID}.json", data=hmac_manifest, is_dir=False),
+    ])
+    tar_path.write_bytes(new_tar)
+
+    with pytest.raises(SignerVerificationError) as exc_info:
+        validate_signatures(tar_path)
+    assert exc_info.value.code == "E_SIGNER_ALGORITHM_MISMATCH"
+
+
+@pytest.mark.integration
+def test_cli_sign_twice_same_signer_preserves_both_envelopes(tmp_path: Path) -> None:
+    """Re-signing with the same signer_id appends rather than replacing prior envelope."""
+    import contextlib
+
+    src = tmp_path / "src"
+    _build_minimal_source(src)
+    tar_path = tmp_path / "pkg.tar"
+    _pack_source(src, tar_path)
+
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(SHARED_SECRET)
+
+    signed_v1 = tmp_path / "signed_v1.tar"
+    signed_v2 = tmp_path / "signed_v2.tar"
+
+    from aphelion.cli import main
+
+    # First sign
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        code = main([
+            "sign",
+            "--package", str(tar_path),
+            "--signer-id", SIGNER_ID,
+            "--algorithm", "hmac-sha256",
+            "--key-file", str(key_file),
+            "--out", str(signed_v1),
+        ])
+    assert code == 0
+
+    # Second sign using the already-signed tar as input (same signer_id)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        code2 = main([
+            "sign",
+            "--package", str(signed_v1),
+            "--signer-id", SIGNER_ID,
+            "--algorithm", "hmac-sha256",
+            "--key-file", str(key_file),
+            "--out", str(signed_v2),
+        ])
+    assert code2 == 0
+
+    # Both envelopes must be present in the output
+    from aphelion.canonical_tar import read_members
+    from aphelion.sig_pack import read_signatures_jsonl
+
+    members = read_members(signed_v2.read_bytes())
+    sig_data = next(m.data for m in members if m.path == "signatures.jsonl")
+    assert sig_data is not None
+    envelopes = read_signatures_jsonl(sig_data)
+    assert len(envelopes) == 2, f"expected 2 envelopes, got {len(envelopes)}"
+    assert all(e.signer_id == SIGNER_ID for e in envelopes)
+
+
+@pytest.mark.integration
+def test_verify_package_accepts_two_envelopes_same_signer(tmp_path: Path) -> None:
+    """verify_package succeeds when a package has two envelopes from the same signer."""
+    from aphelion.verifier import verify_package
+    from aphelion.canonical_tar import read_members, TarMember
+    from aphelion.canonical_tar import pack as tar_pack
+
+    src = tmp_path / "src"
+    _build_minimal_source(src)
+    tar_path = tmp_path / "pkg.tar"
+    _pack_source(src, tar_path)
+
+    manifest_obj = normalize(json.loads((src / "manifest.json").read_bytes()))
+    claims_tuples = [
+        (c["claim_id"], c["claim_instance_id"], c["hash"])
+        for c in manifest_obj["claims"]
+    ]
+    pkg_hash = compute_package_canonical_hash(
+        format_version=manifest_obj["format_version"],
+        package_id=manifest_obj["package_id"],
+        claims=claims_tuples,
+    )
+
+    s = HMACSigner(signer_id=SIGNER_ID, secret=SHARED_SECRET)
+    env1 = s.sign(package_canonical_hash=pkg_hash, signed_at_iso="2026-04-01T00:00:00.000Z")
+    env2 = s.sign(package_canonical_hash=pkg_hash, signed_at_iso="2026-04-27T00:00:00.000Z")
+    sig_bytes = write_signatures_jsonl([env1, env2])
+
+    m = s.manifest()
+    manifest_json = canonical_dumps(normalize({
+        "signer_id": m.signer_id,
+        "algorithm": m.algorithm,
+        "public_key_b64": m.public_key_b64,
+        "key_fingerprint": m.key_fingerprint,
+        "notary_uri": None,
+    }))
+
+    existing = read_members(tar_path.read_bytes())
+    new_tar = tar_pack(existing + [
+        TarMember(path="signatures.jsonl", data=sig_bytes, is_dir=False),
+        TarMember(path=f"signers/{SIGNER_ID}.json", data=manifest_json, is_dir=False),
+    ])
+    tar_path.write_bytes(new_tar)
+
+    result = verify_package(tar_path, require_signed=True)
+    assert len(result.envelopes) == 2
+    assert all(e.signer_id == SIGNER_ID for e in result.envelopes)
+
+
 @pytest.mark.integration
 def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
     """aphe sign then aphe verify --require-signed → success end-to-end."""
