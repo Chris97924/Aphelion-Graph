@@ -424,6 +424,14 @@ def validate_signatures(tar_path: Path | str) -> "tuple[Any, ...]":
                 f"algorithm {envelope.algorithm!r} not in registry",
             )
 
+        # §5 rule: envelope algorithm must match signer manifest algorithm
+        if envelope.algorithm != sm.algorithm:
+            raise SignerVerificationError(
+                "E_SIGNER_ALGORITHM_MISMATCH",
+                f"envelope algorithm {envelope.algorithm!r} does not match "
+                f"signer manifest algorithm {sm.algorithm!r}",
+            )
+
         # §5 rule: verify signature bytes
         if envelope.algorithm == "hmac-sha256":
             HMACVerifier().verify(envelope, sm, package_canonical_hash=expected_hash)

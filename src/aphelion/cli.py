@@ -312,8 +312,6 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
     if existing_sigs_bytes:
         existing_envelopes = list(read_signatures_jsonl(existing_sigs_bytes))
 
-    # Remove existing envelopes from same signer_id (replace with new one)
-    existing_envelopes = [e for e in existing_envelopes if e.signer_id != signer_id]
     all_envelopes = existing_envelopes + [envelope]
     new_sig_bytes = write_signatures_jsonl(all_envelopes)
 
