@@ -125,6 +125,7 @@ are used by the v0.5 signature verification path in `validator.validate_signatur
 | `E_SIGNER_FINGERPRINT_MISMATCH`| `key_fingerprint` in signer manifest does not recompute from `public_key_b64`.           |
 | `E_SIGNATURE_HASH_MISMATCH`    | Envelope `package_canonical_hash` does not match recomputed value from current contents. |
 | `E_SIGNER_ALGORITHM_UNKNOWN`   | `algorithm` field value is not in the §3.1 registry.                                     |
+| `E_SIGNER_ALGORITHM_MISMATCH`  | Envelope `algorithm` does not match the signer manifest `algorithm`. Raised before verifier dispatch to close confused-deputy gap. |
 | `E_SIGNATURE_INVALID`          | Signature bytes fail cryptographic verification against the public key.                   |
 | `E_SIGNATURE_ORDER`            | Lines in `signatures.jsonl` violate §2.4 lex-ascending sort order.                       |
 | `E_SIGNER_REQUIRED`            | Caller passed `--require-signed` but package has no `signatures.jsonl`.                  |
