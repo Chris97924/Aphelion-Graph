@@ -151,7 +151,7 @@ fn canonical_timestamp(dt: DateTime<Utc>) -> String {
 ```bash
 # Cross-platform 驗證套路
 # 在三個 OS 上分別執行：
-$ aphelion pack ./my-claim -o claim.tar
+$ aphelion pack ./my-claim claim.tar
 $ sha256sum claim.tar
 # 三個 OS 的 hash 必須完全一致
 ```
