@@ -1,4 +1,3 @@
-```markdown
 # Crosswalk Schema — 三態語意規範 (Tristate Semantics)
 
 > **Spec version:** m9-prep  
@@ -394,4 +393,3 @@ function validateCrosswalkRow(row: CrosswalkRow): boolean {
 ---
 
 *本文件為 Aphelion crosswalk schema tristate 語意的公開規範。衝突仲裁邏輯、Parallax 內部實作策略不在本 spec 範圍內。*
-```
