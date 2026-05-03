@@ -1,4 +1,3 @@
-```markdown
 # Aphelion Spec Social Review — FAQ
 
 > **文件版本**：m9-prep / draft  
@@ -199,4 +198,3 @@ A: 我們計劃發佈 **兩個** PyPI package：
 ---
 
 > **給 implementor 的一句話**：Aphelion 的設計原則是 **simple core, extensible edges**。Core spec 只定義 archive format + hash + state machine，其餘都是 extension。先實作 core，再逐步加 signer / trust / migration，你會發現它比看起來簡單很多。歡迎在 Discussion 區提問或開 PR！
-```

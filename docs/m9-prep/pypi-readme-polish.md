@@ -1,4 +1,3 @@
-```markdown
 # Aphelion — Decision Note Format & Toolchain
 
 > **Aphelion** is an open-source decision note format and CLI toolchain that makes every decision traceable, verifiable, and portable.
@@ -20,23 +19,23 @@ Requires Python 3.10+. No external dependencies beyond the standard library.
 ## 5-Minute Quickstart
 
 ```bash
-# 1. 初始化一個新的 decision note
-aphelion init --title "Use PostgreSQL over MySQL" --id ADR-0042
+# 1. 初始化一個空的 Aphelion skeleton
+aphelion init ./ADR-0042/
 
 # 2. 驗證 note 結構與 schema compliance
 aphelion validate ./ADR-0042/
 
 # 3. 打包為可分發的 canonical bundle
-aphelion pack ./ADR-0042/ -o ADR-0042.aphelion
+aphelion pack ./ADR-0042/ ADR-0042.aphelion.tar
 
 # 4. 解包收到的 bundle
-aphelion unpack ADR-0042.aphelion -o ./restored/
+aphelion unpack ADR-0042.aphelion.tar ./restored/
 
-# 5. 比較兩個版本的差異（claim-level diff）
-aphelion diff ./ADR-0042/ ./ADR-0042-v2/
+# 5. 比較兩個解開後的版本（claim-level diff）
+aphelion diff ./ADR-0042/ ./restored/
 
 # 6. 驗證簽署與信任鏈完整性
-aphelion verify ./ADR-0042.aphelion
+aphelion verify ./ADR-0042.aphelion.tar
 ```
 
 Each command produces machine-readable output (exit codes + JSON on `--json`), making it CI-friendly.
@@ -133,8 +132,3 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ```
-```
-
----
-
-**字數約 1,050 字（zh-TW 正文 + English code block），結構完整、零 fluff。** 若套件名最終確定為 `decision-package`，只需替換 `pip install` 一行與標題即可。
