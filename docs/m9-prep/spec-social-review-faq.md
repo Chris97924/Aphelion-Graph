@@ -35,7 +35,7 @@ A: 一句話：**cross-platform hash determinism**。不同 OS、不同 filesyst
 | Windows CRLF vs Unix LF | 強制 **LF only** |
 | JSON object key order 各語言不同 | 強制 **lexicographic key sort**（RFC 8785 / JCS-like） |
 
-這些規則寫在 spec §4.2「Canonical Archive Encoding」。Implementor 只要在 serialization pipeline 末端加一個 `canonicalize()` pass，就能保證：同一組 claims，不論在哪個平台 build，產出的 `.aphpkg` 逐 byte 相同，SHA-256 一致。這對 reproducible build 和 supply chain security 至關重要。
+這些規則寫在 `spec/canonical-serialization.md` Rule 1–6（特別是 Rule 5 — tar Entry Canonicalization）。Implementor 只要在 serialization pipeline 末端加一個 `canonicalize()` pass，就能保證：同一組 claims，不論在哪個平台 build，產出的 `.aphelion.tar` 逐 byte 相同，SHA-256 一致。這對 reproducible build 和 supply chain security 至關重要。
 
 ---
 
@@ -43,26 +43,29 @@ A: 一句話：**cross-platform hash determinism**。不同 OS、不同 filesyst
 
 **Claim 的 event state machine 長什麼樣？**
 
-A: Aphelion 的每個 claim 都有一個 **lifecycle state**，由 event log 驅動狀態轉換。完整狀態機如下：
+A: Aphelion 的每個 claim 都有一個 **lifecycle state**，由 event log 驅動狀態轉換。完整狀態機（normative source: `spec/lifecycle-state-machine.md` §3 + §4）：
 
 ```
-draft ──publish──▶ active ──reaffirm──▶ reaffirmed
-                      │                      │
-                      │◀───── reaffirm ──────┘
-                      │
-                      ├──revise──▶ revised ──▶ active (new version)
-                      │
-                      ├──supersede──▶ superseded
-                      │
-                      └──withdraw──▶ withdrawn
+       create
+[*] ───────────▶ draft ──publish──▶ active ──reaffirm──▶ reaffirmed
+                  │                  │  ▲                  │
+                  │                  │  └──── decay ────────┘
+                  │                  │
+                  │                  ├──revise──▶ revised ──decay──▶ active (new instance)
+                  │                  │
+                  │                  ├──supersede──▶ superseded ──▶ [*]
+                  │                  │
+                  │                  └──withdraw──▶ withdrawn ──▶ [*]
+                  │
+                  └──── withdraw ────────────────▶ withdrawn ──▶ [*]
 ```
 
 幾個重點：
 
-- **draft → active**：唯一需要 signer authority 的轉換（見 Q5）。
-- **active ⇄ reaffirmed**：reaffirmed 本質上是 active 的「心跳」，表示 claim 仍然有效，通常由 TTL 或 policy 驅動自動觸發。
-- **revised**：內容有變更時產生新 version，舊版自動進入 `superseded`。
-- **withdrawn**：不可逆，代表 claim 被永久撤回，verifier 應將其視為 invalid。
+- **draft → active**：透過 `publish`/`create` event。**Signer 為 optional per-package 屬性**（見 Q5 + `spec/v0.5-signer-trust.md` §1），**不是** lifecycle transition 的前置條件 — unsigned package 一樣 valid。
+- **draft → withdrawn**：合法的 terminal 路徑（`spec/lifecycle-state-machine.md` §4 matrix `draft|withdraw`）。
+- **active ⇄ reaffirmed / revised**：reaffirmed / revised 是 transient labels（不在 `manifest.json.claims[].state`），會 decay 回 active。
+- **superseded / withdrawn**：terminal read-only — 任何後續 event 都是 `ERR-SEM-LIFECYCLE-ILLEGAL`。
 
 每個 state transition 都是一個 **Event object**，帶 timestamp、actor、reason，串成 append-only log。Implementor 只需實作這個 state machine，不需要自己發明 lifecycle 管理邏輯。
 
@@ -72,17 +75,18 @@ draft ──publish──▶ active ──reaffirm──▶ reaffirmed
 
 **Aphelion 的 archive 安全機制如何防範惡意內容？**
 
-A: `.aphpkg` 本質上是 tar-based archive，而 tar 格式眾所周知有 path traversal 等攻擊面。Aphelion spec §6「Archive Security」規定了一組 **strict validation rules**，implementor 必須在 **deserialization 時**（而非事後）執行：
+A: `.aphelion.tar` 本質上是 tar-based archive，而 tar 格式眾所周知有 path traversal 等攻擊面。`spec/packaging.md` Rule 5（Forbidden Inputs）+ Rule 6（Archive Format Freeze）+ Rule 7（Extraction Limits）規定了一組 **strict validation rules**，implementor 必須在 **deserialization 時**（而非事後）執行：
 
 1. **No `..` in paths** — 任何 entry path 包含 `..` 即 reject。
 2. **No absolute paths** — path 以 `/` 開頭即 reject。
 3. **No symlinks** — tar entry type 為 symlink 即 reject。
 4. **No hardlinks** — 同上，hardlink 也 reject（避免 link-based oracle attack）。
-5. **Size limit: 100 MB per entry** — 防止 decompression bomb。
-6. **Entry count limit: 10,000** — 防止 inode exhaustion attack。
-7. **No device files / FIFOs** — tar entry type 為 block/char device 或 FIFO 即 reject。
+5. **Whole-archive size ≤ 100 MiB (104,857,600 bytes)** — `PX_E_6011`，反 decompression bomb。
+6. **Per-file size ≤ 25 MiB**（reference impl 上限；spec 建議 50 MiB）— `PX_E_6010`。
+7. **Entry count limit: 10,000** — 防止 inode exhaustion attack。
+8. **No device files / FIFOs** — tar entry type 為 block/char device 或 FIFO 即 reject。
 
-這些規則的設計哲學是 **deny by default, allowlist by spec**。Implementor 建議在 `ArchiveReader.open()` 內一次性跑完所有 checks，fail-fast。我們也提供了一個 reference implementation（Python）作為 test oracle。
+這些規則的設計哲學是 **deny by default, allowlist by spec**。Implementor 建議在 `ArchiveReader.open()` 內一次性跑完所有 checks，fail-fast。reference implementation（Python）的 `src/aphelion/unpacker.py` 就是 test oracle。
 
 ---
 
@@ -92,13 +96,13 @@ A: `.aphpkg` 本質上是 tar-based archive，而 tar 格式眾所周知有 path
 
 A: **Short answer：v0.5 optional，v1 strongly recommended，v2 可能 mandatory。**
 
-在 v0.5 spec 中，signer/trust 是 **optional extension**。一個沒有簽名的 `.aphpkg` 仍然 valid，只是 verifier 會標記 `integrity: hash-only, no signature`。這讓早期 implementor 可以先 focus 在 core packaging 邏輯。
+在 v0.5 spec 中，signer/trust 是 **optional extension**（`spec/v0.5-signer-trust.md` §1：role 表 `signer = Optional; per-package`）。一個沒有簽名的 `.aphelion.tar` 仍然 valid（§5：unsigned-valid 等同於 v0.4 通過），驗證器只會走 structural + hash 路徑。這讓早期 implementor 可以先 focus 在 core packaging 邏輯。
 
 但在 v1（預計 2025 Q4），我們計劃將 signer 列為 **recommended**，理由是：
 
 - Supply chain attacks 頻率上升，unsigned package 的信任度越來越低。
 - Parallax runtime（見 Q7）在 production 環境會 **refuse unsigned claims**。
-- Trust model（TOFU、CA-based、web-of-trust）的 spec 已在 Aphelion-ADR-0007 中定義。
+- Trust model（TOFU、CA-based、web-of-trust）的 spec 規範在 `spec/v0.5-signer-trust.md`（envelope §2.2 / algorithm §3 / verification §5 / 預留 §7）。
 
 建議 implementor 現在就預留 `Signer` interface，即使 v0.5 只實作 `NoopSigner`。這樣 v1 升級時只需 plug in real implementation，不需要大改架構。
 
@@ -114,9 +118,11 @@ A: 我們盡量讓遷移 **non-breaking**。具體策略：
 
 - `schema_version` 從 `0.1` 升到 `1.0`。
 - 主要 breaking change：canonical serialization 規則（Q2）從 optional 變 mandatory。
-- 我們會提供 `aphelion-migrate` CLI tool（Python，也可作為 library import），一行指令完成轉換：
+- 我們會提供 migration CLI（Python，也可作為 library import）。**v0.5 已 ship `aphe migrate`** 作為 v0.3 ↔ v0.4 的範本（見 `src/aphelion/migrate.py`）；v1 migration 在 v1 spec 拍板後沿用同一 subcommand surface。
+- 範例（**planned v1 syntax — exact CLI surface 待 v1 spec 拍板**）：
   ```bash
-  aphelion-migrate --from 0.1 --to 1.0 ./my-packages/
+  # planned v1 invocation (subject to change before v1 ships)
+  aphe migrate --from 0.x --to 1.0 ./my-packages/
   ```
 - 該 tool 會重新計算所有 content_hash、重排 tar entries、更新 MANIFEST。
 
@@ -160,27 +166,24 @@ Aphelion spec 的所有 dependencies 都是 **standard library level**：
 
 **Aphelion 的 PyPI 發佈策略是什麼？**
 
-A: 我們計劃發佈 **兩個** PyPI package：
+A: 目前已上架 PyPI 的是單一 package `aphelion`（`pyproject.toml` `[project].name = "aphelion"`），bundles library + CLI 在同一 distribution 內：
 
-1. **`aphelion-kit`** — reference implementation library，包含：
-   - `aphelion.archive` — archive 讀寫 + canonical serialization
-   - `aphelion.claim` — claim model + event state machine
-   - `aphelion.signer` — signer interface + NoopSigner
-   - `aphelion.migrate` — v0.x → v1 migration tool
+- `aphelion.archive`（packer / unpacker / canonical serialization）
+- `aphelion.claim`（claim model + event state machine）
+- `aphelion.signer`（`aphelion[signer]` extra：Ed25519 + HMAC-SHA256 test-only）
+- `aphelion.migrate`（v0.3 ↔ v0.4，v1 sequel pending）
+- 對應 CLI 進入點 `aphe`（[`pyproject.toml` `[project.scripts]`](https://packaging.python.org/en/latest/specifications/entry-points/) 中註冊）
 
-2. **`decision-package`**（名稱待確認）— CLI tool，wrap `aphelion-kit`，提供：
-   - `decision build` — 從 source directory build `.aphpkg`
-   - `decision verify` — 驗證 `.aphpkg` integrity + signature
-   - `decision inspect` — 查看 package metadata + event log
+> 是否在 v1 之前再發佈第二個「opinionated CLI wrapper」package（先前 draft 中的 `decision-package` / `decision build|verify|inspect` 構想）尚未拍板；本文件**不視為對該 wrapper 命名或 surface 的承諾**。在拍板前，請使用 `pip install aphelion` + `aphe <subcommand>`。
 
-**License**：兩個 package 都以 **Apache 2.0** 釋出，implementor 可以自由 fork、商用、修改。
+**License**：以 **Apache 2.0** 釋出，implementor 可以自由 fork、商用、修改。
 
 **Release pipeline**：
 - Code push → GitHub Actions（GHA）自動跑 test suite + lint。
 - Tag `vX.Y.Z` → GHA 自動 build wheel + sdist → `twine upload` 到 PyPI。
 - Release notes 自動從 CHANGELOG.md 生成。
 
-**Versioning**：嚴格遵循 SemVer。`aphelion-kit` 的 version 與 spec version 解耦（library 可能比 spec 更頻繁發 patch release）。
+**Versioning**：嚴格遵循 SemVer。`aphelion` package 的 version 與 spec version 解耦（library 可能比 spec 更頻繁發 patch release）。
 
 ---
 
@@ -188,12 +191,14 @@ A: 我們計劃發佈 **兩個** PyPI package：
 
 | 資源 | 連結 |
 |---|---|
-| Spec repo | `github.com/aphelion-spec/aphelion` |
-| ADR-0001 (per-claim hash) | `docs/adr/0001-per-claim-content-hash.md` |
-| ADR-0007 (trust model) | `docs/adr/0007-trust-model.md` |
-| Reference impl (Python) | `github.com/aphelion-spec/aphelion-kit` |
-| Test vectors | `tests/vectors/` |
-| Discussion | `github.com/aphelion-spec/aphelion/discussions` |
+| Spec + reference impl repo | `github.com/Chris97924/Aphelion-Graph` |
+| ADR-0001 (content hash granularity) | `adr/0001-content-hash-granularity.md` |
+| Trust model spec | `spec/v0.5-signer-trust.md` |
+| Lifecycle state machine | `spec/lifecycle-state-machine.md` |
+| Canonical serialization | `spec/canonical-serialization.md` |
+| Packaging spec | `spec/packaging.md` |
+| Test fixtures | `tests/fixtures/` (in repo) |
+| Discussion | `github.com/Chris97924/Aphelion-Graph/discussions` |
 
 ---
 

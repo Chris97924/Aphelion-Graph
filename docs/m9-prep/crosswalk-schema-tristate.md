@@ -63,8 +63,10 @@ The external document ID maps to an Aphelion document ID, but the **content hash
 **條件 (Conditions):**
 
 1. `aphelion_doc_id` is non-null
-2. At least one of `content_hash_dpkg`, `content_hash_aphelion` is non-null
+2. `content_hash_aphelion` is non-null（`content_hash_dpkg` 由 I-6 保證非 null，故兩 hash 皆存在）
 3. `content_hash_dpkg != content_hash_aphelion`
+
+> 與 §2.1 `matched`（兩 hash 皆非 null 且相等）/ §2.3 `missing`（Aphelion 側皆 null）對稱：`divergent` 是「**兩側皆有 hash**且不相等」。`validateCrosswalkRow()` reference impl（§8）以此為準。
 
 **範例 (Example):**
 
@@ -281,8 +283,8 @@ interface ConflictEvent {
 
 ### 6.2 Lazy Populate
 
-- 當 consumer 讀取 crosswalk row 且發現 `status == 'missing'` 時，**觸發非同步 backfill request**
-- Backfill request 發送至 Aphelion 的 `GET /doc/by_content_hash/{hash}` endpoint
+- 當 consumer 讀取 crosswalk row 且發現 `status == 'missing'` 時，**觸發非同步 backfill 流程**
+- Backfill 如何定位 Aphelion document（local index、registry、unpacked package、或自家儲存）為 **consumer-side 實作細節**，**不在 Aphelion spec 範圍**（Aphelion 是 package format，不是 service / registry / API）
 - 在 backfill 完成前，row 維持 `missing` 狀態
 
 ### 6.3 SLO 測量窗口
@@ -295,27 +297,21 @@ interface ConflictEvent {
 
 ## 7. Aphelion 端職責 (Aphelion-Side Responsibilities)
 
-> 以下為 Aphelion spec 所定義的對外承諾。
+> Aphelion 是 **package format + lifecycle spec**，不是 service / registry / API（與 `implementor-guide.md` 核心原則一致；FAQ Q7 同向）。本節列出 Aphelion **package 內**對 crosswalk consumer 暴露的 normative artifacts；**任何網路端點 / registry service / push notification 都不在 Aphelion spec 範圍**。
 
-### 7.1 Content Hash Lookup Endpoint
+### 7.1 Package 內可信欄位
 
-```
-GET /doc/by_content_hash/{hash}
-```
+Consumer 透過 unpack 一份 Aphelion package 可取得：
 
-- 回傳 Aphelion document metadata（含 `aphelion_doc_id`、lifecycle state、content hash）
-- 若 hash 無對應，回傳 `404 Not Found`
+- `manifest.json.claims[].claim_id`（Aphelion document identity）
+- `manifest.json.claims[].hash`（per-claim canonical content hash，`spec/packaging.md` Rule 3.a）
+- `provenance.jsonl`（claim lifecycle event log，`spec/lifecycle-state-machine.md` §3 / §4）
 
-### 7.2 Lifecycle Event Notification
+Consumer 端如何查找「給定 content hash 對應的 Aphelion claim」（local index、自家 registry、unpacked package 掃描…）為 consumer-side 實作；Aphelion spec **不規範**任何 hash → claim 查詢協定。
 
-Aphelion 端提供 claim lifecycle 的事件通知，consumer 可訂閱：
+### 7.2 Lifecycle Event 來源
 
-```
-draft → active ⇄ reaffirmed / revised → superseded → withdrawn
-```
-
-- Consumer 收到 lifecycle event 後，應更新 crosswalk row 的 `content_hash_aphelion` 並重新計算 `status`
-- Aphelion **不主動推送** crosswalk 狀態變更；consumer 需自行偵測
+Claim lifecycle 變化以 `provenance.jsonl` 為 single source of truth；下一份新 package 的 `provenance.jsonl` 會包含新增的 event。Consumer 在 import 新 package 時應更新對應的 `content_hash_aphelion` 並重新計算 `status`。**Aphelion 不主動推送 lifecycle event** — push / subscribe 機制 (registry contract、webhook、message bus) 都是 **out of scope**。
 
 ### 7.3 不維護 Crosswalk Table
 
@@ -331,7 +327,7 @@ Aphelion **不維護、不儲存、不查詢** 任何 crosswalk table。Crosswal
 |---|-----------|------|
 | I-1 | `status` 永遠是三態之一 | 不會是 `null`、空字串、或其他值 |
 | I-2 | `matched` ⟹ `content_hash_dpkg == content_hash_aphelion` | 對應狀態下兩側 hash 必須一致 |
-| I-3 | `divergent` ⟹ 兩 hash 至少一者非 null 且不相等 | 分歧狀態下必定存在可比較的 hash 差異 |
+| I-3 | `divergent` ⟹ 兩 hash 皆非 null 且不相等 | 與 `matched`（皆非 null 且相等）對稱；reference impl `validateCrosswalkRow()` 強制此條件 |
 | I-4 | `missing` ⟹ `aphelion_doc_id == null` AND `content_hash_aphelion == null` | 缺失狀態下 Aphelion 側欄位皆為 null |
 | I-5 | `dpkg_doc_id` 永遠非 null | 外部識別碼為必要欄位 |
 | I-6 | `content_hash_dpkg` 永遠非 null | 外部側 hash 為必要欄位 |
