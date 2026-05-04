@@ -1,7 +1,7 @@
 # Aphelion v1 — Implementor Guide
 
 > **文件版本：** M9-prep draft  
-> **最後更新：** 2025-07  
+> **最後更新：** 2026-05-04（ultrareview 修正：signer envelope / CRLF / size limits / lifecycle / uuid7）  
 > **授權：** Apache 2.0  
 > **語言約定：** 正文繁體中文，所有 spec terms、code blocks、error codes 維持英文原文。
 
