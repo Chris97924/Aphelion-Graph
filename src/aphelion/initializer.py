@@ -42,8 +42,9 @@ class InitOptions:
 
 def _new_uuid_v7() -> str:
     """Generate a UUID v7 (time-ordered, 128-bit) as lowercase hex string."""
-    # Python 3.13's uuid.uuid7() is available; fall back to uuid4-but-v7-bit
-    # stamp for older interpreters (still v7-pattern for our regex).
+    # uuid.uuid7() lives in stdlib from Python 3.14 onward. pyproject.toml
+    # requires-python = ">=3.10", so for 3.10–3.13 we fall back to a manual
+    # v7 byte layout (still v7-pattern for our regex).
     if hasattr(uuid, "uuid7"):
         return str(uuid.uuid7())  # type: ignore[attr-defined]
     import secrets
