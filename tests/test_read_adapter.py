@@ -185,6 +185,21 @@ class TestQueryTime:
 
 
 @pytest.mark.unit
+class TestSupersessionCycle:
+    def test_mutual_supersession_cycle_does_not_crash(self) -> None:
+        # A supersedes B AND B supersedes A — cycle empties the residual set.
+        # Must return SUPERSESSION with primary=None instead of IndexError.
+        adapter = AphelionReadAdapter()
+        claim_a = _claim(A, supersedes=[B])
+        claim_b = _claim(B, supersedes=[A])
+        result = adapter.query(subject="chris", candidate_claims=[claim_a, claim_b])
+        assert result.conflict_class == ConflictClass.SUPERSESSION
+        assert result.primary is None
+        assert result.surfaced == ()
+        assert set(result.superseded) == {A, B}
+
+
+@pytest.mark.unit
 class TestStepZeroDefence:
     def test_subject_required_check_runs_before_filter(self) -> None:
         # A claim with R4 trigger but no subject must surface the

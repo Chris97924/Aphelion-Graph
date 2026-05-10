@@ -167,6 +167,10 @@ def _cmd_canonicalize(args: argparse.Namespace, writer: Writer) -> int:
     out: Path | None = Path(args.out) if getattr(args, "out", None) else None
     try:
         result = canonicalize_path(src, out=out, in_place=in_place)
+    except OSError as exc:
+        # FileNotFoundError and other I/O errors are exit code 1 per spec §9.1.
+        emit_error(SchemaError(code=ErrorCode.MISSING_FILE, msg=str(exc)))
+        return 1
     except SchemaError as exc:
         # Map exit codes per spec §9.1: PARSE_ERROR / UTF8_INVALID / file
         # absence => 1; any other validator code => 2.

@@ -311,6 +311,18 @@ def _residual_default_policy(
             warnings=tuple(warnings),
         )
 
+    # Guard: supersession cycle (A→B and B→A) can empty the residual set.
+    # Return SUPERSESSION with no primary rather than crashing on index 0.
+    if not active:
+        return QueryResult(
+            conflict_class=ConflictClass.SUPERSESSION,
+            primary=None,
+            surfaced=(),
+            superseded=tuple(superseded_ids),
+            used_query_time=used_query_time,
+            warnings=tuple(warnings),
+        )
+
     # Recency tiebreak — newest created_at wins; ties broken by claim_id ascending
     sorted_recent = sorted(
         active,
