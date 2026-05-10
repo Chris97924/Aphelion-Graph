@@ -1,13 +1,15 @@
 """Aphelion reference CLI entrypoint.
 
-Seven commands (v0.4.0):
-  init      - create an empty Aphelion skeleton in a directory
-  validate  - syntax + lifecycle check of manifest + provenance
-  pack      - deterministic source_dir -> .aphelion.tar
-  unpack    - safe streaming extract
-  verify    - post-unpack semantic cross-reference check
-  diff      - layered diff between two unpacked Aphelion packages
-  migrate   - one-shot v0.3 -> v0.4 wire migration
+Eight commands (v0.4.0 + v0.3-r1r4):
+  init          - create an empty Aphelion skeleton in a directory
+  validate      - syntax + lifecycle check of manifest + provenance
+  pack          - deterministic source_dir -> .aphelion.tar
+  unpack        - safe streaming extract
+  verify        - post-unpack semantic cross-reference check
+  diff          - layered diff between two unpacked Aphelion packages
+  migrate       - one-shot v0.3 -> v0.4 wire migration
+  canonicalize  - repair v0.3-r1r4 claim frontmatter (key order, confidence
+                  3dp, supersedes sort+dedupe). Spec §9.1.
 
 Global flags (accepted before or after the subcommand):
   --json        emit a JSON line on stdout instead of human text
@@ -146,6 +148,54 @@ def _cmd_diff(args: argparse.Namespace, writer: Writer) -> int:
         sys.stdout.write(render_human(result))
     # Exit 0 when diff is empty (identical), 1 when differences found.
     return EXIT_OK if is_empty(result) else 1
+
+
+def _cmd_canonicalize(args: argparse.Namespace, writer: Writer) -> int:
+    """Spec §9.1 ``aphe canonicalize``.
+
+    Exit codes:
+      0 — canonicalization applied (or input was already canonical)
+      1 — input could not be parsed (PARSE_ERROR / UTF8_INVALID)
+      2 — semantic violation discovered during canonicalization
+          (any v0.3 PX_E_4101..4144 or DUPLICATE_CLAIM_ID-class code)
+    """
+    from aphelion.canonicalize import canonicalize_path
+    from aphelion.error_codes import ErrorCode
+
+    src = Path(args.path)
+    in_place: bool = bool(getattr(args, "in_place", False))
+    out: Path | None = Path(args.out) if getattr(args, "out", None) else None
+    try:
+        result = canonicalize_path(src, out=out, in_place=in_place)
+    except SchemaError as exc:
+        # Map exit codes per spec §9.1: PARSE_ERROR / UTF8_INVALID / file
+        # absence => 1; any other validator code => 2.
+        emit_error(exc)
+        parse_codes = {
+            ErrorCode.PARSE_ERROR.value,
+            ErrorCode.UTF8_INVALID.value,
+            ErrorCode.MISSING_FILE.value,
+        }
+        raw_code = exc.code.value if isinstance(exc.code, ErrorCode) else exc.code
+        return 1 if raw_code in parse_codes else 2
+    summary = "already canonical" if not result.changed else "canonicalized"
+    if in_place or out is not None:
+        target = src if in_place else out
+        writer.success(
+            "canonicalize",
+            summary=f"{src}: {summary} -> {target}",
+            data={"path": str(src), "changed": result.changed},
+        )
+    else:
+        # Dry-run: emit the canonical text on stdout (separate from the
+        # success line so callers can pipe).
+        sys.stdout.write(result.text)
+        writer.success(
+            "canonicalize",
+            summary=f"{src}: {summary} (dry-run, no write)",
+            data={"path": str(src), "changed": result.changed},
+        )
+    return EXIT_OK
 
 
 def _cmd_migrate(args: argparse.Namespace, writer: Writer) -> int:
@@ -467,6 +517,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="overwrite an existing destination",
     )
     p_mig.set_defaults(func=_cmd_migrate)
+
+    p_canon = sub.add_parser(
+        "canonicalize",
+        help="repair v0.3-r1r4 claim frontmatter (sort keys, confidence 3dp, supersedes sort+dedupe)",
+    )
+    p_canon.add_argument("path", help="path to a .md claim file")
+    canon_dest = p_canon.add_mutually_exclusive_group()
+    canon_dest.add_argument(
+        "--in-place",
+        dest="in_place",
+        action="store_true",
+        help="rewrite PATH in place",
+    )
+    canon_dest.add_argument(
+        "--out",
+        dest="out",
+        help="write canonicalized output to OUT instead of PATH",
+    )
+    p_canon.set_defaults(func=_cmd_canonicalize)
 
     return parser
 
