@@ -55,9 +55,11 @@ def test_str_includes_code_and_path() -> None:
 
 
 def test_all_codes_follow_registry_format() -> None:
+    # v0.3-r1r4 introduced PX_W_* warning codes alongside PX_E_* errors;
+    # both share the same 4-digit band convention.
     for code in ALL_CODES:
-        assert code.startswith("PX_E_")
-        digits = code[len("PX_E_"):]
+        assert code.startswith(("PX_E_", "PX_W_")), code
+        digits = code[len("PX_E_"):]  # equal-length prefix slice for both
         assert digits.isdigit() and len(digits) == 4, code
 
 

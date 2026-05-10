@@ -1,4 +1,45 @@
-# Aphelion Error Code Registry (v0.4.0)
+# Aphelion Error Code Registry (v0.4.0 + v0.3-r1r4)
+
+## Code-prefix conventions
+
+The registry uses two prefix forms:
+
+| Prefix | Meaning | Behavior |
+|---|---|---|
+| `PX_E_<CCNN>` | Error | Validator MUST abort processing and surface the error to the caller. The body band convention (`CC` = 1NN/2NN/.../6NN) is documented in the v0.2.1 historical legend below. |
+| `PX_W_<CCNN>` | Warning (introduced v0.3-r1r4) | Validator MUST emit the signal but MUST NOT abort. Production deployments MUST surface the warning beyond logs (e.g. Prometheus counter) so silent occurrences are alertable. The first member is `PX_W_4151 / W_CLAIM_SUPERSEDES_DANGLING`. |
+
+Both prefix forms share the same band numbering. A semantic alias (e.g. `E_CLAIM_KEY_ORDER`, `W_CLAIM_SUPERSEDES_DANGLING`) is preferred in spec prose; the `PX_*` form is preferred in validator output.
+
+---
+
+## v0.3-r1r4 additions (claim semantics — Chris-pinned 2026-05-09)
+
+| PX code      | Semantic alias                              | Condition                                                                |
+|--------------|---------------------------------------------|--------------------------------------------------------------------------|
+| PX_E_4101    | E_CLAIM_CONFIDENCE_TYPE                     | `confidence` not numeric.                                                |
+| PX_E_4102    | E_CLAIM_CONFIDENCE_RANGE                    | `confidence` outside `[0.000, 1.000]`.                                   |
+| PX_E_4103    | E_CLAIM_CONFIDENCE_PRECISION                | `confidence` serialized with precision != 3dp on the wire.               |
+| PX_E_4111    | E_CLAIM_VALIDTIME_TYPE                      | `valid_from` / `valid_until` not string.                                 |
+| PX_E_4112    | E_CLAIM_VALIDTIME_FORMAT                    | `valid_from` / `valid_until` not exact 20-char ISO 8601 UTC `Z`.         |
+| PX_E_4113    | E_CLAIM_VALIDTIME_ORDER                     | `valid_from > valid_until` when both present.                            |
+| PX_E_4121    | E_CLAIM_POLARITY_TYPE                       | `polarity` not string.                                                   |
+| PX_E_4122    | E_CLAIM_POLARITY_VALUE                      | `polarity` not in `{affirm, negate, unknown}`.                           |
+| PX_E_4131    | E_CLAIM_SUPERSEDES_TYPE                     | `supersedes` not array<string>.                                          |
+| PX_E_4132    | E_CLAIM_SUPERSEDES_SELF                     | `supersedes` includes the claim's own `claim_id`.                        |
+| PX_E_4133    | E_CLAIM_SUPERSEDES_DUPLICATE                | `supersedes` array contains the same `claim_id` twice.                   |
+| PX_E_4141    | E_CLAIM_RESERVED_FIELD                      | Reader-only derivation field (e.g. `conflict_class`) used in frontmatter. |
+| PX_E_4143    | E_CLAIM_KEY_ORDER                           | Frontmatter keys not ASCII-codepoint ascending. Use `aphe canonicalize`. |
+| PX_E_4144    | E_CLAIM_SUBJECT_REQUIRED_FOR_CONFLICT       | R4-trigger field present (`polarity` / `valid_*` / `supersedes` — see ADR-0002 §6 backward-compat note re `confidence`) without `subject`. |
+| PX_W_4151    | W_CLAIM_SUPERSEDES_DANGLING                 | `supersedes` references a `claim_id` not present in loaded packages (warning, not error — D1.2 lenient resolution). MUST be exposed as Prometheus counter `aphelion_supersedes_dangling_total{package_id,target_id}` so deployments can alert on non-zero rate. |
+
+> The `PX_W_*` prefix denotes a **warning** rather than an error — emitted to logs / observation channels but does not abort processing. v0.3 introduces this prefix for the cross-package `supersedes` lenient case. Production deployments MUST surface the warning via a Prometheus counter (NOT log-only) so silent typos are alertable.
+
+> **Note on `PX_E_4142`**: an earlier draft of this addition included `PX_E_4142 / E_CLAIM_DUPLICATE_ID` for "two claim files in the same package share the same `claim_id`". Removed because `PX_E_4004 / DUPLICATE_CLAIM_ID` (manifest-side duplicate detection) already covers this — `claim-frontmatter.md` Rule 5 makes manifest authoritative on conflict, so manifest-side detection is sufficient and avoids registry collision.
+
+See `spec/v0.3-claim-semantics.md` for normative semantics, `adr/0002-v0.3-claim-semantics-r1r4.md` for design rationale and xcouncil verdict trail.
+
+---
 
 ## v0.3.0 additions (semantic aliases)
 

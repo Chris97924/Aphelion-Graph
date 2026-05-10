@@ -209,3 +209,39 @@ def test_module_entrypoint_runs_via_python_dash_m(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "aphelion" in result.stdout.lower()
+
+
+# ---------- _cmd_canonicalize: dry-run stdout is pipe-safe ----------
+
+
+CLAIM_ID_DRY = "0191aaaa-0000-7000-8000-cccccccccccc"
+
+
+def test_canonicalize_dry_run_stdout_is_only_document(tmp_path: Path) -> None:
+    """Dry-run stdout must be the canonical document only — no status text.
+
+    Regression for Codex P2 round-5: ``writer.success()`` was polluting stdout
+    after the document, breaking ``aphe canonicalize file.md > out.md`` pipes.
+    """
+    # Write a claim whose keys are out of canonical order so canonicalization
+    # changes the content (result.changed == True).  Keys must be unquoted
+    # (YAML bare keys) to be parseable; canonical output quotes values only.
+    f = tmp_path / "claim.md"
+    original = (
+        "---\n"
+        f'claim_id: "{CLAIM_ID_DRY}"\n'
+        'body_format: "markdown"\n'
+        "---\n"
+        "Body.\n"
+    )
+    f.write_text(original, encoding="utf-8")
+
+    code, out, _err = _run(["canonicalize", str(f)])
+
+    assert code == 0
+    # stdout must not contain any status / "[ok]" line — only the canonical doc.
+    assert "[ok]" not in out
+    assert "dry-run" not in out
+    assert "canonicalize" not in out  # no command echo on stdout
+    # The canonical text must itself be valid YAML frontmatter — non-empty.
+    assert out.startswith("---\n")

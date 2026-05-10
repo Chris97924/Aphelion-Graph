@@ -1,6 +1,7 @@
-"""Canonical Aphelion error code registry (v0.2.1+).
+"""Canonical Aphelion error code registry (v0.2.1+, v0.3-r1r4).
 
-Codes follow the scheme ``PX_E_<CCNN>`` where ``CC`` is the two-digit
+Codes follow the scheme ``PX_E_<CCNN>`` (errors) or ``PX_W_<CCNN>``
+(warnings, introduced v0.3-r1r4) where ``CC`` is the two-digit
 **category** band and ``NN`` is the sequence within that band:
 
     1NN — TYPE         wrong JSON type (str expected, got int, …)
@@ -10,8 +11,13 @@ Codes follow the scheme ``PX_E_<CCNN>`` where ``CC`` is the two-digit
     5NN — CONSISTENCY  semantic cross-reference failure (hash/fileset/chain/ref)
     6NN — SECURITY     archive-extraction safety breach
 
+Warnings (``PX_W_*``) MUST be emitted to logs/observation channels but
+MUST NOT abort processing. Production deployments MUST surface them via a
+metrics counter so silent occurrences are alertable.
+
 The registry is the single source of truth. Downstream modules MUST import
-the `ErrorCode` enum — do NOT hard-code string codes anywhere else.
+the `ErrorCode` / `WarningCode` enum — do NOT hard-code string codes anywhere
+else.
 """
 
 from __future__ import annotations
@@ -51,6 +57,22 @@ class ErrorCode(str, Enum):
     NAN_FORBIDDEN = "PX_E_4009"
     UTF8_INVALID = "PX_E_4010"
 
+    # --- 4NN FORMAT (v0.3-r1r4 claim semantics, Chris-pinned 2026-05-09) --
+    CLAIM_CONFIDENCE_TYPE = "PX_E_4101"
+    CLAIM_CONFIDENCE_RANGE = "PX_E_4102"
+    CLAIM_CONFIDENCE_PRECISION = "PX_E_4103"
+    CLAIM_VALIDTIME_TYPE = "PX_E_4111"
+    CLAIM_VALIDTIME_FORMAT = "PX_E_4112"
+    CLAIM_VALIDTIME_ORDER = "PX_E_4113"
+    CLAIM_POLARITY_TYPE = "PX_E_4121"
+    CLAIM_POLARITY_VALUE = "PX_E_4122"
+    CLAIM_SUPERSEDES_TYPE = "PX_E_4131"
+    CLAIM_SUPERSEDES_SELF = "PX_E_4132"
+    CLAIM_SUPERSEDES_DUPLICATE = "PX_E_4133"
+    CLAIM_RESERVED_FIELD = "PX_E_4141"
+    CLAIM_KEY_ORDER = "PX_E_4143"
+    CLAIM_SUBJECT_REQUIRED_FOR_CONFLICT = "PX_E_4144"
+
     # --- 5NN CONSISTENCY --------------------------------------------------
     HASH_MISMATCH = "PX_E_5001"
     FILESET_DIVERGENCE = "PX_E_5002"
@@ -79,6 +101,21 @@ class ErrorCode(str, Enum):
     UNKNOWN = "PX_E_9001"
 
 
+class WarningCode(str, Enum):
+    """Non-fatal validation signals (v0.3-r1r4+).
+
+    Emitted to logs/observation channels but never abort processing.
+    Production deployments MUST expose each warning via a Prometheus
+    counter (see spec/error-codes.md and spec/v0.3-claim-semantics.md
+    §6.2 D1.2). Log-only is insufficient — silent occurrences would
+    let typos in cross-package supersedes references go un-applied
+    with no human-visible signal.
+    """
+
+    # --- 4NN FORMAT warnings ---------------------------------------------
+    CLAIM_SUPERSEDES_DANGLING = "PX_W_4151"
+
+
 CATEGORY_LABELS: dict[str, str] = {
     "1": "type",
     "2": "structure",
@@ -90,15 +127,21 @@ CATEGORY_LABELS: dict[str, str] = {
 }
 
 
-def category_of(code: ErrorCode | str) -> str:
+def category_of(code: ErrorCode | WarningCode | str) -> str:
     """Return the human label for a code's category band.
 
-    Accepts either an ``ErrorCode`` member or the raw string (``"PX_E_2005"``).
+    Accepts ``ErrorCode``, ``WarningCode``, or raw string forms
+    (``"PX_E_2005"`` / ``"PX_W_4151"``).
     """
-    raw = code.value if isinstance(code, ErrorCode) else code
-    if not raw.startswith("PX_E_") or len(raw) < 6:
+    if isinstance(code, (ErrorCode, WarningCode)):
+        raw = code.value
+    else:
+        raw = code
+    if not (raw.startswith("PX_E_") or raw.startswith("PX_W_")) or len(raw) < 6:
         return "generic"
     return CATEGORY_LABELS.get(raw[5], "generic")
 
 
-ALL_CODES: frozenset[str] = frozenset(c.value for c in ErrorCode)
+ALL_CODES: frozenset[str] = frozenset(
+    [c.value for c in ErrorCode] + [w.value for w in WarningCode]
+)

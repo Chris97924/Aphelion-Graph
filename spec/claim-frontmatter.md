@@ -32,12 +32,23 @@ Each claim is a `.md` file with YAML frontmatter between `---` fences, followed 
 
 1. Field order in the serialized file MUST be ASCII-codepoint-ascending. Example field ordering in a canonical file (alphabetical):
    ```
-   annotations → author → author_uri → claim_id → claim_instance_id → confidence → created_at → labels → locale → object → predicate → source → state → subject → tags → type → updated_at
+   annotations → author → author_uri → claim_id → claim_instance_id → confidence → created_at → labels → locale → object → polarity → predicate → source → state → subject → supersedes → tags → type → updated_at → valid_from → valid_until
    ```
+   v0.3-r1r4 additions inserted in canonical position. Violations raise `PX_E_4143 / E_CLAIM_KEY_ORDER`; use `aphe canonicalize` to repair.
 2. Unknown `format-*` fields MUST NOT appear. Unknown `application-defined` fields MAY appear only under `labels` or `annotations`.
 3. `updated_at >= created_at`; otherwise `ERR-SEM-016`.
 4. `claim_instance_id != claim_id` (they occupy different identity spaces).
 5. `state` in frontmatter mirrors `manifest.json.claims[].state`; on conflict manifest wins (`ERR-SEM-020`).
+6. **v0.3-r1r4 conditional requirement (Chris-pinned 2026-05-09)**: if any of `polarity`, `valid_from`, `valid_until`, or `supersedes` is present on a claim, then `subject` MUST also be present and non-empty; otherwise `PX_E_4144 / E_CLAIM_SUBJECT_REQUIRED_FOR_CONFLICT`. `confidence` is deliberately excluded from this trigger list — it is metadata, not a conflict-graph opt-in signal (Chris-confirmed 2026-05-09 PM after Phase-4 review surfaced the backward-compat hazard). `subject` itself remains `format-optional` at the schema-matrix level — the conditional check is enforced by the v0.3 validator only. See `spec/v0.3-claim-semantics.md` §6.5 + `adr/0002-v0.3-claim-semantics-r1r4.md`.
+
+## v0.3-r1r4 added fields (additive — see `spec/v0.3-claim-semantics.md`)
+
+| Name | Type | Required | Format / Constraint | Example |
+|---|---|---|---|---|
+| `valid_from` | string | no (R2) | quoted ISO 8601 UTC `Z`, exact 20 chars | `"2026-05-09T10:00:00Z"` |
+| `valid_until` | string | no (R2) | quoted ISO 8601 UTC `Z`, exact 20 chars; `>= valid_from` if both present | `"2026-12-31T23:59:59Z"` |
+| `polarity` | string | no (R3) | enum `{affirm, negate, unknown}`, lowercase ASCII; defaults to `affirm` if absent | `"affirm"` |
+| `supersedes` | array<string> | no (R4) | claim_id values (UUID v7), lex-sorted + dedupe; cross-package allowed (lenient warning if dangling) | `["0193e2b1-0001-7000-8000-00000000aaaa"]` |
 
 ## Example
 
