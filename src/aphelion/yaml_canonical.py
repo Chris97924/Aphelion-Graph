@@ -57,6 +57,16 @@ def _parse_scalar(raw: str, line_no: int) -> Any:
         # the same quote char are out of scope (not used in canonical
         # claims).
         return text[1:-1]
+    # Reject unsupported YAML tokens: flow sequences/mappings, anchors,
+    # aliases, and tags are outside the canonical Aphelion frontmatter
+    # subset and must not be silently coerced to plain strings.
+    if text and text[0] in ("[", "{", "&", "*", "!"):
+        raise _err(
+            f"unsupported YAML token {text!r} — flow sequences/mappings, "
+            "anchors, aliases, and tags are not in the canonical Aphelion "
+            "frontmatter subset",
+            line_no,
+        )
     # Number (int or float)
     try:
         if "." in text or "e" in text or "E" in text:

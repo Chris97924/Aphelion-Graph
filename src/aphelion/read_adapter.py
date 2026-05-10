@@ -222,6 +222,14 @@ def _apply_supersession(
         for c in all_candidates
         if isinstance(c.get("claim_id"), str)
     }
+    # Only claims that are in the active set can actually be dropped by
+    # step 3.  ``superseded`` must reflect IDs removed from *active*, not
+    # every claim that happens to exist in the loaded corpus.
+    active_ids = {
+        c.get("claim_id")
+        for c in active
+        if isinstance(c.get("claim_id"), str)
+    }
     dropped: list[str] = []
     warnings: list[Warning_] = []
     # Iterate copy because we mutate ``active`` indirectly through the
@@ -249,6 +257,11 @@ def _apply_supersession(
                         },
                     )
                 )
+                continue
+            if target_id not in active_ids:
+                # Target exists in the loaded corpus but was not in the
+                # active set (different subject or outside R2 window);
+                # dropping it would misreport QueryResult.superseded.
                 continue
             if target_id in dropped:
                 continue
