@@ -97,6 +97,16 @@ class TestValidTime:
             validate_validtime("valid_until", "2026-05-09T10:00:00")
         assert exc.value.code == ErrorCode.CLAIM_VALIDTIME_FORMAT
 
+    @pytest.mark.parametrize("bad_ts", [
+        "2026-13-01T00:00:00Z",  # month 13
+        "2026-02-30T00:00:00Z",  # Feb 30
+        "2026-00-00T00:00:00Z",  # month 0 / day 0
+    ])
+    def test_impossible_calendar_validtime_rejected(self, bad_ts: str) -> None:
+        with pytest.raises(SchemaError) as exc:
+            validate_validtime("valid_from", bad_ts)
+        assert exc.value.code == ErrorCode.CLAIM_VALIDTIME_FORMAT
+
     def test_order_check_pass_when_both_present_and_ordered(self) -> None:
         validate_validtime_order("2026-05-09T10:00:00Z", "2026-12-31T23:59:59Z")
 

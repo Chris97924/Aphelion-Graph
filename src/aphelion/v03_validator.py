@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any, Final
 
 from aphelion.error_codes import ErrorCode
@@ -106,6 +107,13 @@ def validate_validtime(name: str, value: Any) -> None:
         _raise(
             ErrorCode.CLAIM_VALIDTIME_FORMAT,
             f"{name} must match YYYY-MM-DDTHH:MM:SSZ (20 chars), got {value!r}",
+        )
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        _raise(
+            ErrorCode.CLAIM_VALIDTIME_FORMAT,
+            f"{name} is not a valid calendar timestamp, got {value!r}: {exc}",
         )
 
 
