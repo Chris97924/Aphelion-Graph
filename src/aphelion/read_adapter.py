@@ -324,11 +324,9 @@ def _residual_default_policy(
         )
 
     # Recency tiebreak — newest created_at wins; ties broken by claim_id ascending
-    sorted_recent = sorted(
-        active,
-        key=lambda c: (c.get("created_at", ""), c.get("claim_id", "")),
-        reverse=True,
-    )
+    # Stable two-pass: secondary key (claim_id asc) first, primary (created_at desc) last.
+    sorted_recent = sorted(active, key=lambda c: c.get("claim_id", ""))
+    sorted_recent = sorted(sorted_recent, key=lambda c: c.get("created_at", ""), reverse=True)
     return QueryResult(
         conflict_class=ConflictClass.SUPERSESSION,
         primary=sorted_recent[0],
