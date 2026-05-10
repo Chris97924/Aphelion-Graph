@@ -82,6 +82,10 @@ All other fields are single-homed. Specifically:
 | `locale` | string (BCP 47) | format-optional |
 | `author` | string | format-optional |
 | `author_uri` | string | format-optional |
+| `valid_from` | string (iso8601-Z) | format-optional (v0.3-r1r4) |
+| `valid_until` | string (iso8601-Z) | format-optional (v0.3-r1r4) |
+| `polarity` | string (enum: affirm, negate, unknown) | format-optional (v0.3-r1r4) |
+| `supersedes` | array<uuid-v7> | format-optional (v0.3-r1r4) |
 | `labels` | object | application-defined |
 | `annotations` | object | application-defined |
 
