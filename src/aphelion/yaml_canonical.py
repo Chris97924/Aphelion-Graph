@@ -47,11 +47,10 @@ def _parse_scalar(raw: str, line_no: int) -> Any:
         return True
     if text == "false":
         return False
-    if (text.startswith('"') and text.endswith('"')) or (
-        text.startswith("'") and text.endswith("'")
-    ):
-        if len(text) < 2:
-            raise _err(f"unterminated quoted string {raw!r}", line_no)
+    if text.startswith('"') or text.startswith("'"):
+        quote = text[0]
+        if not text.endswith(quote) or len(text) < 2:
+            raise _err(f"unterminated quoted scalar: {raw!r}", line_no)
         # No escape processing in canonical Aphelion frontmatter — the
         # value is the literal between quotes. Quoted values containing
         # the same quote char are out of scope (not used in canonical

@@ -42,7 +42,11 @@ class CanonicalizeResult:
 
 
 def _normalize_confidence(value: Any) -> Any:
-    """Round confidence to 3dp; preserve type so validator sees a number.
+    """Validate confidence range, then round to 3dp.
+
+    Range check ([0, 1] closed interval) is performed on the *unrounded*
+    float so that out-of-range values like 1.0004 or -0.0001 are rejected
+    before rounding would silently bring them inside the valid range.
 
     Serialization to exactly 3dp digits happens at emit time
     (see :func:`_emit_with_confidence_fix`) — keeping the value as a
@@ -53,7 +57,13 @@ def _normalize_confidence(value: Any) -> Any:
         # Bool slipped past parsing — leave to validator.
         return value
     if isinstance(value, (int, float)):
-        return round(float(value), 3)
+        raw = float(value)
+        if raw < 0.0 or raw > 1.0:
+            raise SchemaError(
+                code=ErrorCode.CLAIM_CONFIDENCE_RANGE,
+                msg=f"confidence {raw!r} is outside [0, 1]",
+            )
+        return round(raw, 3)
     return value
 
 

@@ -225,3 +225,73 @@ class TestCanonicalizePath:
         with pytest.raises(SchemaError) as exc:
             canonicalize_path(f)
         assert exc.value.code == ErrorCode.UTF8_INVALID
+
+
+# ---- P1 regression: confidence range validation before rounding ---------------
+
+@pytest.mark.unit
+class TestConfidenceRangeValidation:
+    """confidence must be validated against [0, 1] on the unrounded value."""
+
+    def _doc_with_confidence(self, confidence: str) -> str:
+        return _doc(
+            f'claim_id: "{CLAIM_ID}"\n'
+            f'confidence: {confidence}\n'
+            'created_at: "2026-05-09T10:00:00Z"\n'
+            'polarity: "affirm"\n'
+            'source: "conversation"\n'
+            'state: "active"\n'
+            'subject: "chris"\n'
+            'type: "user_preference"\n'
+            f'updated_at: "2026-05-09T10:00:00Z"\n'
+            f'claim_instance_id: "{INSTANCE_ID}"\n'
+        )
+
+    def test_confidence_above_one_raises_range_error(self) -> None:
+        with pytest.raises(SchemaError) as exc:
+            canonicalize_text(self._doc_with_confidence("1.0004"))
+        assert exc.value.code == ErrorCode.CLAIM_CONFIDENCE_RANGE
+
+    def test_confidence_negative_raises_range_error(self) -> None:
+        with pytest.raises(SchemaError) as exc:
+            canonicalize_text(self._doc_with_confidence("-0.0001"))
+        assert exc.value.code == ErrorCode.CLAIM_CONFIDENCE_RANGE
+
+    def test_confidence_one_accepted(self) -> None:
+        result = canonicalize_text(self._doc_with_confidence("1.0"))
+        assert "confidence: 1.000" in result.text
+
+    def test_confidence_zero_accepted(self) -> None:
+        result = canonicalize_text(self._doc_with_confidence("0.0"))
+        assert "confidence: 0.000" in result.text
+
+    def test_confidence_mid_range_accepted(self) -> None:
+        result = canonicalize_text(self._doc_with_confidence("0.5"))
+        assert "confidence: 0.500" in result.text
+
+
+# ---- P2 regression: unterminated quoted scalar rejection ---------------------
+
+@pytest.mark.unit
+class TestUnterminatedQuotedScalar:
+    """Scalars that open with a quote but lack a matching close quote must fail."""
+
+    def test_double_quote_unterminated_raises_parse_error(self) -> None:
+        yaml = 'subject: "chris\n'
+        with pytest.raises(SchemaError) as exc:
+            parse_frontmatter(yaml)
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    def test_single_quote_unterminated_raises_parse_error(self) -> None:
+        yaml = "subject: 'chris\n"
+        with pytest.raises(SchemaError) as exc:
+            parse_frontmatter(yaml)
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    def test_double_quote_terminated_parses(self) -> None:
+        data, _ = parse_frontmatter('subject: "chris"\n')
+        assert data["subject"] == "chris"
+
+    def test_single_quote_terminated_parses(self) -> None:
+        data, _ = parse_frontmatter("subject: 'chris'\n")
+        assert data["subject"] == "chris"
