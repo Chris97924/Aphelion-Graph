@@ -218,3 +218,10 @@ class TestCanonicalizePath:
         result = canonicalize_path(f)
         assert result.changed is True
         assert f.read_text(encoding="utf-8") == original
+
+    def test_non_utf8_input_raises_utf8_invalid(self, tmp_path: Path) -> None:
+        f = tmp_path / "bad.md"
+        f.write_bytes(b"\xff\xfe\xfd invalid bytes")
+        with pytest.raises(SchemaError) as exc:
+            canonicalize_path(f)
+        assert exc.value.code == ErrorCode.UTF8_INVALID

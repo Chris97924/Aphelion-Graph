@@ -158,7 +158,13 @@ def canonicalize_path(
             code=ErrorCode.PARSE_ERROR,
             msg="--in-place and --out are mutually exclusive",
         )
-    document = src.read_text(encoding="utf-8")
+    try:
+        document = src.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise SchemaError(
+            code=ErrorCode.UTF8_INVALID,
+            msg=f"input is not valid UTF-8: {exc}",
+        ) from exc
     result = canonicalize_text(document)
     target: Path | None = None
     if in_place:
