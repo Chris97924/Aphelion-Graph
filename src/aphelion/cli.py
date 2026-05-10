@@ -191,14 +191,9 @@ def _cmd_canonicalize(args: argparse.Namespace, writer: Writer) -> int:
             data={"path": str(src), "changed": result.changed},
         )
     else:
-        # Dry-run: emit the canonical text on stdout (separate from the
-        # success line so callers can pipe).
+        # Dry-run: stdout is the canonical document only — no status text,
+        # so callers can pipe (`aphe canonicalize foo.md > foo.canonical.md`).
         sys.stdout.write(result.text)
-        writer.success(
-            "canonicalize",
-            summary=f"{src}: {summary} (dry-run, no write)",
-            data={"path": str(src), "changed": result.changed},
-        )
     return EXIT_OK
 
 
