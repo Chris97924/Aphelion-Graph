@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from aphelion import __version__ as APHELION_VERSION, SCHEMA_VERSION_MAX
+from aphelion import SCHEMA_VERSION_MAX, SPEC_VERSION
 from aphelion.canonical_json import dumps as canonical_dumps, normalize
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
@@ -24,7 +24,9 @@ from aphelion.validator import TIMESTAMP_RE, UUID_V7_RE
 
 
 SUPPORTED_SPEC_VERSIONS: frozenset[str] = frozenset({"0.4.0"})
-DEFAULT_SPEC_VERSION = APHELION_VERSION
+# The default spec version must track the on-disk format (SPEC_VERSION),
+# never the package release — the two diverge as of package 0.5.0.
+DEFAULT_SPEC_VERSION = SPEC_VERSION
 
 
 @dataclass(frozen=True)
