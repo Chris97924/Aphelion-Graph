@@ -17,10 +17,7 @@ import base64
 import hashlib
 import io
 import json
-import tarfile
-import warnings
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -29,7 +26,6 @@ from aphelion.canonical_json import normalize
 from aphelion.signer import (
     HMACSigner,
     SignatureEnvelope,
-    SignerManifest,
     SignerVerificationError,
     compute_key_fingerprint,
     compute_package_canonical_hash,
@@ -620,7 +616,6 @@ def test_tampered_signature_fails_invalid(tmp_path: Path) -> None:
     from aphelion.canonical_tar import read_members, TarMember
     from aphelion.canonical_tar import pack as tar_pack
     from aphelion.sig_pack import read_signatures_jsonl
-    from aphelion.signer import parse_envelope_line, canonical_envelope_bytes
 
     tar_path = _make_signed_tar(tmp_path)
 
@@ -738,7 +733,6 @@ def test_envelopes_present_but_require_signed_false_still_verifies_strictly(
 @pytest.mark.integration
 def test_cli_aphe_verify_unsigned_without_flag_passes(tmp_path: Path) -> None:
     """aphe verify without --require-signed on unsigned package → exit 0."""
-    import sys
     import contextlib
 
     src = tmp_path / "src"
@@ -763,7 +757,6 @@ def test_cli_aphe_verify_unsigned_without_flag_passes(tmp_path: Path) -> None:
 @pytest.mark.integration
 def test_cli_aphe_verify_unsigned_with_flag_fails(tmp_path: Path) -> None:
     """aphe verify --require-signed on unsigned package → non-zero, E_SIGNER_REQUIRED in stderr."""
-    import sys
     import contextlib
 
     src = tmp_path / "src"

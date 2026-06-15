@@ -231,8 +231,7 @@ def _cmd_verify(args: argparse.Namespace, writer: Writer) -> int:
         try:
             result = verify_package(target, require_signed=require_signed, require_notary=require_notary)
         except SignerVerificationError as exc:
-            from aphelion.errors import emit_error, SchemaError, EXIT_VALIDATION
-            from aphelion.error_codes import ErrorCode
+            from aphelion.errors import EXIT_VALIDATION
             import sys
             # Emit as JSON error line to stderr then return non-zero
             import json
@@ -263,7 +262,6 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
     writes/merges signatures.jsonl and signers/<signer_id>.json,
     then repacks into --out.
     """
-    import json as _json
     from pathlib import Path as _Path
     from aphelion.canonical_tar import read_members, TarMember
     from aphelion.canonical_tar import pack as tar_pack

@@ -5,7 +5,6 @@ Covers spec/v0.5-signer-trust.md §4 (trust notary extension point).
 
 from __future__ import annotations
 
-import socket
 import typing
 import unittest.mock
 

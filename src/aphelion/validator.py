@@ -18,7 +18,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-from aphelion import SCHEMA_VERSION_MAX
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
 
@@ -323,10 +322,8 @@ def validate_signatures(tar_path: Path | str) -> "tuple[Any, ...]":
         SignerManifest,
         SignerVerificationError,
         _REGISTRY,
-        _require_cryptography,
         compute_key_fingerprint,
         compute_package_canonical_hash,
-        parse_envelope_line,
     )
 
     # §5 rule 2 (implicit): read signatures.jsonl; if absent → unsigned-valid

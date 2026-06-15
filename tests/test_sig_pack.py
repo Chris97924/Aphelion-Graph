@@ -144,7 +144,7 @@ def test_read_rejects_unsorted_lines() -> None:
     # Write them in correct order then manually reverse the bytes
     correct = write_signatures_jsonl([env_a, env_z])
     lines = correct.split(b"\n")
-    lines = [l for l in lines if l]  # drop empty
+    lines = [ln for ln in lines if ln]  # drop empty
     reversed_content = b"\n".join(reversed(lines)) + b"\n"
     with pytest.raises(SignerVerificationError) as exc_info:
         read_signatures_jsonl(reversed_content)

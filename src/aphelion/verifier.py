@@ -231,7 +231,6 @@ def verify_package(
         # Re-read the signer manifest to build SignerManifest for trust resolution
         import json as _json
         from aphelion.unpacker import extract_signer_manifests
-        from aphelion.canonical_json import normalize as cj_normalize
 
         signer_manifests_raw = extract_signer_manifests(tar_path)
         raw = _json.loads(signer_manifests_raw[envelope.signer_id].decode("utf-8"))
