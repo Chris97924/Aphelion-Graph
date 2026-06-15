@@ -338,10 +338,31 @@ def validate_signatures(tar_path: Path | str) -> "tuple[Any, ...]":
 
     # Load package canonical hash from manifest inside the tar
     import tarfile
+    from aphelion.errors import SecurityError
     archive = Path(tar_path)
     with tarfile.open(archive, mode="r") as tar:
-        manifest_member = tar.extractfile(tar.getmember("manifest.json"))
-        assert manifest_member is not None
+        try:
+            manifest_info = tar.getmember("manifest.json")
+        except KeyError as exc:
+            raise SchemaError(
+                code=ErrorCode.MISSING_FILE,
+                msg="manifest.json is missing from the archive",
+                path="manifest.json",
+            ) from exc
+        # A directory/symlink/non-regular member named manifest.json makes
+        # extractfile() return None. Guard explicitly rather than relying on
+        # ``assert`` (stripped under ``python -O``) so a crafted archive yields
+        # a typed validation error instead of a raw AttributeError.
+        manifest_member = tar.extractfile(manifest_info)
+        if manifest_member is None:
+            raise SecurityError(
+                code=ErrorCode.DISALLOWED_MEMBER_TYPE,
+                msg=(
+                    "manifest.json is not a regular file member "
+                    f"(type {manifest_info.type!r})"
+                ),
+                path="manifest.json",
+            )
         manifest_bytes = manifest_member.read()
         manifest_member.close()
 

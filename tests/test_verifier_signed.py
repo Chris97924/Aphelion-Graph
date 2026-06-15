@@ -471,6 +471,133 @@ def test_validate_signatures_order_rejected(tmp_path: Path) -> None:
     assert exc_info.value.code == "E_SIGNATURE_ORDER"
 
 
+def _rewrite_tar_manifest_as_dir(tar_path: Path) -> None:
+    """Rewrite ``tar_path`` so ``manifest.json`` is a directory member.
+
+    A directory member is non-regular, so ``tar.extractfile()`` returns None
+    while ``tar.getmember("manifest.json")`` still succeeds. This is the
+    crafted-archive shape that exercises the trust-boundary guard in
+    ``validate_signatures``. We use the raw ``tarfile`` module here on purpose:
+    ``canonical_tar`` would reject a non-regular member before it could be
+    written.
+    """
+    import tarfile
+
+    src_members: list[tuple[tarfile.TarInfo, bytes | None]] = []
+    with tarfile.open(tar_path, mode="r") as tin:
+        for info in tin.getmembers():
+            if info.name == "manifest.json":
+                continue  # drop the regular manifest member; re-add as dir below
+            extracted = tin.extractfile(info) if info.isreg() else None
+            data = extracted.read() if extracted is not None else None
+            src_members.append((info, data))
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tout:
+        dir_info = tarfile.TarInfo(name="manifest.json")
+        dir_info.type = tarfile.DIRTYPE
+        dir_info.mode = 0o755
+        tout.addfile(dir_info)
+        for info, data in src_members:
+            if data is None:
+                tout.addfile(info)
+            else:
+                tout.addfile(info, io.BytesIO(data))
+    tar_path.write_bytes(buf.getvalue())
+
+
+@pytest.mark.unit
+def test_validate_signatures_non_regular_manifest_member(tmp_path: Path) -> None:
+    """Crafted archive: manifest.json is a directory member (extractfile → None).
+
+    Under ``python -O`` the prior ``assert manifest_member is not None`` guard is
+    stripped, so ``.read()`` on None would raise a raw ``AttributeError`` instead
+    of a clean typed validation error. This test asserts the typed
+    ``AphelionError`` subclass is raised and that the same code path holds under
+    optimized (assert-stripped) semantics.
+    """
+    from aphelion.errors import AphelionError, SchemaError, SecurityError
+
+    tar_path = _make_signed_tar(tmp_path)
+    _rewrite_tar_manifest_as_dir(tar_path)
+
+    from aphelion.validator import validate_signatures
+
+    with pytest.raises((SecurityError, SchemaError)) as exc_info:
+        validate_signatures(tar_path)
+    assert isinstance(exc_info.value, AphelionError)
+    # Must NOT be a bare AttributeError leaking through the trust boundary.
+    assert not isinstance(exc_info.value, AttributeError)
+
+    # Verify under -O semantics: assert statements are stripped, so the guard
+    # must hold without relying on `assert`. Re-import the validator under -O.
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        f"""
+        from aphelion.errors import AphelionError
+        from aphelion.validator import validate_signatures
+        try:
+            validate_signatures(r{str(tar_path)!r})
+        except AphelionError:
+            raise SystemExit(0)
+        except AttributeError:
+            raise SystemExit(2)
+        raise SystemExit(3)
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"under -O expected typed AphelionError (rc=0), got rc={proc.returncode}\n"
+        f"stdout={proc.stdout}\nstderr={proc.stderr}"
+    )
+
+
+def test_validate_signatures_absent_manifest_member(tmp_path: Path) -> None:
+    """Crafted archive with signatures but no manifest.json → typed error, not KeyError.
+
+    ``tar.getmember("manifest.json")`` raises ``KeyError`` when the member is
+    absent; the guard must surface a typed validation error instead.
+    """
+    import tarfile
+
+    from aphelion.errors import AphelionError, SchemaError, SecurityError
+
+    tar_path = _make_signed_tar(tmp_path)
+
+    # Rebuild the tar dropping manifest.json entirely (keep signatures + signer).
+    kept: list[tuple[tarfile.TarInfo, bytes | None]] = []
+    with tarfile.open(tar_path, mode="r") as tin:
+        for info in tin.getmembers():
+            if info.name == "manifest.json":
+                continue
+            extracted = tin.extractfile(info) if info.isreg() else None
+            data = extracted.read() if extracted is not None else None
+            kept.append((info, data))
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tout:
+        for info, data in kept:
+            if data is None:
+                tout.addfile(info)
+            else:
+                tout.addfile(info, io.BytesIO(data))
+    tar_path.write_bytes(buf.getvalue())
+
+    from aphelion.validator import validate_signatures
+
+    with pytest.raises((SecurityError, SchemaError)) as exc_info:
+        validate_signatures(tar_path)
+    assert isinstance(exc_info.value, AphelionError)
+    assert not isinstance(exc_info.value, KeyError)
+
+
 # ---------------------------------------------------------------------------
 # Tests: verify_package() integration
 # ---------------------------------------------------------------------------
