@@ -1,5 +1,50 @@
 # Changelog
 
+## [Unreleased] (v0.6)
+
+### Added
+
+- **R7.2 — Notary attestation envelope** per the new
+  `spec/v0.6-notary-attestation.md`. This fills the v0.5 §4 trust-notary
+  *extension point* (which only ever yielded `"verified-locally"`) with a
+  pinned envelope format and verification path:
+  - **`NotaryAttestationEnvelope`** frozen dataclass
+    (`src/aphelion/trust.py`) — a notary's detached attestation that a
+    `key_fingerprint` is the key it associates with a `signer_id`. Fields:
+    `notary_id`, `signer_id`, `key_fingerprint`, `algorithm`, `signed_at_iso`,
+    `signature_b64`.
+  - **`compute_attestation_canonical_hash`** — `sha256` over the canonical
+    JSON of `{key_fingerprint, notary_id, signer_id}`. Binds notary, signer,
+    and key; deliberately does NOT bind a package hash, so one attestation is
+    reusable across every package that key signs.
+  - **`canonical_attestation_bytes`** / **`parse_attestation_line`** — byte-
+    deterministic round-trip over the existing canonical-JSON machinery;
+    structural failures raise `E_SIGNATURE_MALFORMED`.
+  - **`resolve_notary_attestation(signer_manifest, attestation,
+    notary_manifest)`** — returns `"verified-by-notary"` when every §3 rule
+    holds: signer/key/notary identity binding, registry algorithm,
+    pre-dispatch algorithm-match confused-deputy guard, notary fingerprint
+    recompute, and signature verification (hmac-sha256 reference + real
+    ed25519 under the `[signer]` extra).
+- New error code **`E_SIGNER_NOTARY_INVALID`** (`spec/error-codes.md`,
+  `spec/v0.6-notary-attestation.md` §4) for an attestation that is
+  structurally present but fails an identity/fingerprint binding check.
+
+### Compatibility
+
+- Strictly additive over v0.5. The v0.5 `resolve_notary` stub and the
+  `NotaryAttestation` `Literal` (`"verified-locally"` | `"verified-by-notary"`)
+  are unchanged; a package with no attestation behaves exactly as before. No
+  mandatory new file. `E_SIGNER_NOTARY_REQUIRED` wiring (v0.5) is unchanged.
+
+### Tests
+
+- 537 tests GREEN (was 513). +24 in `tests/test_trust_notary_envelope.py`
+  (canonical-hash determinism + field binding, envelope round-trip + malformed
+  rejection, full §3 rule sequence per error code, ed25519 round-trip/tamper
+  under the `[signer]` extra, and regression guards that the v0.5 stub and
+  Literal are untouched).
+
 ## [0.5.1] — 2026-06-15
 
 ### Fixed

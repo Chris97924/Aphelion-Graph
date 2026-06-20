@@ -172,3 +172,16 @@ are used by the v0.5 signature verification path in `validator.validate_signatur
 | `E_SIGNER_REQUIRED`            | Caller passed `--require-signed` but package has no `signatures.jsonl`.                  |
 | `E_SIGNER_NOTARY_REQUIRED`     | Caller passed `--require-notary` but all attestations are `"verified-locally"` only.     |
 | `E_SIGNER_ALGORITHM_UNAVAILABLE`| `cryptography` extra is not installed; `ed25519` cannot be used.                        |
+
+## v0.6 — Notary attestation error codes (R7.2)
+
+Emitted by `trust.SignerVerificationError` from
+`trust.resolve_notary_attestation()`. See
+`spec/v0.6-notary-attestation.md §4` for normative detail. The notary
+attestation path also reuses `E_SIGNATURE_INVALID`, `E_SIGNER_ALGORITHM_UNKNOWN`,
+`E_SIGNER_ALGORITHM_MISMATCH`, and `E_SIGNER_FINGERPRINT_MISMATCH` from v0.5
+with their existing meanings.
+
+| Code                       | Condition                                                                                                  |
+|----------------------------|------------------------------------------------------------------------------------------------------------|
+| `E_SIGNER_NOTARY_INVALID`  | A notary attestation envelope is structurally present but fails an identity/fingerprint binding check (signer_id, key_fingerprint, or notary_id mismatch). |
