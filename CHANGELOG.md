@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.5.1] — 2026-06-15
+
+### Fixed
+
+- **Signer manifest guard** (`src/aphelion/validator.py`): `validate_signatures`
+  loaded `manifest.json` behind a bare `assert manifest_member is not None`.
+  Under `python -O` the assert is stripped, so a crafted archive whose
+  `manifest.json` is a non-regular member (directory / symlink) made
+  `tarfile.extractfile()` return `None` and surfaced a raw `AttributeError`
+  on `.read()` instead of a typed validation error; an absent `manifest.json`
+  raised `KeyError`. Replaced the assert with explicit typed raises matching
+  the codebase's None-handling idiom: `SchemaError` `MISSING_FILE` for an
+  absent manifest, `SecurityError` `DISALLOWED_MEMBER_TYPE` for a non-regular
+  member. The guard now holds with asserts stripped.
+
+### Changed
+
+- Applied ruff safe autofixes (F401 unused imports, E741 ambiguous variable
+  names). No behavioural change.
+
+### Tests
+
+- 513 tests GREEN (was 412 in v0.5.0). Added RED-first coverage in
+  `tests/test_verifier_signed.py` for the absent-manifest and
+  non-regular-manifest shapes, including a `python -O` subprocess check
+  confirming the guard holds when asserts are stripped.
+
+### Compatibility
+
+- Fully backward-compatible bugfix release. No format, schema, or public API
+  changes; every package that validated under v0.5.0 still validates.
+
 ## [0.5.0] — 2026-04-27
 
 ### Added (additive — v0.4 readers ignoring `signatures.jsonl` + `signers/` still validate every previously-conforming v0.4 package unchanged)
