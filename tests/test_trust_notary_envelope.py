@@ -448,6 +448,55 @@ def test_signature_with_trailing_non_base64_junk_rejected() -> None:
     assert exc.value.code == "E_SIGNATURE_MALFORMED"
 
 
+@pytest.mark.unit
+def test_non_ascii_fingerprint_rejected_before_compare() -> None:
+    """A non-ASCII key_fingerprint must surface E_SIGNER_NOTARY_INVALID.
+
+    ``hmac.compare_digest`` raises a raw ``TypeError`` on non-ASCII ``str``
+    input, so a malformed envelope could crash a verifier before it returns the
+    spec error code. The §3.2 format guard (64 lowercase hex) rejects it first.
+    """
+    from aphelion.trust import NotaryAttestationEnvelope, resolve_notary_attestation
+
+    signer_manifest, _, notary_manifest = _valid_attestation()
+    bad = NotaryAttestationEnvelope(
+        notary_id="acme-notary",
+        signer_id="alice",
+        key_fingerprint="é" * 64,  # non-ASCII: would crash compare_digest
+        algorithm="hmac-sha256",
+        signed_at_iso=SIGNED_AT,
+        signature_b64="QUJD",
+    )
+    with pytest.raises(SignerVerificationError) as exc:
+        resolve_notary_attestation(signer_manifest, bad, notary_manifest)
+    assert exc.value.code == "E_SIGNER_NOTARY_INVALID"
+
+
+@pytest.mark.unit
+def test_notary_key_with_trailing_non_base64_junk_rejected() -> None:
+    """A notary public_key_b64 with trailing junk MUST be rejected at §3.6.
+
+    ``base64.standard_b64decode`` silently discards trailing non-alphabet
+    characters, so a malformed notary manifest could still recompute the right
+    fingerprint and satisfy §3.6, returning ``verified-by-notary``. Strict
+    decoding (validate=True) closes that gap → E_SIGNER_MALFORMED.
+    """
+    from dataclasses import replace
+
+    from aphelion.trust import resolve_notary_attestation
+
+    signer_manifest, attestation, notary_manifest = _valid_attestation()
+    # public_key_b64 is otherwise-valid (already "="-padded); appending "!!"
+    # after it is silently dropped by tolerant decode — it decodes to the exact
+    # same 32 bytes, so the fingerprint recompute would still pass §3.6. Strict
+    # decoding (validate=True) rejects the trailing junk instead.
+    junked_key = notary_manifest.public_key_b64 + "!!"
+    corrupt_notary = replace(notary_manifest, public_key_b64=junked_key)
+    with pytest.raises(SignerVerificationError) as exc:
+        resolve_notary_attestation(signer_manifest, attestation, corrupt_notary)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
 # ---------------------------------------------------------------------------
 # ed25519 production path (guarded by the signer extra)
 # ---------------------------------------------------------------------------

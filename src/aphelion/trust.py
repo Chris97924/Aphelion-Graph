@@ -23,6 +23,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass, fields
 from typing import Literal
 
@@ -35,6 +36,26 @@ from aphelion.signer import (  # re-export for spec §10
 )
 
 NotaryAttestation = Literal["verified-locally", "verified-by-notary"]
+
+# A key fingerprint is ``sha256(...).hexdigest()`` (signer §2.3): exactly 64
+# lowercase hex characters. Anything else cannot be a real fingerprint and must
+# be rejected before it reaches ``hmac.compare_digest`` (which raises a raw
+# ``TypeError`` on non-ASCII ``str`` input).
+_FINGERPRINT_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def _require_fingerprint_format(fingerprint: str, *, label: str) -> None:
+    """Reject a fingerprint that is not 64 lowercase hex chars (§2.3).
+
+    Raises ``SignerVerificationError(E_SIGNER_NOTARY_INVALID)`` so a malformed
+    (e.g. non-ASCII) fingerprint surfaces as a verification error rather than
+    crashing ``hmac.compare_digest`` with ``TypeError``.
+    """
+    if not _FINGERPRINT_RE.match(fingerprint):
+        raise SignerVerificationError(
+            "E_SIGNER_NOTARY_INVALID",
+            f"{label} {fingerprint!r} is not a 64-char lowercase hex fingerprint",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +222,10 @@ def _verify_attestation_signature(
     message = bytes.fromhex(attestation_hash)
 
     if notary_manifest.algorithm == "hmac-sha256":
+        # validate=True for the same reason as the signature decode above: a
+        # tolerant decode would accept a notary key with trailing junk.
         try:
-            mac_key = base64.standard_b64decode(notary_manifest.public_key_b64)
+            mac_key = base64.b64decode(notary_manifest.public_key_b64, validate=True)
         except (ValueError, binascii.Error) as exc:
             raise SignerVerificationError(
                 "E_SIGNER_MALFORMED",
@@ -221,8 +244,9 @@ def _verify_attestation_signature(
         from aphelion.signer import _require_cryptography
 
         _, Ed25519PublicKey = _require_cryptography()
+        # validate=True: reject a notary key carrying trailing non-base64 junk.
         try:
-            pub_raw = base64.standard_b64decode(notary_manifest.public_key_b64)
+            pub_raw = base64.b64decode(notary_manifest.public_key_b64, validate=True)
         except (ValueError, binascii.Error) as exc:
             raise SignerVerificationError(
                 "E_SIGNER_MALFORMED",
@@ -281,7 +305,12 @@ def resolve_notary_attestation(
         )
 
     # §3.2 key-fingerprint binding — the notary must vouch for the same key the
-    # package signer used (closes a key-substitution gap).
+    # package signer used (closes a key-substitution gap). Validate the format
+    # first: a non-ASCII / non-hex fingerprint would make hmac.compare_digest
+    # raise a raw TypeError instead of returning the spec error code.
+    _require_fingerprint_format(
+        attestation.key_fingerprint, label="attestation key_fingerprint"
+    )
     if not hmac.compare_digest(
         attestation.key_fingerprint, signer_manifest.key_fingerprint
     ):
@@ -314,9 +343,12 @@ def resolve_notary_attestation(
             f"{notary_manifest.algorithm!r}",
         )
 
-    # §3.6 notary manifest fingerprint recompute.
+    # §3.6 notary manifest fingerprint recompute. validate=True so trailing
+    # non-base64 junk appended to an otherwise-valid key is rejected rather than
+    # silently dropped — a tolerant decode here would let a malformed notary
+    # manifest still recompute the right fingerprint and pass §3.6.
     try:
-        notary_pub = base64.standard_b64decode(notary_manifest.public_key_b64)
+        notary_pub = base64.b64decode(notary_manifest.public_key_b64, validate=True)
     except (ValueError, binascii.Error) as exc:
         raise SignerVerificationError(
             "E_SIGNER_MALFORMED",
