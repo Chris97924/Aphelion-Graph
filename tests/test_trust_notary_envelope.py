@@ -420,6 +420,34 @@ def test_signature_not_base64_rejected() -> None:
     assert exc.value.code == "E_SIGNATURE_MALFORMED"
 
 
+@pytest.mark.unit
+def test_signature_with_trailing_non_base64_junk_rejected() -> None:
+    """An otherwise-valid signature with trailing junk MUST be rejected.
+
+    ``base64.standard_b64decode`` silently discards trailing non-alphabet
+    characters, so ``<good-sig>!!`` would decode identically to ``<good-sig>``
+    and could still HMAC-verify. Strict decoding (validate=True) closes that
+    gap; the helper promises E_SIGNATURE_MALFORMED for undecodable base64.
+    """
+    from aphelion.trust import NotaryAttestationEnvelope, resolve_notary_attestation
+
+    signer_manifest, attestation, notary_manifest = _valid_attestation()
+    # attestation.signature_b64 is a valid hmac-sha256 signature; appending
+    # "!!" keeps the length divisible by 4 but injects non-base64 bytes.
+    junked = attestation.signature_b64[:-2] + "!!"
+    bad = NotaryAttestationEnvelope(
+        notary_id=attestation.notary_id,
+        signer_id=attestation.signer_id,
+        key_fingerprint=attestation.key_fingerprint,
+        algorithm=attestation.algorithm,
+        signed_at_iso=attestation.signed_at_iso,
+        signature_b64=junked,
+    )
+    with pytest.raises(SignerVerificationError) as exc:
+        resolve_notary_attestation(signer_manifest, bad, notary_manifest)
+    assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
 # ---------------------------------------------------------------------------
 # ed25519 production path (guarded by the signer extra)
 # ---------------------------------------------------------------------------
@@ -462,6 +490,50 @@ def test_ed25519_notary_attestation_roundtrip() -> None:
     )
     result = resolve_notary_attestation(signer_manifest, attestation, notary_manifest)
     assert result == "verified-by-notary"
+
+
+@pytest.mark.unit
+def test_ed25519_malformed_notary_key_becomes_verification_error() -> None:
+    """A notary key that decodes but is not a valid 32-byte ed25519 key.
+
+    ``Ed25519PublicKey.from_public_bytes`` raises ``ValueError`` on non-32-byte
+    input. If the manifest fingerprint is self-consistent (computed over those
+    same malformed bytes), §3.6 passes and verification reaches
+    from_public_bytes — which must surface as E_SIGNER_MALFORMED, not an
+    uncaught exception that bypasses the SignerVerificationError.code contract.
+    """
+    pytest.importorskip("cryptography")
+
+    from aphelion.trust import (
+        NotaryAttestationEnvelope,
+        resolve_notary_attestation,
+    )
+
+    # 16 bytes — decodes fine, but is not a valid ed25519 public key.
+    bad_raw = b"\x07" * 16
+    bad_b64 = base64.standard_b64encode(bad_raw).decode("ascii")
+    # Fingerprint is computed over the malformed bytes so §3.6 (fingerprint
+    # recompute) passes and execution reaches from_public_bytes.
+    notary_manifest = SignerManifest(
+        signer_id="acme-notary",
+        algorithm="ed25519",
+        public_key_b64=bad_b64,
+        key_fingerprint=compute_key_fingerprint(bad_raw),
+        notary_uri=None,
+    )
+    signer_manifest = _signer_manifest(signer_id="alice", key_fingerprint="5" * 64)
+    # Signature content is irrelevant — the crash happens before verify().
+    attestation = NotaryAttestationEnvelope(
+        notary_id="acme-notary",
+        signer_id="alice",
+        key_fingerprint="5" * 64,
+        algorithm="ed25519",
+        signed_at_iso=SIGNED_AT,
+        signature_b64=base64.standard_b64encode(b"\x00" * 64).decode("ascii"),
+    )
+    with pytest.raises(SignerVerificationError) as exc:
+        resolve_notary_attestation(signer_manifest, attestation, notary_manifest)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
 
 
 @pytest.mark.unit

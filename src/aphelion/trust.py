@@ -187,8 +187,12 @@ def _verify_attestation_signature(
     ``E_SIGNATURE_MALFORMED`` for un-decodable base64,
     ``E_SIGNATURE_INVALID`` for a signature that does not verify.
     """
+    # validate=True so trailing non-base64 junk (e.g. an otherwise-valid
+    # signature with "!!" appended) is rejected rather than silently dropped;
+    # the v0.6 envelope requires base64-standard and this helper promises
+    # E_SIGNATURE_MALFORMED for undecodable base64.
     try:
-        signature = base64.standard_b64decode(signature_b64)
+        signature = base64.b64decode(signature_b64, validate=True)
     except (ValueError, binascii.Error) as exc:
         raise SignerVerificationError(
             "E_SIGNATURE_MALFORMED", f"signature_b64 not valid base64: {exc}"
@@ -224,7 +228,16 @@ def _verify_attestation_signature(
                 "E_SIGNER_MALFORMED",
                 f"notary public_key_b64 not valid base64: {exc}",
             ) from exc
-        pub = Ed25519PublicKey.from_public_bytes(pub_raw)
+        # from_public_bytes raises ValueError on non-32-byte input; wrap it so a
+        # malformed notary key surfaces as E_SIGNER_MALFORMED rather than an
+        # uncaught exception escaping the SignerVerificationError contract.
+        try:
+            pub = Ed25519PublicKey.from_public_bytes(pub_raw)
+        except (ValueError, binascii.Error) as exc:
+            raise SignerVerificationError(
+                "E_SIGNER_MALFORMED",
+                f"notary public_key_b64 is not a valid ed25519 public key: {exc}",
+            ) from exc
         try:
             pub.verify(signature, message)
         except Exception as exc:  # cryptography raises InvalidSignature
