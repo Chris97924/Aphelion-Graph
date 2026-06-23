@@ -355,6 +355,12 @@ def resolve_notary_attestation(
             f"notary public_key_b64 not valid base64: {exc}",
         ) from exc
     recomputed = compute_key_fingerprint(notary_pub)
+    # The notary manifest fingerprint is attacker-influenced (notaries/<id>.json);
+    # validate its format before compare_digest, which raises a raw TypeError on a
+    # non-ASCII str rather than the spec error code (mirrors the §3.2 guard).
+    _require_fingerprint_format(
+        notary_manifest.key_fingerprint, label="notary manifest key_fingerprint"
+    )
     if not hmac.compare_digest(recomputed, notary_manifest.key_fingerprint):
         raise SignerVerificationError(
             "E_SIGNER_FINGERPRINT_MISMATCH",
