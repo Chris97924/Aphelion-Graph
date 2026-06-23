@@ -44,16 +44,26 @@ NotaryAttestation = Literal["verified-locally", "verified-by-notary"]
 _FINGERPRINT_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
-def _require_fingerprint_format(fingerprint: str, *, label: str) -> None:
+def _require_fingerprint_format(
+    fingerprint: str,
+    *,
+    label: str,
+    code: str = "E_SIGNER_NOTARY_INVALID",
+) -> None:
     """Reject a fingerprint that is not 64 lowercase hex chars (§2.3).
 
-    Raises ``SignerVerificationError(E_SIGNER_NOTARY_INVALID)`` so a malformed
-    (e.g. non-ASCII) fingerprint surfaces as a verification error rather than
+    Raises ``SignerVerificationError(code, ...)`` so a malformed (e.g.
+    non-ASCII) fingerprint surfaces as a verification error rather than
     crashing ``hmac.compare_digest`` with ``TypeError``.
+
+    *code* defaults to ``E_SIGNER_NOTARY_INVALID`` (§3.2 attestation-binding
+    checks).  Callers on the §3.6 notary-manifest path pass
+    ``code="E_SIGNER_FINGERPRINT_MISMATCH"`` per spec §3.6 lines 86-87 &
+    107-108.
     """
     if not _FINGERPRINT_RE.match(fingerprint):
         raise SignerVerificationError(
-            "E_SIGNER_NOTARY_INVALID",
+            code,
             f"{label} {fingerprint!r} is not a 64-char lowercase hex fingerprint",
         )
 
@@ -359,7 +369,9 @@ def resolve_notary_attestation(
     # validate its format before compare_digest, which raises a raw TypeError on a
     # non-ASCII str rather than the spec error code (mirrors the §3.2 guard).
     _require_fingerprint_format(
-        notary_manifest.key_fingerprint, label="notary manifest key_fingerprint"
+        notary_manifest.key_fingerprint,
+        label="notary manifest key_fingerprint",
+        code="E_SIGNER_FINGERPRINT_MISMATCH",
     )
     if not hmac.compare_digest(recomputed, notary_manifest.key_fingerprint):
         raise SignerVerificationError(
