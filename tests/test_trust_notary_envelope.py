@@ -473,6 +473,28 @@ def test_non_ascii_fingerprint_rejected_before_compare() -> None:
 
 
 @pytest.mark.unit
+def test_non_ascii_notary_manifest_fingerprint_rejected_before_compare() -> None:
+    """A non-ASCII notary-manifest key_fingerprint must surface E_SIGNER_FINGERPRINT_MISMATCH.
+
+    The §3.6 path recomputes the notary fingerprint and compares it against the
+    attacker-influenced ``notary_manifest.key_fingerprint`` via
+    ``hmac.compare_digest``, which raises a raw ``TypeError`` on non-ASCII ``str``
+    input. The §3.6 format guard (64 lowercase hex) rejects it first with the
+    spec-mandated error code ``E_SIGNER_FINGERPRINT_MISMATCH`` (spec §3.6,
+    lines 86-87 & 107-108), not the §3.2 attestation-binding code.
+    """
+    from dataclasses import replace
+
+    from aphelion.trust import resolve_notary_attestation
+
+    signer_manifest, attestation, notary_manifest = _valid_attestation()
+    bad_notary = replace(notary_manifest, key_fingerprint="é" * 64)
+    with pytest.raises(SignerVerificationError) as exc:
+        resolve_notary_attestation(signer_manifest, attestation, bad_notary)
+    assert exc.value.code == "E_SIGNER_FINGERPRINT_MISMATCH"
+
+
+@pytest.mark.unit
 def test_notary_key_with_trailing_non_base64_junk_rejected() -> None:
     """A notary public_key_b64 with trailing junk MUST be rejected at §3.6.
 
