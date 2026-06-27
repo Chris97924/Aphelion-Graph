@@ -1,6 +1,6 @@
 # Aphelion — Deterministic Package Format
 
-Reference CLI implementation (v0.5.1). **Zero runtime dependencies** (stdlib
+Reference CLI implementation (v0.6.0). **Zero runtime dependencies** (stdlib
 only). Python 3.10+.
 
 - CI: Linux / macOS / Windows × Python 3.10 / 3.11 / 3.12 — 9-cell matrix
@@ -15,7 +15,7 @@ pip install -e .
 
 # 2. Check the version — shows package + spec + schema
 aphe --version
-# aphelion 0.5.1 (spec 0.4.0, schema 2.0)
+# aphelion 0.6.0 (spec 0.4.0, schema 2.0)
 
 # 3. Create an empty skeleton
 aphelion init ./my-pkg
@@ -162,7 +162,7 @@ aphe migrate SRC DST [--force]
 
 `aphelion --version` reports three numbers:
 
-- **Package** (`0.5.1`) — the version of this CLI / Python library.
+- **Package** (`0.6.0`) — the version of this CLI / Python library.
 - **Spec** (`0.4.0`) — the version of the on-disk Aphelion format this build
   targets (spec version is tracked independently from package version so
   maintenance releases can ship without bumping the format).
