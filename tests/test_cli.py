@@ -13,6 +13,7 @@ suite does not naturally exercise:
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -22,7 +23,7 @@ import pytest
 
 from aphelion.canonical_json import dumps, normalize
 from aphelion.error_codes import ErrorCode
-from aphelion.errors import SchemaError
+from aphelion.errors import EXIT_VALIDATION, SchemaError
 
 from conftest import run_cli as _run
 
@@ -245,3 +246,353 @@ def test_canonicalize_dry_run_stdout_is_only_document(tmp_path: Path) -> None:
     assert "canonicalize" not in out  # no command echo on stdout
     # The canonical text must itself be valid YAML frontmatter — non-empty.
     assert out.startswith("---\n")
+
+
+# ===========================================================================
+# `aphe sign` CLI command — error-branch + round-trip coverage
+#
+# signer.py is exercised 100% via the API by test_signer/test_verifier_signed,
+# but the CLI wiring in _cmd_sign (argv -> exit code -> JSON error payload) had
+# no direct coverage of its guard branches. These lock in:
+#   * package file not found            -> EXIT_VALIDATION + MISSING_FILE
+#   * key file missing or zero-length   -> EXIT_VALIDATION + MISSING_FILE
+#   * unknown --algorithm value         -> EXIT_VALIDATION + ENUM_INVALID
+#   * signer-layer error surfaced       -> EXIT_VALIDATION + algorithm code
+#   * manifest.json absent in archive   -> EXIT_VALIDATION + MISSING_FILE
+#   * hmac-sha256 / ed25519 round trips  -> exit 0 + a verifiable signed tar
+# ===========================================================================
+
+
+HMAC_KEY = b"test-hmac-key-cli-sign-32bytes!!"
+
+
+def _packed_tar(tmp_path: Path, name: str = "pkg.tar") -> Path:
+    """Build a minimal valid source dir and pack it into a .aphelion.tar."""
+    from aphelion.packer import pack
+
+    src = _minimal_source(tmp_path / "pkgsrc")
+    out = tmp_path / name
+    pack(src, out)
+    return out
+
+
+def _pkg_canonical_hash(tar_path: Path) -> str:
+    """Compute the package canonical hash from a packed tar's manifest."""
+    from aphelion.canonical_tar import read_members
+    from aphelion.signer import compute_package_canonical_hash
+
+    members = read_members(tar_path.read_bytes())
+    manifest_raw = next(m.data for m in members if m.path == "manifest.json")
+    assert manifest_raw is not None
+    manifest_obj = normalize(json.loads(manifest_raw))
+    claims_tuples = [
+        (c["claim_id"], c["claim_instance_id"], c["hash"])
+        for c in manifest_obj["claims"]
+    ]
+    return compute_package_canonical_hash(
+        format_version=manifest_obj["format_version"],
+        package_id=manifest_obj["package_id"],
+        claims=claims_tuples,
+    )
+
+
+# ---------- package file not found (lines 279-283) ----------
+
+
+def test_sign_package_not_found_emits_missing_file(tmp_path: Path) -> None:
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(HMAC_KEY)  # valid key, so only the package guard can fire
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(tmp_path / "does-not-exist.aphelion.tar"),
+            "--signer-id", "s1",
+            "--algorithm", "hmac-sha256",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    assert code == EXIT_VALIDATION, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.MISSING_FILE.value
+    # Teeth: the explicit guard's message distinguishes it from main()'s generic
+    # FileNotFoundError fallback. Removing `if not pkg_path.exists()` would let
+    # read_bytes() raise and surface the raw OSError string instead.
+    assert "package not found" in payload["msg"]
+    assert not out.exists()
+
+
+# ---------- key file missing (lines 287-291) ----------
+
+
+def test_sign_key_file_missing_emits_missing_file(tmp_path: Path) -> None:
+    pkg = _packed_tar(tmp_path)
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "s1",
+            "--algorithm", "hmac-sha256",
+            "--key-file", str(tmp_path / "no-such-key.bin"),
+            "--out", str(out),
+        ]
+    )
+
+    assert code == EXIT_VALIDATION, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.MISSING_FILE.value
+    assert "key file not found or empty" in payload["msg"]
+    assert not out.exists()
+
+
+# ---------- key file zero-length (lines 287-291) ----------
+
+
+def test_sign_key_file_empty_emits_missing_file(tmp_path: Path) -> None:
+    pkg = _packed_tar(tmp_path)
+    empty_key = tmp_path / "empty.bin"
+    empty_key.write_bytes(b"")  # exists but zero-length
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "s1",
+            "--algorithm", "hmac-sha256",
+            "--key-file", str(empty_key),
+            "--out", str(out),
+        ]
+    )
+
+    # Strong teeth: without the `or stat().st_size == 0` guard, an empty key
+    # would build a valid HMACSigner and SUCCEED (exit 0, signed tar written).
+    assert code == EXIT_VALIDATION, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.MISSING_FILE.value
+    assert not out.exists()
+
+
+# ---------- unknown --algorithm: argparse choices guard (exit 2) ----------
+
+
+def test_sign_unknown_algorithm_rejected_by_argparse(tmp_path: Path) -> None:
+    """`--algorithm bogus` is blocked by argparse choices before _cmd_sign runs."""
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(HMAC_KEY)
+
+    code, _, _ = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "s1",
+            "--algorithm", "totally-bogus",
+            "--key-file", str(key_file),
+            "--out", str(tmp_path / "signed.tar"),
+        ]
+    )
+    assert code == 2  # argparse usage error
+
+
+# ---------- unknown algorithm reaching the else branch (lines 307-312) ----------
+
+
+def test_sign_cmd_unknown_algorithm_emits_enum_invalid(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The defensive ``else`` branch in _cmd_sign emits ENUM_INVALID.
+
+    argparse ``choices`` normally blocks any non-registered algorithm, so this
+    branch is only reachable by invoking the command handler directly with a
+    crafted Namespace. We assert it fails closed with ENUM_INVALID rather than
+    silently constructing an unbound signer.
+    """
+    from aphelion.cli import _cmd_sign
+    from aphelion.output import Writer
+
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(HMAC_KEY)
+    out = tmp_path / "signed.tar"
+
+    args = argparse.Namespace(
+        package=str(pkg),
+        signer_id="s1",
+        algorithm="rot13",  # not in {hmac-sha256, ed25519}
+        key_file=str(key_file),
+        out=str(out),
+    )
+    writer = Writer(json_mode=False, color=False, stdout=sys.stdout)
+
+    code = _cmd_sign(args, writer)
+
+    assert code == EXIT_VALIDATION
+    payload = _error_payload(capsys.readouterr().err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.ENUM_INVALID.value
+    assert not out.exists()
+
+
+# ---------- signer-layer SignerVerificationError surfaced (lines 313-318) ----------
+
+
+def test_sign_ed25519_algorithm_unavailable_surfaces_json_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the signer layer reports the algorithm is unavailable, the CLI emits
+    a JSON error line and returns EXIT_VALIDATION — it must not crash.
+
+    Simulates a venv without the ``cryptography`` extra by patching
+    ``_require_cryptography`` to raise (the import is lazy inside _cmd_sign,
+    so the patched attribute is picked up at call time).
+    """
+    import aphelion.signer as signer_mod
+    from aphelion.signer import SignerVerificationError
+
+    def _boom() -> tuple[type, type]:
+        raise SignerVerificationError(
+            "E_SIGNER_ALGORITHM_UNAVAILABLE", "cryptography extra not installed"
+        )
+
+    monkeypatch.setattr(signer_mod, "_require_cryptography", _boom)
+
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(b"x" * 32)
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "s1",
+            "--algorithm", "ed25519",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    # Teeth: if the `except SignerVerificationError` handler were removed, the
+    # error would fall through to main()'s generic handler as UNKNOWN/exit 1.
+    assert code == EXIT_VALIDATION, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == "E_SIGNER_ALGORITHM_UNAVAILABLE"
+    assert not out.exists()
+
+
+# ---------- manifest.json absent inside the archive (lines 330-334) ----------
+
+
+def test_sign_manifest_absent_in_archive_emits_missing_file(tmp_path: Path) -> None:
+    from aphelion.canonical_tar import read_members
+    from aphelion.canonical_tar import pack as tar_pack
+
+    pkg = _packed_tar(tmp_path)
+    # Rebuild the tar with manifest.json dropped (signer reads members, then
+    # fails closed because it cannot find manifest.json to compute the hash).
+    members = [m for m in read_members(pkg.read_bytes()) if m.path != "manifest.json"]
+    pkg.write_bytes(tar_pack(members))
+
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(HMAC_KEY)
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "s1",
+            "--algorithm", "hmac-sha256",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    # Teeth: removing the `if manifest_raw is None` guard would feed None to
+    # the canonical-json loader and surface UNKNOWN/exit 1 instead.
+    assert code == EXIT_VALIDATION, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.MISSING_FILE.value
+    assert "manifest.json not found in archive" in payload["msg"]
+    assert not out.exists()
+
+
+# ---------- successful round trips (lines 299-306) ----------
+
+
+@pytest.mark.filterwarnings(
+    "ignore:hmac-sha256 envelopes have zero non-repudiation:UserWarning"
+)
+def test_sign_hmac_round_trip_produces_verifiable_tar(tmp_path: Path) -> None:
+    from aphelion.verifier import verify_package
+
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(HMAC_KEY)
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "hmac-signer",
+            "--algorithm", "hmac-sha256",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    assert code == 0, err
+    assert out.exists()
+    # Teeth: the emitted tar must actually verify (require_signed forces §5).
+    result = verify_package(out, require_signed=True)
+    assert len(result.envelopes) == 1
+    assert result.envelopes[0].signer_id == "hmac-signer"
+    assert result.envelopes[0].algorithm == "hmac-sha256"
+
+
+def test_sign_ed25519_round_trip_produces_verifiable_tar(tmp_path: Path) -> None:
+    pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from aphelion.verifier import verify_package
+
+    pkg = _packed_tar(tmp_path)
+
+    # The CLI expects the key file to hold the raw 32-byte ed25519 private key.
+    priv_raw = Ed25519PrivateKey.generate().private_bytes_raw()
+    assert len(priv_raw) == 32
+    key_file = tmp_path / "ed.key"
+    key_file.write_bytes(priv_raw)
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "ed-signer",
+            "--algorithm", "ed25519",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    assert code == 0, err
+    assert out.exists()
+    # Teeth: a real Ed25519 signature over the package canonical hash must verify.
+    result = verify_package(out, require_signed=True)
+    assert len(result.envelopes) == 1
+    assert result.envelopes[0].signer_id == "ed-signer"
+    assert result.envelopes[0].algorithm == "ed25519"
+    assert result.envelopes[0].package_canonical_hash == _pkg_canonical_hash(pkg)
