@@ -182,6 +182,54 @@ def _make_signed_tar(
 
 
 # ---------------------------------------------------------------------------
+# Tests: verifier internal helpers (defensive-branch coverage)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_load_events_skips_blank_and_whitespace_lines(tmp_path: Path) -> None:
+    """_load_events drops blank and whitespace-only lines between records."""
+    from aphelion.verifier import _load_events
+
+    event = {
+        "actor": "test",
+        "claim_id": UUID_CLAIM_A,
+        "claim_instance_id": UUID_INSTANCE_A,
+        "event_id": UUID_EVENT_1,
+        "event_type": "create",
+        "timestamp": "2026-04-21T00:00:00Z",
+    }
+    line = canonical_dumps(normalize(event))  # canonical line, already ends in \n
+    p = tmp_path / "provenance.jsonl"
+    # Interleave a blank line and a whitespace-only line between two records.
+    p.write_bytes(line + b"\n" + b"   \n" + line)
+
+    events = _load_events(p)
+    assert len(events) == 2
+    assert all(e["event_id"] == UUID_EVENT_1 for e in events)
+
+
+@pytest.mark.unit
+def test_check_provenance_chain_rejects_multiple_creates() -> None:
+    """A claim with two create events trips the single-create guard (CHAIN_BROKEN)."""
+    from aphelion.error_codes import ErrorCode
+    from aphelion.errors import SemanticError
+    from aphelion.verifier import _check_provenance_chain
+
+    events = [
+        {"claim_id": UUID_CLAIM_A, "event_id": UUID_EVENT_1, "event_type": "create"},
+        {
+            "claim_id": UUID_CLAIM_A,
+            "event_id": "0191bbbb-0000-7000-8000-eeee00000002",
+            "event_type": "create",
+        },
+    ]
+    with pytest.raises(SemanticError) as exc:
+        _check_provenance_chain(events)
+    assert exc.value.code == ErrorCode.CHAIN_BROKEN
+
+
+# ---------------------------------------------------------------------------
 # Tests: unpacker accessors
 # ---------------------------------------------------------------------------
 
