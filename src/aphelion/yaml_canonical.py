@@ -250,7 +250,7 @@ def split_frontmatter(text: str) -> tuple[str, str]:
     yaml_part = rest[: closing.start()]
     body_start = closing.end()
     body = rest[body_start:]
-    if body.startswith("\r\n"):
+    if body.startswith("\r\n"):  # pragma: no cover - unreachable: _FENCE_RE's \s*$ consumes the \r of a CRLF closing fence, so body always starts with \n
         body = body[2:]
     elif body.startswith("\n"):
         body = body[1:]

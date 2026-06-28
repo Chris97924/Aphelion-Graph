@@ -83,6 +83,134 @@ class TestYamlCanonical:
             split_frontmatter("---\na: 1\nbody\n")
         assert exc.value.code == ErrorCode.PARSE_ERROR
 
+    # -- safety contract: reject non-canonical / unsupported YAML --------------
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "[1, 2]",   # flow sequence
+            "{a: 1}",   # flow mapping
+            "&anchor x",  # anchor
+            "*alias",   # alias
+            "!tag v",   # tag
+        ],
+    )
+    def test_parse_rejects_unsupported_yaml_tokens(self, token: str) -> None:
+        # Flow style, anchors, aliases, and tags are outside the canonical
+        # Aphelion subset and MUST be rejected, never silently coerced to a
+        # plain string (which would let a non-canonical doc earn a hash).
+        with pytest.raises(SchemaError) as exc:
+            parse_frontmatter(f"a: {token}\n")
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    def test_parse_false_scalar(self) -> None:
+        data, _ = parse_frontmatter("flag: false\n")
+        assert data == {"flag": False}
+        assert data["flag"] is False
+
+    def test_parse_unquoted_string_falls_through_non_number(self) -> None:
+        # A bare token that is neither bool/null nor a valid int/float falls
+        # through the numeric parse (ValueError) and is treated as a string.
+        # "world" exercises the int() path; "1.2.3" the float() path.
+        data, _ = parse_frontmatter("a: world\nb: 1.2.3\n")
+        assert data == {"a": "world", "b": "1.2.3"}
+
+    def test_parse_skips_blank_and_comment_lines_top_level(self) -> None:
+        text = "a: 1\n\n# a comment\nb: 2\n"
+        data, order = parse_frontmatter(text)
+        assert data == {"a": 1, "b": 2}
+        assert order == ["a", "b"]
+
+    def test_parse_skips_blank_and_comment_lines_inside_block(self) -> None:
+        text = 'tags:\n  - "a"\n\n  # note\n  - "b"\n'
+        data, _ = parse_frontmatter(text)
+        assert data == {"tags": ["a", "b"]}
+
+    def test_parse_rejects_key_with_no_value_and_no_block(self) -> None:
+        # `a:` with nothing indented after it is not a valid block scalar.
+        with pytest.raises(SchemaError) as exc:
+            parse_frontmatter("a:\n")
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    def test_parse_rejects_mixed_block_under_sequence(self) -> None:
+        # First block line is a list item, a later line is not — reject.
+        text = 'tags:\n  - "a"\n  notalist\n'
+        with pytest.raises(SchemaError) as exc:
+            parse_frontmatter(text)
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    def test_parse_rejects_mixed_block_under_mapping(self) -> None:
+        # First block line is a nested key/value, a later line is a list item.
+        text = 'labels:\n  priority: "high"\n  - notakv\n'
+        with pytest.raises(SchemaError) as exc:
+            parse_frontmatter(text)
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    def test_parse_rejects_nested_mapping_deeper_than_one_level(self) -> None:
+        # A nested key with no scalar value implies a 2nd nesting level.
+        text = 'labels:\n  deep:\n'
+        with pytest.raises(SchemaError) as exc:
+            parse_frontmatter(text)
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    def test_parse_rejects_unknown_block_shape(self) -> None:
+        # Block line is neither a list item nor a nested key/value.
+        text = 'weird:\n  plaintext\n'
+        with pytest.raises(SchemaError) as exc:
+            parse_frontmatter(text)
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    # -- emit_frontmatter: scalar / container edge shapes ----------------------
+
+    def test_emit_none_true_false(self) -> None:
+        out = emit_frontmatter({"a": None, "b": True, "c": False})
+        assert out == "a: null\nb: true\nc: false\n"
+
+    def test_emit_string_with_double_quote_uses_single_quote(self) -> None:
+        out = emit_frontmatter({"a": 'say "hi"'})
+        assert out == "a: 'say \"hi\"'\n"
+        # Round-trips back to the original value.
+        reparsed, _ = parse_frontmatter(out)
+        assert reparsed == {"a": 'say "hi"'}
+
+    def test_emit_string_with_both_quote_forms_raises(self) -> None:
+        with pytest.raises(SchemaError) as exc:
+            emit_frontmatter({"a": 'he said "hi" it\'s done'})
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    def test_emit_unsupported_scalar_type_raises(self) -> None:
+        with pytest.raises(SchemaError) as exc:
+            emit_frontmatter({"a": object()})
+        assert exc.value.code == ErrorCode.PARSE_ERROR
+
+    def test_emit_empty_list(self) -> None:
+        assert emit_frontmatter({"tags": []}) == "tags: []\n"
+
+    def test_emit_empty_dict(self) -> None:
+        assert emit_frontmatter({"labels": {}}) == "labels: {}\n"
+
+    def test_emit_nested_mapping_sorts_inner_keys(self) -> None:
+        out = emit_frontmatter({"labels": {"y": "2", "x": "1"}})
+        assert out == 'labels:\n  x: "1"\n  y: "2"\n'
+        reparsed, _ = parse_frontmatter(out)
+        assert reparsed == {"labels": {"x": "1", "y": "2"}}
+
+    # -- split_frontmatter: CRLF handling --------------------------------------
+
+    def test_split_strips_crlf_after_opening_fence(self) -> None:
+        yaml, body = split_frontmatter("---\r\na: 1\n---\nbody\n")
+        assert yaml == "a: 1\n"
+        assert body == "body\n"
+
+    def test_split_crlf_document_roundtrips(self) -> None:
+        # A fully CRLF document: the opening-fence CRLF is stripped (the
+        # \r\n branch) and the body retains its own line endings.
+        yaml, body = split_frontmatter("---\r\na: 1\r\n---\r\nbody\r\n")
+        assert yaml == "a: 1\r\n"
+        assert body == "body\r\n"
+        data, _ = parse_frontmatter(yaml)
+        assert data == {"a": 1}
+
 
 # ---- canonicalize_data (pure transform) --------------------------------------
 

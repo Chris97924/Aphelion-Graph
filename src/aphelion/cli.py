@@ -313,6 +313,12 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
     except SignerVerificationError as exc:
         import sys
         import json
+        # EXIT_VALIDATION is rebound as a function-local by the `from
+        # aphelion.errors import ... EXIT_VALIDATION` statements in the guard
+        # branches above, so the module-level binding is shadowed here. Import
+        # it locally (matching those branches) so this handler does not raise
+        # UnboundLocalError when reached before any guard branch ran.
+        from aphelion.errors import EXIT_VALIDATION
         sys.stderr.write(json.dumps({"code": exc.code, "severity": "error", "msg": str(exc)}, sort_keys=True) + "\n")
         sys.stderr.flush()
         return EXIT_VALIDATION

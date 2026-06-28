@@ -18,8 +18,10 @@ import hashlib
 import hmac
 
 import pytest
+from hypothesis import HealthCheck, given, settings, strategies as st
 
 from aphelion.canonical_json import dumps, normalize
+from aphelion.errors import SchemaError
 from aphelion.signer import (
     SignerManifest,
     SignerVerificationError,
@@ -235,6 +237,106 @@ def test_parse_attestation_rejects_non_object() -> None:
     with pytest.raises(SignerVerificationError) as exc:
         parse_attestation_line(b"[1,2,3]\n")
     assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+@pytest.mark.unit
+def test_parse_attestation_rejects_non_utf8() -> None:
+    """A non-UTF-8 byte sequence cannot be canonical JSON → E_SIGNATURE_MALFORMED."""
+    from aphelion.trust import parse_attestation_line
+
+    with pytest.raises(SignerVerificationError) as exc:
+        parse_attestation_line(b"\xff\xfe")
+    assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+@pytest.mark.unit
+def test_parse_attestation_rejects_invalid_json() -> None:
+    """Structurally invalid JSON surfaces as E_SIGNATURE_MALFORMED, not a raw parse error."""
+    from aphelion.trust import parse_attestation_line
+
+    with pytest.raises(SignerVerificationError) as exc:
+        parse_attestation_line(b"{not valid json")
+    assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+@pytest.mark.unit
+def test_parse_attestation_rejects_non_string_field() -> None:
+    """An object with all spec fields but a non-string value → E_SIGNATURE_MALFORMED.
+
+    ``signer_id`` is a JSON number here; every envelope field MUST be a string.
+    """
+    from aphelion.trust import parse_attestation_line
+
+    payload = {
+        "algorithm": "hmac-sha256",
+        "key_fingerprint": "a" * 64,
+        "notary_id": "n",
+        "signature_b64": "QQ==",
+        "signed_at_iso": SIGNED_AT,
+        "signer_id": 5,  # non-string field
+    }
+    line = dumps(normalize(payload))
+    with pytest.raises(SignerVerificationError) as exc:
+        parse_attestation_line(line)
+    assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+# ---------------------------------------------------------------------------
+# §2.2 envelope canonical round-trip — hypothesis fixed-point property
+# ---------------------------------------------------------------------------
+
+# Arbitrary text for each envelope field. ``parse_attestation_line`` only
+# requires each field be a string (it does not validate base64/hex shape), so
+# any non-surrogate text round-trips. Mirrors the value strategy in
+# tests/test_properties.py.
+_att_text = st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=24)
+
+
+@pytest.mark.unit
+@given(
+    notary_id=_att_text,
+    signer_id=_att_text,
+    key_fingerprint=_att_text,
+    algorithm=_att_text,
+    signed_at_iso=_att_text,
+    signature_b64=_att_text,
+)
+@settings(max_examples=150, suppress_health_check=[HealthCheck.too_slow])
+def test_prop_canonical_attestation_is_fixed_point(
+    notary_id: str,
+    signer_id: str,
+    key_fingerprint: str,
+    algorithm: str,
+    signed_at_iso: str,
+    signature_b64: str,
+) -> None:
+    """``canonical_attestation_bytes(parse_attestation_line(x))`` is a fixed point.
+
+    For every well-formed envelope, serializing → parsing → re-serializing the
+    canonical line reproduces the exact same bytes (property analogue of
+    tests/test_properties.py canonical-JSON round-trip).
+    """
+    from aphelion.trust import (
+        NotaryAttestationEnvelope,
+        canonical_attestation_bytes,
+        parse_attestation_line,
+    )
+
+    env = NotaryAttestationEnvelope(
+        notary_id=notary_id,
+        signer_id=signer_id,
+        key_fingerprint=key_fingerprint,
+        algorithm=algorithm,
+        signed_at_iso=signed_at_iso,
+        signature_b64=signature_b64,
+    )
+    try:
+        line = canonical_attestation_bytes(env)
+    except SchemaError:
+        # Hypothesis can emit NFC-unstable text that normalize rejects; skip.
+        return
+    parsed = parse_attestation_line(line)
+    assert canonical_attestation_bytes(parsed) == line
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +619,79 @@ def test_notary_key_with_trailing_non_base64_junk_rejected() -> None:
     with pytest.raises(SignerVerificationError) as exc:
         resolve_notary_attestation(signer_manifest, attestation, corrupt_notary)
     assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+# ---------------------------------------------------------------------------
+# _verify_attestation_signature defensive branches (direct helper coverage)
+#
+# These branches are unreachable through resolve_notary_attestation: §3.6
+# decodes notary_manifest.public_key_b64 (validate=True) and §3.4/§3.5 gate the
+# algorithm before _verify_attestation_signature runs. Exercise the helper
+# directly to pin the spec error-code contract on the un-decodable-key and
+# unsupported-algorithm fall-throughs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_verify_attestation_signature_hmac_notary_key_not_base64() -> None:
+    """hmac branch: un-decodable notary key → E_SIGNER_MALFORMED."""
+    from dataclasses import replace
+
+    from aphelion.trust import _verify_attestation_signature
+
+    _, notary_manifest = _hmac_notary_material()
+    bad_notary = replace(notary_manifest, public_key_b64="!!!not base64!!!")
+    with pytest.raises(SignerVerificationError) as exc:
+        _verify_attestation_signature(
+            notary_manifest=bad_notary,
+            attestation_hash="ab" * 32,  # 64 valid hex chars
+            signature_b64="QQ==",  # decodes fine; failure is the key decode
+        )
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+@pytest.mark.unit
+def test_verify_attestation_signature_ed25519_notary_key_not_base64() -> None:
+    """ed25519 branch: un-decodable notary key → E_SIGNER_MALFORMED."""
+    pytest.importorskip("cryptography")
+
+    from aphelion.trust import _verify_attestation_signature
+
+    notary_manifest = SignerManifest(
+        signer_id="acme-notary",
+        algorithm="ed25519",
+        public_key_b64="!!!not base64!!!",
+        key_fingerprint="a" * 64,
+        notary_uri=None,
+    )
+    with pytest.raises(SignerVerificationError) as exc:
+        _verify_attestation_signature(
+            notary_manifest=notary_manifest,
+            attestation_hash="cd" * 32,
+            signature_b64="QQ==",
+        )
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+@pytest.mark.unit
+def test_verify_attestation_signature_unsupported_algorithm_fallthrough() -> None:
+    """Algorithm neither hmac-sha256 nor ed25519 → defensive E_SIGNER_ALGORITHM_UNKNOWN."""
+    from aphelion.trust import _verify_attestation_signature
+
+    notary_manifest = SignerManifest(
+        signer_id="acme-notary",
+        algorithm="future-algo",
+        public_key_b64="AAAA",
+        key_fingerprint="a" * 64,
+        notary_uri=None,
+    )
+    with pytest.raises(SignerVerificationError) as exc:
+        _verify_attestation_signature(
+            notary_manifest=notary_manifest,
+            attestation_hash="ef" * 32,
+            signature_b64="QQ==",
+        )
+    assert exc.value.code == "E_SIGNER_ALGORITHM_UNKNOWN"
 
 
 # ---------------------------------------------------------------------------

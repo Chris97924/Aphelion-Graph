@@ -111,7 +111,7 @@ def _check_provenance_chain(events: list[dict[str, Any]]) -> None:
 
     for claim_id, chain in by_claim.items():
         if not chain:
-            continue
+            continue  # pragma: no cover - by_claim values are never empty by construction
         creates = [e for e in chain if e["event_type"] == "create"]
         if len(creates) != 1:
             raise SemanticError(
