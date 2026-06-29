@@ -41,7 +41,13 @@ _LEGAL_TRANSITIONS = {
     ("active", "revise"): "active",
     ("active", "supersede"): "superseded",
     ("active", "withdraw"): "withdrawn",
-    ("active", "publish"): "active",
+    # NOTE: there is deliberately NO ("active", "publish") transition.
+    # spec/lifecycle-state-machine.md §3/§4 only allows `publish` to REACH
+    # `active` (from `(new)`/`draft`); it is never legal FROM `active`. An
+    # earlier spurious ("active","publish") entry made this reader accept a
+    # create->publish stream that the reference validator (and the spec)
+    # reject with ERR-SEM-LIFECYCLE-ILLEGAL. Regression-guarded by
+    # tests/test_diff_fuzz_hardening.py::test_active_publish_rejected_like_reference.
     ("draft", "publish"): "active",
     ("NEW", "publish"): "active",
 }
