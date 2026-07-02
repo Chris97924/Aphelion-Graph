@@ -8,6 +8,7 @@ import unicodedata
 from pathlib import Path
 
 import pytest
+from hypothesis import given, settings, strategies as st
 
 from aphelion.content_hash import (
     EXCLUDED_KEYS,
@@ -113,3 +114,77 @@ def test_identity_fields_is_frozenset() -> None:
 def test_reserved_prefixes_constant() -> None:
     assert "parallax:" in RESERVED_PREFIXES
     assert "internal:" in RESERVED_PREFIXES
+
+
+# ---------- RFC 8785 §3.2.3: UTF-16 code-unit key ordering ----------
+
+
+def test_canonical_bytes_sorts_supplementary_keys_by_utf16() -> None:
+    """Object keys sort by UTF-16 code unit, not Unicode code point.
+
+    U+1F600 (😀) encodes as the surrogate pair D83D DE00; U+FFFF encodes as
+    the single unit FFFF. By UTF-16 code unit D83D < FFFF, so U+1F600 sorts
+    *before* U+FFFF — the reverse of code-point order (U+1F600 = 0x1F600 >
+    U+FFFF), which is what json.dumps(sort_keys=True) produced. This is the
+    single case where JCS §3.2.3 and Python's code-point sort disagree.
+    """
+    projection = {"\U0001F600": 1, "￿": 2}
+    out = canonical_bytes(projection).decode("utf-8")
+    assert out == '{"\U0001F600":1,"￿":2}'
+    assert out.index("\U0001F600") < out.index("￿")
+
+
+def test_nested_labels_supplementary_key_order() -> None:
+    """Nested object keys are also UTF-16-ordered through the projection path."""
+    payload = {"type": "fact", "labels": {"\U0001F600": "a", "￿": "b"}}
+    projection = project(payload)
+    out = canonical_bytes(projection).decode("utf-8")
+    # Within the labels object the astral key precedes U+FFFF.
+    assert out.index("\U0001F600") < out.index("￿")
+
+
+# ---------- Property: BMP inputs stay byte-identical to the legacy form ----------
+
+# BMP, non-surrogate characters only. For these, UTF-16 code-unit order and
+# Unicode code-point order coincide, so the new JCS serializer MUST reproduce
+# the exact bytes of the previous json.dumps(sort_keys=True) implementation.
+_bmp_chars = st.characters(max_codepoint=0xFFFF, blacklist_categories=("Cs",))
+_bmp_key = st.text(alphabet=_bmp_chars, min_size=1, max_size=8)
+_bmp_scalars = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(min_value=-(2**53), max_value=2**53),
+    st.text(alphabet=_bmp_chars, max_size=8),
+)
+_bmp_json = st.recursive(
+    _bmp_scalars,
+    lambda children: st.one_of(
+        st.lists(children, max_size=4),
+        st.dictionaries(keys=_bmp_key, values=children, max_size=4),
+    ),
+    max_leaves=8,
+)
+_bmp_projection = st.dictionaries(keys=_bmp_key, values=_bmp_json, max_size=6)
+
+
+def _legacy_canonical_bytes(projection: dict) -> bytes:
+    """The pre-fix implementation: json.dumps with code-point key sorting."""
+    return json.dumps(
+        projection,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+@given(projection=_bmp_projection)
+@settings(max_examples=300)
+def test_prop_bmp_canonical_bytes_matches_legacy(projection: dict) -> None:
+    """For any BMP-only projection the JCS bytes equal the legacy bytes.
+
+    Guards the hard requirement that BMP/ASCII content hashes never drift: the
+    UTF-16 fix only reorders supplementary-plane keys, everything else must be
+    reproduced verbatim.
+    """
+    assert canonical_bytes(projection) == _legacy_canonical_bytes(projection)
