@@ -95,18 +95,49 @@ def project(payload: dict[str, Any],
     return out
 
 
+def _jcs_sorted(value: Any) -> Any:
+    """Return ``value`` with every object's members ordered per RFC 8785 §3.2.3.
+
+    JCS sorts object keys by their **UTF-16 code units**, not by Unicode code
+    point. The two orders agree for every BMP key (a BMP character's UTF-16
+    encoding is a single code unit equal to its code point), so this reorders
+    nothing in the common case; they diverge only when a key contains a
+    supplementary-plane character (U+10000..U+10FFFF), which UTF-16 encodes as
+    a surrogate pair whose leading unit (0xD800..0xDBFF) sorts below U+E000+.
+
+    Comparing the big-endian UTF-16 byte encodings lexicographically is exactly
+    a comparison of the underlying code-unit sequences, so ``utf-16-be`` is the
+    sort key. Only member order changes; scalar values and list order are left
+    untouched and later serialization is delegated to ``json.dumps``.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _jcs_sorted(sub)
+            for key, sub in sorted(
+                value.items(), key=lambda item: item[0].encode("utf-16-be")
+            )
+        }
+    if isinstance(value, list):
+        return [_jcs_sorted(item) for item in value]
+    return value
+
+
 def canonical_bytes(projection: dict[str, Any]) -> bytes:
     """Render a projected payload as RFC 8785 JCS-canonical bytes.
 
-    Python's json.dumps with sort_keys=True and compact separators
-    matches RFC 8785 for the subset of JSON Aphelion allows (no raw floats
-    in identity fields apart from ``confidence``, which is expected to
-    be pre-formatted). Non-ASCII characters are emitted as raw UTF-8
-    (ensure_ascii=False), matching JCS §3.2.
+    Object members are ordered by UTF-16 code unit per RFC 8785 §3.2.3 (see
+    :func:`_jcs_sorted`); the keys are pre-ordered so json.dumps runs with
+    ``sort_keys=False``. String escaping, compact separators, and number form
+    are delegated to ``json.dumps``, which matches RFC 8785 for the subset of
+    JSON Aphelion allows (no raw floats in identity fields apart from
+    ``confidence``, which is expected to be pre-formatted). Non-ASCII
+    characters are emitted as raw UTF-8 (ensure_ascii=False), matching
+    JCS §3.2. BMP-only payloads are byte-identical to the previous
+    code-point-sorted output.
     """
     text = json.dumps(
-        projection,
-        sort_keys=True,
+        _jcs_sorted(projection),
+        sort_keys=False,
         separators=(",", ":"),
         ensure_ascii=False,
         allow_nan=False,

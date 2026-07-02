@@ -92,6 +92,12 @@ verbatim on the wire, but MUST NOT affect `content_hash`. See
 RFC 8785 already pins JSON object key order (I-JSON), string escapes,
 and number form. In addition:
 
+0. **Object key order**: object members MUST be sorted by their **UTF-16
+   code units** (RFC 8785 §3.2.3), not by Unicode code point. The two
+   orders coincide for every BMP key but diverge for keys containing a
+   supplementary-plane character (U+10000..U+10FFFF): its leading UTF-16
+   surrogate unit (0xD800..0xDBFF) sorts below U+E000..U+FFFF, so e.g.
+   a `U+1F600` key precedes a `U+FFFF` key.
 1. **Unicode**: every string value MUST be NFC-normalized before
    canonicalization. NFD inputs hash identically to their NFC
    counterparts.
