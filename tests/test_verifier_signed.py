@@ -1162,6 +1162,79 @@ def test_verify_package_accepts_two_envelopes_same_signer(tmp_path: Path) -> Non
 
 
 @pytest.mark.integration
+def test_verify_package_extracts_signer_manifests_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """verify_package must not re-extract the signer manifests per envelope.
+
+    Regression guard for the O(N) tar re-read: with N=2 envelopes the pre-fix
+    verifier called ``extract_signer_manifests`` once inside signature
+    validation plus once per envelope in the notary-resolution loop (3 total).
+    The fix reuses the manifests parsed during validation, so the extraction
+    count must stay O(1) — i.e. it must not grow with the envelope count.
+    """
+    import aphelion.unpacker as unpacker_mod
+    from aphelion.verifier import verify_package
+    from aphelion.canonical_tar import read_members, TarMember
+    from aphelion.canonical_tar import pack as tar_pack
+
+    src = tmp_path / "src"
+    _build_minimal_source(src)
+    tar_path = tmp_path / "pkg.tar"
+    _pack_source(src, tar_path)
+
+    manifest_obj = normalize(json.loads((src / "manifest.json").read_bytes()))
+    claims_tuples = [
+        (c["claim_id"], c["claim_instance_id"], c["hash"])
+        for c in manifest_obj["claims"]
+    ]
+    pkg_hash = compute_package_canonical_hash(
+        format_version=manifest_obj["format_version"],
+        package_id=manifest_obj["package_id"],
+        claims=claims_tuples,
+    )
+
+    s = HMACSigner(signer_id=SIGNER_ID, secret=SHARED_SECRET)  # secret-scan:allow (fake test key SHARED_SECRET)
+    env1 = s.sign(package_canonical_hash=pkg_hash, signed_at_iso="2026-04-01T00:00:00.000Z")
+    env2 = s.sign(package_canonical_hash=pkg_hash, signed_at_iso="2026-04-27T00:00:00.000Z")
+    sig_bytes = write_signatures_jsonl([env1, env2])
+
+    m = s.manifest()
+    manifest_json = canonical_dumps(normalize({
+        "signer_id": m.signer_id,
+        "algorithm": m.algorithm,
+        "public_key_b64": m.public_key_b64,
+        "key_fingerprint": m.key_fingerprint,
+        "notary_uri": None,
+    }))
+
+    existing = read_members(tar_path.read_bytes())
+    new_tar = tar_pack(existing + [
+        TarMember(path="signatures.jsonl", data=sig_bytes, is_dir=False),
+        TarMember(path=f"signers/{SIGNER_ID}.json", data=manifest_json, is_dir=False),
+    ])
+    tar_path.write_bytes(new_tar)
+
+    # Spy that counts extractions while delegating to the real implementation so
+    # verification still runs for real.
+    real_extract = unpacker_mod.extract_signer_manifests
+    calls = {"n": 0}
+
+    def _counting_extract(path: Path | str):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        return real_extract(path)
+
+    monkeypatch.setattr(unpacker_mod, "extract_signer_manifests", _counting_extract)
+
+    result = verify_package(tar_path, require_signed=True)
+    assert len(result.envelopes) == 2
+    assert calls["n"] <= 1, (
+        f"extract_signer_manifests was called {calls['n']} times for 2 envelopes; "
+        "it must not grow with the envelope count"
+    )
+
+
+@pytest.mark.integration
 def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
     """aphe sign then aphe verify --require-signed → success end-to-end."""
     import contextlib

@@ -315,6 +315,21 @@ def validate_signatures(tar_path: Path | str) -> "tuple[Any, ...]":
     verification regardless of caller flags. The ``require_signed`` flag
     at the verifier layer only controls whether ABSENCE of signatures is an error.
     """
+    envelopes, _ = _validate_signatures_full(tar_path)
+    return envelopes
+
+
+def _validate_signatures_full(
+    tar_path: Path | str,
+) -> "tuple[tuple[Any, ...], dict[str, Any]]":
+    """Verify all signatures and return ``(envelopes, signer_manifests_by_id)``.
+
+    Performs the identical §5 verification as :func:`validate_signatures` but
+    additionally returns the parsed ``SignerManifest`` for each verified signer,
+    keyed by ``signer_id``. The verifier reuses this mapping for notary
+    resolution so signer manifests are neither re-extracted from the tar nor
+    re-parsed once per envelope.
+    """
     from aphelion.unpacker import extract_signatures_jsonl, extract_signer_manifests
     from aphelion.sig_pack import read_signatures_jsonl
     from aphelion.signer import (
@@ -329,7 +344,7 @@ def validate_signatures(tar_path: Path | str) -> "tuple[Any, ...]":
     # §5 rule 2 (implicit): read signatures.jsonl; if absent → unsigned-valid
     sig_content = extract_signatures_jsonl(tar_path)
     if sig_content is None:
-        return ()
+        return (), {}
 
     # Parse and validate sort order (raises E_SIGNATURE_MALFORMED / E_SIGNATURE_ORDER)
     envelopes = read_signatures_jsonl(sig_content)
@@ -378,6 +393,7 @@ def validate_signatures(tar_path: Path | str) -> "tuple[Any, ...]":
         claims=claims_tuples,
     )
 
+    signer_manifests_by_id: dict[str, Any] = {}
     for envelope in envelopes:
         signer_id = envelope.signer_id
 
@@ -410,6 +426,8 @@ def validate_signatures(tar_path: Path | str) -> "tuple[Any, ...]":
                 "E_SIGNER_MALFORMED",
                 f"signers/{signer_id}.json missing required fields: {exc}",
             ) from exc
+
+        signer_manifests_by_id[signer_id] = sm
 
         # §5 rule: key_fingerprint recomputes
         try:
@@ -465,7 +483,7 @@ def validate_signatures(tar_path: Path | str) -> "tuple[Any, ...]":
                 f"no verifier for algorithm {envelope.algorithm!r}",
             )
 
-    return envelopes
+    return envelopes, signer_manifests_by_id
 
 
 def validate_package(manifest_obj: Any, events: list[Any],

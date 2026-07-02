@@ -195,7 +195,8 @@ def verify_package(
     Spec §5 verification order:
     1. Unpack tar, run v0.4 semantic checks (hash, fileset, chain, refs).
        Failure here uses v0.4 error codes; signatures are NOT checked.
-    2. Run ``validator.validate_signatures(tar_path)``. Returns envelopes tuple.
+    2. Run §5 signature validation, reusing the parsed signer manifests it
+       already extracted (no per-envelope tar re-read).
     3. If ``require_signed=True`` and envelopes is empty: raise E_SIGNER_REQUIRED.
     4. For each envelope, resolve notary. If ``require_notary=True`` and any
        attestation is ``"verified-locally"`` only: raise E_SIGNER_NOTARY_REQUIRED.
@@ -203,9 +204,9 @@ def verify_package(
     Backward-compat: defaults (require_signed=False, require_notary=False) preserve
     v0.4 behavior — unsigned packages pass, signed packages are §5-verified.
     """
-    from aphelion.signer import SignerVerificationError, SignerManifest
+    from aphelion.signer import SignerVerificationError
     from aphelion.trust import resolve_notary, attestation_is_acceptable
-    from aphelion.validator import validate_signatures
+    from aphelion.validator import _validate_signatures_full
 
     tar_path = Path(tar_path)
 
@@ -215,8 +216,11 @@ def verify_package(
         unpacked = unpack(tar_path, tmp_dir)
         verify(unpacked)
 
-    # Step 2: v0.5 signature validation
-    envelopes = validate_signatures(tar_path)
+    # Step 2: v0.5 signature validation. This extracts and parses each signer
+    # manifest exactly once (with typed-error guards); reuse the parsed
+    # SignerManifest objects below instead of re-reading the whole tar and
+    # re-parsing per envelope.
+    envelopes, signer_manifests_by_id = _validate_signatures_full(tar_path)
 
     # Step 3: require_signed check
     if require_signed and len(envelopes) == 0:
@@ -228,19 +232,7 @@ def verify_package(
     # Step 4: notary resolution
     attestations: list[Any] = []
     for envelope in envelopes:
-        # Re-read the signer manifest to build SignerManifest for trust resolution
-        import json as _json
-        from aphelion.unpacker import extract_signer_manifests
-
-        signer_manifests_raw = extract_signer_manifests(tar_path)
-        raw = _json.loads(signer_manifests_raw[envelope.signer_id].decode("utf-8"))
-        sm = SignerManifest(
-            signer_id=raw["signer_id"],
-            algorithm=raw["algorithm"],
-            public_key_b64=raw["public_key_b64"],
-            key_fingerprint=raw["key_fingerprint"],
-            notary_uri=raw.get("notary_uri"),
-        )
+        sm = signer_manifests_by_id[envelope.signer_id]
         attestation = resolve_notary(sm)
         attestations.append(attestation)
 
