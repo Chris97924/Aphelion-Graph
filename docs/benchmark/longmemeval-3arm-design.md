@@ -83,11 +83,21 @@ Arm C exercises exactly the memory-quality machinery under test:
 |---|---|---|
 | **content_hash dedup** | `spec/content-hash.md` | RFC 8785 (JCS) canonicalization of the identity projection → SHA-256; claims with an equal 64-hex `content_hash` coalesce (`duplicate` merge-verdict). |
 | **Event state machine** | `spec/lifecycle-state-machine.md` | `create / revise / reaffirm / withdraw / supersede`; canonical event order `(occurred_at_ms, event_id_lex)`; `superseded` and `withdrawn` claims become read-only and are suppressed from retrieval surfacing. |
-| **R4 conflict classification** | `spec/v0.3-claim-semantics.md` | Reader-side: subject-group the active set, apply R2 valid-time filtering, resolve the `supersedes` graph, emit `conflict_class ∈ {none, scope_mismatch, supersession, contradiction, ambiguity}`; surface the winning claim, demote the losers. |
+| **R4 conflict classification** | `spec/v0.3-claim-semantics.md` | Reader-side: subject-group the active set, apply R2 valid-time filtering, resolve the `supersedes` graph, emit `conflict_class ∈ {none, scope_mismatch, supersession, contradiction, ambiguity}`. The verdict governs surfacing: `none`/`supersession` yield a single `primary`; `ambiguity` yields a `primary` (the definite claim) plus the others; **`contradiction` yields NO `primary` — every conflicting claim is surfaced** (`src/aphelion/read_adapter.py` `_residual_default_policy`; `tests/test_read_adapter.py::test_polarity_divergence_returns_contradiction`). Surfacing removes only truly `superseded`/`withdrawn` claims. |
 
-At query time Arm C returns, for each retrieved candidate set, the claim(s) that
-survive R4 resolution — current, non-superseded, non-withdrawn — instead of the
-raw pile A and B return.
+At query time Arm C returns, for each retrieved candidate set, the R4-resolved
+result: `superseded`/`withdrawn` claims are removed, and the surviving active set
+carries an R4 verdict. Arm C surfaces a single primary only when the verdict is
+`none`, `supersession`, or `ambiguity`; when the verdict is `contradiction` it
+surfaces **all** conflicting claims with no primary — not the raw pile A and B
+return, but not a single artificially-chosen winner either.
+
+**Harness note (contradiction handling).** Arm C's retrieval MUST preserve the
+`contradiction` contract — surface every conflicting claim, pick no winner. An
+implementation that collapses a contradiction to one claim would hide a live
+conflict and could spuriously inflate M1 (accidentally "answering" from one
+arbitrary side) and distort M3. The metric harness treats a collapsed
+contradiction as an Arm C implementation bug, not a result.
 
 **Mechanism → metric map.** content_hash dedup is designed to move **M2**;
 the event SM (`supersede`/`withdraw` suppression) plus R4 is designed to move
@@ -208,7 +218,8 @@ them.** Once pinned they may not be moved after any result is seen (§6.3).
 | **M2** | Dedup F1 (exact-duplicate detection) | **C.F1 > A.F1 + 0.10** | content_hash dedup should mechanically beat no-dedup by a wide, unambiguous margin. Failure to clear +0.10 implies the identity projection or canonicalization is miscalibrated. Highest-power metric. |
 | **M3** | Stale-info contamination rate | **C ≤ 0.5 × A** | `superseded`/`withdrawn` suppression should at least halve the rate at which a stale (superseded) value appears in the retrieved context, vs plain storage. Contamination = fraction of knowledge-update answers whose retrieved context contains the *old* value. |
 | **M4** | Storage / latency | **sanity-only — no gate** (soft tripwire at 10× Arm A) | Aphelion trades storage/compute for correctness; this benchmark judges correctness, so M4 is context, not a gate. Report p50/p95 query latency and on-disk bytes/claim; flag only pathological >10× A regressions. |
-| **M5** | Cross-tool round-trip byte-equality | **100 / 100 SHA-256 byte-identical** | The `spec/canonical-serialization.md` contract is absolute: any single mismatch is a spec hole, not a quality tradeoff. See §7 for the independent-reader mechanism. |
+| **M5** | Cross-tool round-trip byte-equality | **100 / 100 SHA-256 byte-identical** | The `spec/canonical-serialization.md` contract is absolute: any single mismatch is a spec hole, not a quality tradeoff. **Precondition:** the existing `scripts/external_reader.py` reproduces only the validator verdict, *not* canonical bytes — M5 requires work item `W-M5` (a full canonical independent reader) or an explicit re-scope before it can run; see §7.4. |
+| **AG** | Adversarial-set advantage (bias guard §6, item 4) | **diagnostic tripwire (non-gating): C − B ≤ +3 pp on the 20 adversarial questions** | New draft rule (v0.2 named the adversarial set but pinned no number). On questions where aphelion's machinery structurally cannot help, C must not gain more than the very margin M1 requires it to gain on the real set; a larger adversarial gain signals arm-identity leakage or spurious signal. Non-gating because N = 20 (+3pp ≈ 0.6 questions cannot support a hard pass/fail); a breach **mandates** a leakage investigation before M1/M3 are trusted. Pinned here so the rule is fixed before any run. |
 
 **Also pre-registered (see §5, §6):** fixed random seed, answering-model
 temperature = 0, pinned answering + judge model identifiers. The commit that
@@ -277,8 +288,11 @@ every incentive, conscious or not, to build a benchmark its format wins.
    single-session-user questions with no updates and no duplicates (no
    supersession, no dedup opportunity). If Arm C "wins" here, it is winning
    *dishonestly* (spurious signal, or arm identity leaking into the pipeline).
-   **Adversarial gate:** C must not beat B beyond noise on this set. This checks
-   that C wins for the *right reason*.
+   **Adversarial rule (pre-registered — §4 row AG):** C − B ≤ +3 pp on the 20
+   adversarial questions. This is a non-gating diagnostic tripwire — N = 20 is
+   too small for a hard gate — fixed here in advance so the response is not
+   chosen post-hoc; a breach mandates a leakage investigation before M1/M3 are
+   trusted. This checks that C wins for the *right reason*.
 5. **50-question human diff spot-check.** A human manually reviews 50 questions'
    Arm A vs Arm C retrieved contexts and answers, confirming the automated
    judge's verdicts are not systematically wrong. Catches judge failure modes the
@@ -361,11 +375,25 @@ that it is a shared, arm-independent stage.
 
 ### 7.4 Reuse of existing repo assets
 
-- **M5** uses `scripts/external_reader.py` — the ~170-LOC stdlib-only independent
-  reader (no `import aphelion`). Packaged claim sets are normalized by both the
-  reference validator and the external reader; the two normalized outputs must be
-  SHA-256 byte-identical (the reader already cross-checks each `samples/*`
-  fixture against its `expected-normalized.json`, exit 0 on agreement).
+- **M5 — the existing `scripts/external_reader.py` does NOT satisfy byte-equality
+  as-is.** It is a stdlib-only independent reader (no `import aphelion`), but by
+  its own contract it "is NOT a full validator": it reproduces only the
+  `validator_verdict` (valid/invalid) plus a minimal notes block, "without
+  claiming to reproduce the full Aphelion canonical output" (`external_reader.py`
+  header §Scope; `emit_sample_json` docstring). Its `samples/*` cross-check
+  compares verdict semantics, not canonical bytes. M5 as specified (100/100
+  SHA-256 byte-identical) therefore has an unmet precondition; the execution
+  drive MUST pick one before running M5:
+  - **(a) Recommended — work item `W-M5`:** expand `external_reader.py` into a
+    full canonical reader that emits the byte-exact canonical form
+    (`spec/canonical-serialization.md`), so a genuinely independent
+    implementation's bytes can be SHA-256-compared against the reference. This is
+    the honest two-implementation test of the cross-tool determinism claim.
+  - **(b) Fallback — re-scope M5:** if a second full reader is out of budget,
+    restate M5 as the reference packer's own round-trip determinism (pack →
+    unpack → re-pack byte-identity, already exercised by the repo's differential
+    tests) plus external-reader verdict agreement — and mark M5 as *not yet* a
+    true two-implementation cross-check until (a) lands.
 - **Metric fixtures** reuse `samples/`: `revise-withdraw-flow` (create→revise→
   withdraw chain, final state `withdrawn`) for M3 suppression; `contradictory-claim`
   for R4 `contradiction`; `duplicate-reaffirm-collision` for M2 dedup edges.
