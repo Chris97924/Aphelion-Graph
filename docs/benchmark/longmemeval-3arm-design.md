@@ -1,0 +1,409 @@
+# LongMemEval 3-Arm Benchmark — Design
+
+> **DRAFT — pre-registered thresholds 待 Chris 釘；執行在下一個 drive，門檻釘死前不得跑**
+>
+> This document is a *design*, not a result. It defines the arms, corpus,
+> metrics, and pre-registered decision gates. No arm has been run. The
+> thresholds in §4 are drafts inherited from the roadmap's v0.2-era design;
+> they become binding only once pinned by the maintainer. Do not execute any
+> arm until the thresholds are frozen — running first and choosing thresholds
+> afterward defeats the entire pre-registration guard.
+
+**Status:** Draft (design-only)
+**Date:** 2026-07-17
+**Targets:** aphelion 0.6.0 · wire spec 0.4.0 · schema 2.0
+**Scope of this drive:** design only — no harness code, no benchmark execution.
+
+---
+
+## 1. Background & the G2 kill-gate
+
+Aphelion shipped its full claim-semantics stack — content-hash identity
+(`spec/content-hash.md`), the lifecycle state machine
+(`spec/lifecycle-state-machine.md`), the R1–R4 reader-side conflict machinery
+(`spec/v0.3-claim-semantics.md`), a package signer (`spec/v0.5-signer-trust.md`),
+and notary attestation (`spec/v0.6-notary-attestation.md`) — on design
+conviction and green unit tests. Every one of those layers was justified by an
+argument about what *should* make memory better. None was ever measured against
+the question the roadmap itself posed at gate **G2**:
+
+> **G2 kill-gate (roadmap SSoT):** *benchmark shows no gain → spec 回修.*
+
+That gate was never executed. The format matured from v0.3 to v0.6 without a
+single empirical check on whether the event state machine, content-hash dedup,
+and R4 conflict classification actually improve memory-QA quality over a plain
+baseline. This document is the **補課** (make-up work): it operationalizes G2 so
+the kill-gate can finally fire.
+
+**Why now.** Aphelion is `aphelion 0.6.0` on PyPI, the `aphe` CLI is stable, and
+the R1–R4 machinery is shipped and load-bearing. The format is "done" enough
+that the honest question is now answerable: *does the machinery earn its
+complexity?* If the benchmark shows no gain, the roadmap's own rule says revise
+the spec — not ship more features on top of an unvalidated base.
+
+**This is a kill-gate, not a victory lap.** The design deliberately makes a
+positive result hard to manufacture: it includes a naive-dedup control (Arm B,
+§2), pre-registers every threshold before any run (§4, §6), and treats a
+negative outcome as a first-class, respected result that triggers `spec 回修`
+per §8. A benchmark that can only confirm the hypothesis is not a kill-gate.
+
+---
+
+## 2. Arms
+
+Three memory backends sit behind one shared QA pipeline (§7). The **only**
+independent variable across arms is the memory-quality layer; the extractor, the
+retriever, the answering model, and the judge are identical for A, B, and C.
+
+### 2.1 Arm A — plain
+
+Store each extracted memory as a flat claim (`.md` + YAML frontmatter). No
+content-hash, no `provenance.jsonl` events, no R1–R4 fields. On a duplicate or an
+updated fact, keep both copies. This is "dumb memory" — what you get from a
+markdown-and-YAML store with none of aphelion's machinery. It is the floor.
+
+### 2.2 Arm B — naive-dedup (the honest middle control)
+
+Arm A **plus** exact-string-match dedup: two claims collapse iff their body text
+is byte-equal after trivial whitespace trimming (strip leading/trailing
+whitespace, collapse internal runs to a single space). No canonical projection,
+no semantic hashing, no state machine, no valid-time. This is the three-line
+dedup any engineer writes without a spec.
+
+Arm B exists to answer the decisive question: **if Arm C beats Arm A but not
+Arm B, then aphelion's event state machine, RFC-8785 content-hash, and R4
+classification added nothing** — the win came from "dedup at all," which a naive
+control already buys. C must beat B, not merely A, to justify the machinery.
+
+### 2.3 Arm C — aphelion full
+
+Arm C exercises exactly the memory-quality machinery under test:
+
+| Mechanism | Spec | What it does in the arm |
+|---|---|---|
+| **content_hash dedup** | `spec/content-hash.md` | RFC 8785 (JCS) canonicalization of the identity projection → SHA-256; claims with an equal 64-hex `content_hash` coalesce (`duplicate` merge-verdict). |
+| **Event state machine** | `spec/lifecycle-state-machine.md` | `create / revise / reaffirm / withdraw / supersede`; canonical event order `(occurred_at_ms, event_id_lex)`; `superseded` and `withdrawn` claims become read-only and are suppressed from retrieval surfacing. |
+| **R4 conflict classification** | `spec/v0.3-claim-semantics.md` | Reader-side: subject-group the active set, apply R2 valid-time filtering, resolve the `supersedes` graph, emit `conflict_class ∈ {none, scope_mismatch, supersession, contradiction, ambiguity}`; surface the winning claim, demote the losers. |
+
+At query time Arm C returns, for each retrieved candidate set, the claim(s) that
+survive R4 resolution — current, non-superseded, non-withdrawn — instead of the
+raw pile A and B return.
+
+**Mechanism → metric map.** content_hash dedup is designed to move **M2**;
+the event SM (`supersede`/`withdraw` suppression) plus R4 is designed to move
+**M1** (answer the *current* fact) and **M3** (don't surface the stale one);
+canonical serialization determinism underwrites **M5**.
+
+### 2.4 Signer / notary — EXCLUDED (with rationale)
+
+The v0.5 signer (`spec/v0.5-signer-trust.md`) and v0.6 notary
+(`spec/v0.6-notary-attestation.md`) are **out of scope** for every arm:
+
+1. **Orthogonal to memory quality.** A signer answers "who attests these package
+   bytes are unaltered"; a notary answers "who vouches this key belongs to this
+   signer." Both are *trust/provenance* questions. A LongMemEval question
+   ("what was my 5K personal best?") is answered from claim *content*; no arm's
+   answer changes based on whether the package is signed or notarized. They add
+   **zero retrieval signal** — including them would only add packaging steps and
+   latency to metrics that measure memory quality, moving no gate.
+2. **Dependency cost, no benefit.** Real Ed25519 signing needs the
+   `aphelion[signer]` crypto extra (`cryptography>=42`); the core is otherwise
+   zero-dep. Pulling a crypto dependency into a memory-quality benchmark buys
+   nothing measurable here.
+
+Trust is a separate benchmark with its own threat model (tamper detection,
+key-substitution, revocation). It does not belong in the G2 memory-quality
+kill-gate.
+
+---
+
+## 3. Corpus (real recon)
+
+Recon was run against the on-disk data directory. All filenames, byte sizes, and
+counts below are measured, not assumed.
+
+### 3.1 Files
+
+Directory: `E:/Workspace/longmemeval/data/`
+
+| File | Bytes | ~Size | Role |
+|---|---:|---|---|
+| `longmemeval_s_cleaned.json` | 277,383,467 | 264.5 MiB | **LongMemEval_S** — full haystack (distractor-heavy). Primary retrieval corpus. |
+| `longmemeval_oracle.json` | 15,388,478 | 14.7 MiB | Oracle (evidence-only sessions). Source of gold answers + evidence-session labels. |
+| `custom_history/sample_haystack_and_timestamp.py` | 21,503 | 21.0 KiB | Helper script (haystack / timestamp sampler). |
+
+Both JSON files are top-level arrays of **500** question records with identical
+keys: `answer`, `answer_session_ids`, `haystack_dates`, `haystack_session_ids`,
+`haystack_sessions`, `question`, `question_date`, `question_id`,
+`question_type`.
+
+The two files describe the **same 500 questions** at two haystack depths:
+
+- **oracle**: mean **1.9** sessions/question (evidence only) — used for gold
+  answers and to label which sessions carry the evidence.
+- **S (cleaned)**: mean **47.7** sessions/question (min 38, max 62), mean
+  **~494** turns/question (min 396, max 616) — the real retrieval challenge with
+  distractor sessions. This is what the extractor ingests.
+
+### 3.2 Question-type distribution (measured, identical in both files)
+
+| question_type | count |
+|---|---:|
+| temporal-reasoning | 133 |
+| multi-session | 133 |
+| knowledge-update | **78** |
+| single-session-user | 70 |
+| single-session-assistant | 56 |
+| single-session-preference | 30 |
+| **total** | **500** |
+
+Abstention (`_abs`-suffixed question_id) variants: **30**.
+
+### 3.3 Correction to the v0.2 corpus plan
+
+The roadmap's v0.2-era design assumed **100 knowledge-update + 100 multi-session
+= 200 (100 each)**. Recon shows this is **not achievable**: LongMemEval_S
+contains only **78** knowledge-update questions total. There is no larger
+knowledge-update pool in standard LongMemEval.
+
+**Recommended corrected split (N = 200):**
+
+- **All 78 knowledge-update** questions — the M1 gate rides on this subset, so
+  the full pool is used to maximize statistical power.
+- **122 multi-session** questions — fixed-seed sample from the 133 available.
+
+Alternative (balanced) split: 78 + 78 = 156; recorded but not recommended
+(discards knowledge-update power without buying internal validity).
+
+**Statistical consequence (must be read honestly).** M1's gate is measured on
+**N = 78**. A +3pp difference is ≈ 2.3 questions; a Wilson 95% CI near 50%
+accuracy at N = 78 is roughly ±11pp. **M1 is underpowered** and must be reported
+with a bootstrapped confidence interval and read as *directional*. The
+statistical weight of the benchmark rests on **M2** (a mechanical F1 with high
+power) and **M3** (contamination, measurable across all 200), not on M1 alone.
+This is a real limitation of the available data, surfaced here rather than
+papered over — and it is the reason the §8 decision table gives M1 a two-round
+rule instead of acting on a single underpowered result.
+
+### 3.4 Data pipeline note
+
+- **oracle** supplies the gold answer and the evidence-session labels.
+- **S** supplies the haystack the memory extractor ingests.
+- knowledge-update questions inherently encode an *old-value → new-value* update
+  (the gold answer is the latest value) — the natural substrate for M1 and M3.
+- multi-session questions supply cross-session aggregation/QA breadth.
+
+---
+
+## 4. Metrics & pre-registered thresholds
+
+Every threshold below is a **draft** carried from the v0.2-era design. Numbers
+are unchanged from v0.2 unless a justification is stated; annotations add context
+without moving the number. **These become binding only when the maintainer pins
+them.** Once pinned they may not be moved after any result is seen (§6.3).
+
+| # | Metric | Gate (pre-registered) | Rationale |
+|---|---|---|---|
+| **M1** | QA accuracy on knowledge-update | **C − B ≥ +3 pp** | The honest test is C beating the *naive-dedup* control, not plain A. +3pp is the v0.2 minimum improvement deemed worth the state-machine complexity. **Caveat:** N = 78 → ≈ 2.3 questions; report a bootstrapped CI and treat as directional (§3.3). Report C − A as secondary context. |
+| **M2** | Dedup F1 (exact-duplicate detection) | **C.F1 > A.F1 + 0.10** | content_hash dedup should mechanically beat no-dedup by a wide, unambiguous margin. Failure to clear +0.10 implies the identity projection or canonicalization is miscalibrated. Highest-power metric. |
+| **M3** | Stale-info contamination rate | **C ≤ 0.5 × A** | `superseded`/`withdrawn` suppression should at least halve the rate at which a stale (superseded) value appears in the retrieved context, vs plain storage. Contamination = fraction of knowledge-update answers whose retrieved context contains the *old* value. |
+| **M4** | Storage / latency | **sanity-only — no gate** (soft tripwire at 10× Arm A) | Aphelion trades storage/compute for correctness; this benchmark judges correctness, so M4 is context, not a gate. Report p50/p95 query latency and on-disk bytes/claim; flag only pathological >10× A regressions. |
+| **M5** | Cross-tool round-trip byte-equality | **100 / 100 SHA-256 byte-identical** | The `spec/canonical-serialization.md` contract is absolute: any single mismatch is a spec hole, not a quality tradeoff. See §7 for the independent-reader mechanism. |
+
+**Also pre-registered (see §5, §6):** fixed random seed, answering-model
+temperature = 0, pinned answering + judge model identifiers. The commit that
+lands this document is the pre-registration record.
+
+---
+
+## 5. Answering & judge model plan
+
+Two model roles, both pinned:
+
+- **Answering model** — reads the retrieved context and produces the answer.
+  Runs at **temperature 0** with a **pinned seed**, identical across A/B/C.
+- **Judge model** — scores the answer against gold (LongMemEval-style
+  LLM-as-judge with a fixed rubric). 200 questions × 3 arms = 600 judgements.
+
+### 5.1 Candidates
+
+| Option | Pros | Cons |
+|---|---|---|
+| Local GB10 ollama `gpt-oss:120b` (`192.168.1.134:11434`) | Zero token cost; on-prem; fully reproducible; same model can serve all three arms → arm differences attributable to memory quality, not model variance. | Below-frontier capability; ollama has minor batch nondeterminism even at temp 0; weaker as a judge. |
+| Pinned frontier API snapshot (dated Claude or GPT) | Higher capability; stronger judge fidelity; snapshot pin gives reproducibility. | Per-token cost; reproducibility depends on the vendor not deprecating the snapshot. |
+
+### 5.2 Recommendation (final pins OPEN for Chris)
+
+**Split the roles:**
+
+- **Answering model = local `gpt-oss:120b` on GB10.** Zero-cost and reproducible,
+  and — crucially — the *same* model serves all three arms, so any A/B/C delta is
+  memory quality, not model variance. Answering is the high-volume path (600+
+  generations); keeping it local and free matters most here.
+- **Judge model = a pinned frontier API snapshot.** Judging is lower-volume and
+  fidelity matters more than cost; a stronger judge reduces scoring noise on M1.
+
+Whatever is chosen, the **same answering model and the same retriever must serve
+A, B, and C** — the only variable is the memory layer. That is the core
+internal-validity guard.
+
+**OPEN pins (Chris to freeze before any run):**
+
+- Answering-model exact tag (draft: `gpt-oss:120b` @ GB10 ollama).
+- Judge-model exact snapshot id (draft: a dated frontier snapshot such as
+  `claude-opus-4-8` or an equivalent pinned GPT snapshot — **exact id OPEN**).
+- Seed (draft: `20260717`).
+
+---
+
+## 6. Bias guards
+
+All five guards are mandatory. They exist because a memory format's author has
+every incentive, conscious or not, to build a benchmark its format wins.
+
+1. **Blind scoring (arm masking).** The judge receives `(question, gold,
+   candidate_answer)` with **no arm label**. Candidate answers from A/B/C are
+   shuffled and de-identified before scoring; the arm id is hashed out of the
+   judge payload so the judge cannot favor "the fancy one."
+2. **Fixed seed + temperature 0.** All generation at temp 0 with the pinned seed;
+   the retriever is seeded; sampling is disabled. Pinned in the pre-registration
+   (§5.2).
+3. **Pre-registered thresholds.** The entire §4 table is committed *before* any
+   run. The commit SHA of this document is the pre-registration timestamp.
+   Thresholds may not be moved after results are seen; if they are moved, it is a
+   documented protocol violation recorded in the results, not a silent edit.
+4. **20 adversarial questions.** A held-out set of question types where
+   aphelion's machinery should **not** help — e.g. single-session-preference /
+   single-session-user questions with no updates and no duplicates (no
+   supersession, no dedup opportunity). If Arm C "wins" here, it is winning
+   *dishonestly* (spurious signal, or arm identity leaking into the pipeline).
+   **Adversarial gate:** C must not beat B beyond noise on this set. This checks
+   that C wins for the *right reason*.
+5. **50-question human diff spot-check.** A human manually reviews 50 questions'
+   Arm A vs Arm C retrieved contexts and answers, confirming the automated
+   judge's verdicts are not systematically wrong. Catches judge failure modes the
+   automated pipeline cannot self-detect.
+
+---
+
+## 7. Harness plan
+
+**Design only — this drive builds none of the below.** `benchmarks/` does not
+exist yet; this is the planned layout.
+
+### 7.1 Layout sketch
+
+```
+benchmarks/
+  longmemeval/
+    README.md
+    preregister.json      # frozen thresholds + seed + model pins (hash-committed)
+    corpus.py             # load oracle + S, build the 200-Q split (fixed seed)
+    pipeline.py           # shared QA pipeline (arm-agnostic)
+    arms/
+      plain.py            # Arm A  — MemoryStore
+      naive_dedup.py      # Arm B  — MemoryStore
+      aphelion.py         # Arm C  — MemoryStore (uses aphe + content_hash + SM + R4)
+    metrics/
+      m1_qa.py
+      m2_dedup.py
+      m3_contamination.py
+      m4_perf.py
+      m5_roundtrip.py
+    run.py                # orchestrator → results.jsonl + report
+```
+
+### 7.2 Dependency policy
+
+**The shipped core (`src/aphelion/**`) stays zero-dependency, stdlib-only**, per
+the README contract. The benchmark harness **may** carry dependencies (an LLM
+client, ollama/OpenAI SDK, an F1/metrics helper, a reporting library) because
+`benchmarks/` is **not part of the installed `aphelion` package** — it lives
+outside `src/`, so its dependencies never enter `pip install aphelion`. Policy:
+`benchmarks/` declares its own optional group (e.g. `aphelion[bench]`) or a
+separate requirements file; the `src/aphelion/**` import graph must remain
+stdlib-only, guarded by the existing AST-scan precedent in
+`tests/test_external_reader.py`.
+
+### 7.3 How the arms share one QA pipeline
+
+All three arms implement a single `MemoryStore` protocol:
+
+```
+class MemoryStore(Protocol):
+    def ingest(self, sessions: list[Session]) -> None: ...
+    def retrieve(self, question: str) -> list[Claim]: ...
+```
+
+`pipeline.py` is arm-agnostic: **extract → ingest → retrieve → answer → judge.**
+The extractor (session → claims) and the retriever (e.g. BM25 or embedding
+top-k) are **identical** across arms. Only the post-retrieval memory-quality
+layer differs:
+
+- **A** returns the raw candidate set.
+- **B** returns it after exact-string dedup.
+- **C** returns it after content_hash coalescing + R4 resolution + `superseded`/
+  `withdrawn` suppression — a *post-filter over the same candidate set A and B
+  see.*
+
+This guarantees the only independent variable is the memory layer.
+
+**Central validity risk (called out, not hidden).** Arm C can only win M1/M3 if
+the extraction pipeline actually emits the R4 edges — `supersedes`,
+`valid_from`, `polarity` — that mark an update. A shared *linker* pass assigns a
+`supersedes` edge (and `valid_from`) when it detects a new claim updating an
+existing subject; Arms A/B ignore those edges. **The linker's recall bounds Arm
+C's ceiling**: if the linker fails to detect updates, Arm C degenerates to Arm B
+and M1/M3 cannot move — which is precisely the "M1 fail, M2/M3 pass" branch in
+§8 that triggers a retriever/linker-integration rerun before any spec retreat.
+The linker design is a next-drive concern; this document only fixes the contract
+that it is a shared, arm-independent stage.
+
+### 7.4 Reuse of existing repo assets
+
+- **M5** uses `scripts/external_reader.py` — the ~170-LOC stdlib-only independent
+  reader (no `import aphelion`). Packaged claim sets are normalized by both the
+  reference validator and the external reader; the two normalized outputs must be
+  SHA-256 byte-identical (the reader already cross-checks each `samples/*`
+  fixture against its `expected-normalized.json`, exit 0 on agreement).
+- **Metric fixtures** reuse `samples/`: `revise-withdraw-flow` (create→revise→
+  withdraw chain, final state `withdrawn`) for M3 suppression; `contradictory-claim`
+  for R4 `contradiction`; `duplicate-reaffirm-collision` for M2 dedup edges.
+- **Arm C packaging** uses the `aphe` CLI (`init` / `pack` / `unpack` / `verify`).
+
+---
+
+## 8. Kill-gate decision table
+
+Outcomes are read against the pre-registered §4 gates. This is the G2 kill-gate,
+operationalized.
+
+| Outcome | Diagnosis | Action |
+|---|---|---|
+| **All pass** (M1, M2, M3, M5 gates; M4 sane) | The machinery earns its complexity — measurably better memory quality than both the plain floor and the naive-dedup control. | **GA** — publish the result as validation of the claim-semantics stack. |
+| **M5 fail** | Cross-tool determinism hole in canonical serialization — a correctness bug, not a quality tradeoff. Highest priority regardless of other metrics. | **Fix the serialization spec; do NOT publish** until M5 is 100/100. |
+| **M1 fail + M2 & M3 pass** | The mechanism *works* (dedup and contamination-suppression are measurable) but does not convert into QA accuracy — most likely a retriever/linker-integration gap, and M1 is underpowered at N = 78. | **Rerun with retriever/linker integration.** Only after **2 failed rounds** retreat and revise the spec — do not over-react to one underpowered result. |
+| **M2 fail** | content_hash dedup underperforming. | **Recheck the content-hash identity projection / whitelist** (`spec/content-hash.md` §3–§4): is it dropping or keeping the wrong fields? |
+| **M3 fail** | `superseded`/`withdrawn` suppression not reducing contamination. | **Demote the event state machine** — question whether `supersede`/`withdraw` belong in the retrieval-surfacing path at all. |
+| **All fail** | The machinery is not validated. | **Do not publish.** Escalate to spec revision per G2 (`benchmark shows no gain → spec 回修`). |
+
+**Honoring G2.** A negative result is a *success of the process*, not a failure:
+it fires the kill-gate the roadmap promised and routes the format back to `spec
+回修` instead of shipping more unvalidated machinery. The two-round rule on the
+M1 branch exists so that a single underpowered N = 78 result cannot trigger a
+premature spec retreat.
+
+---
+
+## Appendix — spec grounding index
+
+Every claim in this design is anchored in a repo artifact:
+
+- `spec/content-hash.md` — RFC 8785 (JCS) + SHA-256 identity projection (M2, Arm C dedup).
+- `spec/lifecycle-state-machine.md` — event SM, canonical event order, read-only `superseded`/`withdrawn` (M1/M3, Arm C SM).
+- `spec/v0.3-claim-semantics.md` — R1–R4 fields + `conflict_class` reader-side derivation (M1/M3, Arm C R4).
+- `spec/canonical-serialization.md` — byte-identity contract (M5).
+- `spec/v0.5-signer-trust.md`, `spec/v0.6-notary-attestation.md` — excluded layers (§2.4 rationale).
+- `scripts/external_reader.py` — independent stdlib reader (M5 mechanism).
+- `samples/{revise-withdraw-flow,contradictory-claim,duplicate-reaffirm-collision}` — metric fixtures.
+- `README.md` — `aphelion 0.6.0`, spec 0.4.0, schema 2.0, zero-dep core, `aphe` CLI.
