@@ -189,8 +189,14 @@ Alternative (balanced) split: 78 + 78 = 156; recorded but not recommended
 **N = 78**. A +3pp difference is ≈ 2.3 questions; a Wilson 95% CI near 50%
 accuracy at N = 78 is roughly ±11pp. **M1 is underpowered** and must be reported
 with a bootstrapped confidence interval and read as *directional*. The
-statistical weight of the benchmark rests on **M2** (a mechanical F1 with high
-power) and **M3** (contamination, measurable across all 200), not on M1 alone.
+statistical weight of the benchmark rests on **M2**, whose labeled duplicate set
+(drawn from exact restatements across *both* subsets) is the only metric whose
+power is *not* bounded by the 78-question knowledge-update pool. **M3 shares
+M1's N = 78 knowledge-update denominator** — old→new value labels exist only for
+knowledge-update questions — so M3 carries the same CI caveat; it is nonetheless
+more reliable than M1 at that N because it is a mechanical check on the retrieved
+set (does the stale value appear) rather than a judge-scored accuracy. Report
+bootstrapped CIs on both M1 and M3.
 This is a real limitation of the available data, surfaced here rather than
 papered over — and it is the reason the §8 decision table gives M1 a two-round
 rule instead of acting on a single underpowered result.
@@ -215,8 +221,8 @@ them.** Once pinned they may not be moved after any result is seen (§6.3).
 | # | Metric | Gate (pre-registered) | Rationale |
 |---|---|---|---|
 | **M1** | QA accuracy on knowledge-update | **C − B ≥ +3 pp** | The honest test is C beating the *naive-dedup* control, not plain A. +3pp is the v0.2 minimum improvement deemed worth the state-machine complexity. **Caveat:** N = 78 → ≈ 2.3 questions; report a bootstrapped CI and treat as directional (§3.3). Report C − A as secondary context. |
-| **M2** | Dedup F1 (exact-duplicate detection) | **C.F1 > A.F1 + 0.10** | content_hash dedup should mechanically beat no-dedup by a wide, unambiguous margin. Failure to clear +0.10 implies the identity projection or canonicalization is miscalibrated. Highest-power metric. |
-| **M3** | Stale-info contamination rate | **C ≤ 0.5 × A** | `superseded`/`withdrawn` suppression should at least halve the rate at which a stale (superseded) value appears in the retrieved context, vs plain storage. Contamination = fraction of knowledge-update answers whose retrieved context contains the *old* value. |
+| **M2** | Dedup F1 (exact-duplicate detection) | **(C.F1 > A.F1 + 0.10) AND (C.F1 ≥ B.F1 − ε), ε = 0.02 (DRAFT)** | Two arms. C must beat no-dedup by a wide margin (`A + 0.10`) **and must not regress below the naive-dedup control B** (`B − ε`). Without the second arm the gate is a false-positive trap: `A=0.00, B=0.90, C=0.11` would "pass" on `A + 0.10` alone while C is catastrophically worse than the honest control, validating broken machinery. content_hash is a superset of exact-string match, so C ≥ B is structurally expected; ε = 0.02 tolerates measurement noise on a tie. A genuine `C < B − ε` means the projection is over- or under-merging (see §8). Highest-power metric. |
+| **M3** | Stale-info contamination rate (denominator N = 78 KU) | **C ≤ 0.5 × A** | `superseded`/`withdrawn` suppression should at least halve the rate at which a stale (superseded) value appears in the retrieved context, vs plain storage. Contamination = fraction of the **78 knowledge-update** answers whose retrieved context contains the *old* value — old→new value labels exist only for that subset, so N = 78 (same CI caveat as M1; §3.3). Multi-session questions are **not** a current M3 substrate (no stale-value labels); extending M3 to them is labeled future work requiring stale-value annotation, not current measurability. |
 | **M4** | Storage / latency | **sanity-only — no gate** (soft tripwire at 10× Arm A) | Aphelion trades storage/compute for correctness; this benchmark judges correctness, so M4 is context, not a gate. Report p50/p95 query latency and on-disk bytes/claim; flag only pathological >10× A regressions. |
 | **M5** | Cross-tool round-trip byte-equality | **100 / 100 SHA-256 byte-identical** | The `spec/canonical-serialization.md` contract is absolute: any single mismatch is a spec hole, not a quality tradeoff. **Precondition:** the existing `scripts/external_reader.py` reproduces only the validator verdict, *not* canonical bytes — M5 requires work item `W-M5` (a full canonical independent reader) or an explicit re-scope before it can run; see §7.4. |
 | **AG** | Adversarial-set advantage (bias guard §6, item 4) | **diagnostic tripwire (non-gating): C − B ≤ +3 pp on the 20 adversarial questions** | New draft rule (v0.2 named the adversarial set but pinned no number). On questions where aphelion's machinery structurally cannot help, C must not gain more than the very margin M1 requires it to gain on the real set; a larger adversarial gain signals arm-identity leakage or spurious signal. Non-gating because N = 20 (+3pp ≈ 0.6 questions cannot support a hard pass/fail); a breach **mandates** a leakage investigation before M1/M3 are trusted. Pinned here so the rule is fixed before any run. |
@@ -411,7 +417,7 @@ operationalized.
 | **All pass** (M1, M2, M3, M5 gates; M4 sane) | The machinery earns its complexity — measurably better memory quality than both the plain floor and the naive-dedup control. | **GA** — publish the result as validation of the claim-semantics stack. |
 | **M5 fail** | Cross-tool determinism hole in canonical serialization — a correctness bug, not a quality tradeoff. Highest priority regardless of other metrics. | **Fix the serialization spec; do NOT publish** until M5 is 100/100. |
 | **M1 fail + M2 & M3 pass** | The mechanism *works* (dedup and contamination-suppression are measurable) but does not convert into QA accuracy — most likely a retriever/linker-integration gap, and M1 is underpowered at N = 78. | **Rerun with retriever/linker integration.** Only after **2 failed rounds** retreat and revise the spec — do not over-react to one underpowered result. |
-| **M2 fail** | content_hash dedup underperforming. | **Recheck the content-hash identity projection / whitelist** (`spec/content-hash.md` §3–§4): is it dropping or keeping the wrong fields? |
+| **M2 fail** | Either arm fails: C does not clear `A + 0.10` (dedup not working at all), or C regresses below `B − ε` (the naive control beats the machinery → projection over/under-merging). | **Recheck the content-hash identity projection / whitelist** (`spec/content-hash.md` §3–§4): is it dropping or keeping the wrong fields? A `C < B − ε` failure specifically points at over-merging (projection too coarse) or under-merging (too fine). |
 | **M3 fail** | `superseded`/`withdrawn` suppression not reducing contamination. | **Demote the event state machine** — question whether `supersede`/`withdraw` belong in the retrieval-surfacing path at all. |
 | **All fail** | The machinery is not validated. | **Do not publish.** Escalate to spec revision per G2 (`benchmark shows no gain → spec 回修`). |
 
