@@ -1,16 +1,20 @@
 # LongMemEval 3-Arm Benchmark — Design
 
-> **DRAFT — pre-registered thresholds 待 Chris 釘；執行在下一個 drive，門檻釘死前不得跑**
+> **PINNED 2026-07-19 — pre-registered thresholds frozen by the maintainer. The
+> §4 metric gates and the §5.2 model/seed pins are now binding; no pinned value
+> may move after any arm is run. Execution runs in the next drive under exactly
+> these gates.**
 >
 > This document is a *design*, not a result. It defines the arms, corpus,
 > metrics, and pre-registered decision gates. No arm has been run. The
-> thresholds in §4 are drafts inherited from the roadmap's v0.2-era design;
-> they become binding only once pinned by the maintainer. Do not execute any
-> arm until the thresholds are frozen — running first and choosing thresholds
-> afterward defeats the entire pre-registration guard.
+> thresholds in §4 were pinned by the maintainer on 2026-07-19 (previously
+> drafts inherited from the roadmap's v0.2-era design) and are now frozen and
+> binding. They may not be moved after any result is seen — running first and
+> choosing thresholds afterward defeats the entire pre-registration guard.
 
-**Status:** Draft (design-only)
+**Status:** Pinned (design-only) — thresholds frozen 2026-07-19
 **Date:** 2026-07-17
+**Pinned:** 2026-07-19
 **Targets:** aphelion 0.6.0 · wire spec 0.4.0 · schema 2.0
 **Scope of this drive:** design only — no harness code, no benchmark execution.
 
@@ -81,9 +85,18 @@ Arm C exercises exactly the memory-quality machinery under test:
 
 | Mechanism | Spec | What it does in the arm |
 |---|---|---|
-| **content_hash dedup** | `spec/content-hash.md` | RFC 8785 (JCS) canonicalization of the identity projection → SHA-256; claims with an equal 64-hex `content_hash` coalesce (`duplicate` merge-verdict). |
+| **content_hash dedup** | `spec/content-hash.md` | RFC 8785 (JCS) canonicalization of the identity projection → SHA-256. Two claims coalesce (`duplicate` merge-verdict) **only** when they share the same `claim_id` (same lineage) **and** their 64-hex `content_hash` is byte-equal — **never** by textual proximity, embedding similarity, or any fuzzy/near-duplicate heuristic. (Same `claim_id` with a differing `content_hash` is a hash-collision error, not a coalesce; see `spec/lifecycle-state-machine.md` §5.1.) |
 | **Event state machine** | `spec/lifecycle-state-machine.md` | `create / revise / reaffirm / withdraw / supersede`; canonical event order `(occurred_at_ms, event_id_lex)`; `superseded` and `withdrawn` claims become read-only and are suppressed from retrieval surfacing. |
 | **R4 conflict classification** | `spec/v0.3-claim-semantics.md` | Reader-side: subject-group the active set, apply R2 valid-time filtering, resolve the `supersedes` graph, emit `conflict_class ∈ {none, scope_mismatch, supersession, contradiction, ambiguity}`. The verdict governs surfacing: `none`/`supersession` yield a single `primary`; `ambiguity` yields a `primary` (the definite claim) plus the others; **`contradiction` yields NO `primary` — every conflicting claim is surfaced** (`src/aphelion/read_adapter.py` `_residual_default_policy`; `tests/test_read_adapter.py::test_polarity_divergence_returns_contradiction`). Surfacing removes only truly `superseded`/`withdrawn` claims. |
+
+**Coalescing rule (pre-registered 2026-07-19, normative for Arm C).** Arm C MUST
+coalesce two claims **iff both** conditions hold: (1) identical `claim_id` (same
+lineage) **and** (2) byte-equal 64-hex `content_hash`. Coalescing by textual
+proximity, cosine/embedding similarity, or any near-duplicate heuristic is
+forbidden — content-hash identity is lineage-scoped, not a similarity match. The
+Arm C **implementation** (next drive) MUST enforce both conditions and ship a
+regression test proving a same-`content_hash` / different-`claim_id` pair does NOT
+coalesce and that no proximity-only pair coalesces.
 
 At query time Arm C returns, for each retrieved candidate set, the R4-resolved
 result: `superseded`/`withdrawn` claims are removed, and the surviving active set
@@ -213,19 +226,19 @@ rule instead of acting on a single underpowered result.
 
 ## 4. Metrics & pre-registered thresholds
 
-Every threshold below is a **draft** carried from the v0.2-era design. Numbers
-are unchanged from v0.2 unless a justification is stated; annotations add context
-without moving the number. **These become binding only when the maintainer pins
-them.** Once pinned they may not be moved after any result is seen (§6.3).
+Every threshold below is **PINNED 2026-07-19** by the maintainer, carried from the
+v0.2-era design. Numbers are unchanged from v0.2 unless a justification is stated;
+annotations add context without moving the number. **They are now binding and
+frozen.** They may not be moved after any result is seen (§6.3).
 
 | # | Metric | Gate (pre-registered) | Rationale |
 |---|---|---|---|
 | **M1** | QA accuracy on knowledge-update | **C − B ≥ +3 pp** | The honest test is C beating the *naive-dedup* control, not plain A. +3pp is the v0.2 minimum improvement deemed worth the state-machine complexity. **Caveat:** N = 78 → ≈ 2.3 questions; report a bootstrapped CI and treat as directional (§3.3). Report C − A as secondary context. |
-| **M2** | Dedup F1 (exact-duplicate detection) | **(C.F1 > A.F1 + 0.10) AND (C.F1 ≥ B.F1 − ε), ε = 0.02 (DRAFT)** | Two arms. C must beat no-dedup by a wide margin (`A + 0.10`) **and must not regress below the naive-dedup control B** (`B − ε`). Without the second arm the gate is a false-positive trap: `A=0.00, B=0.90, C=0.11` would "pass" on `A + 0.10` alone while C is catastrophically worse than the honest control, validating broken machinery. content_hash is a superset of exact-string match, so C ≥ B is structurally expected; ε = 0.02 tolerates measurement noise on a tie. A genuine `C < B − ε` means the projection is over- or under-merging (see §8). Highest-power metric. |
+| **M2** | Dedup F1 (exact-duplicate detection) | **(C.F1 > A.F1 + 0.10) AND (C.F1 ≥ B.F1 − ε), ε = 0.02 (pinned 2026-07-19)** | Two arms. C must beat no-dedup by a wide margin (`A + 0.10`) **and must not regress below the naive-dedup control B** (`B − ε`). Without the second arm the gate is a false-positive trap: `A=0.00, B=0.90, C=0.11` would "pass" on `A + 0.10` alone while C is catastrophically worse than the honest control, validating broken machinery. content_hash is a superset of exact-string match, so C ≥ B is structurally expected; ε = 0.02 tolerates measurement noise on a tie. A genuine `C < B − ε` means the projection is over- or under-merging (see §8). Highest-power metric. **Annotation (pre-registered 2026-07-19, threshold unchanged — interpretation guidance only):** the `content_hash`-superset expectation above holds only *within a lineage*. Under the §2.3 lineage-gated coalescing rule (same `claim_id` **and** byte-equal `content_hash`), cross-lineage byte-identical duplicates that Arm B collapses will **not** coalesce in Arm C, so a `C.F1 < B.F1 − ε` deficit is no longer *automatically* a projection over/under-merge bug. The §8 M2-fail diagnosis MUST therefore first check whether the deficit is entirely attributable to such cross-lineage exact duplicates (a linker lineage-fragmentation artifact) before concluding the identity projection is at fault. |
 | **M3** | Stale-info contamination rate (denominator N = 78 KU) | **C ≤ 0.5 × A** | `superseded`/`withdrawn` suppression should at least halve the rate at which a stale (superseded) value appears in the retrieved context, vs plain storage. Contamination = fraction of the **78 knowledge-update** answers whose retrieved context contains the *old* value — old→new value labels exist only for that subset, so N = 78 (same CI caveat as M1; §3.3). Multi-session questions are **not** a current M3 substrate (no stale-value labels); extending M3 to them is labeled future work requiring stale-value annotation, not current measurability. |
 | **M4** | Storage / latency | **sanity-only — no gate** (soft tripwire at 10× Arm A) | Aphelion trades storage/compute for correctness; this benchmark judges correctness, so M4 is context, not a gate. Report p50/p95 query latency and on-disk bytes/claim; flag only pathological >10× A regressions. |
 | **M5** | Cross-tool round-trip byte-equality | **100 / 100 SHA-256 byte-identical** | The `spec/canonical-serialization.md` contract is absolute: any single mismatch is a spec hole, not a quality tradeoff. **Precondition:** the existing `scripts/external_reader.py` reproduces only the validator verdict, *not* canonical bytes — M5 requires work item `W-M5` (a full canonical independent reader) or an explicit re-scope before it can run; see §7.4. |
-| **AG** | Adversarial-set advantage (bias guard §6, item 4) | **diagnostic tripwire (non-gating): C − B ≤ +3 pp on the 20 adversarial questions** | New draft rule (v0.2 named the adversarial set but pinned no number). On questions where aphelion's machinery structurally cannot help, C must not gain more than the very margin M1 requires it to gain on the real set; a larger adversarial gain signals arm-identity leakage or spurious signal. Non-gating because N = 20 (+3pp ≈ 0.6 questions cannot support a hard pass/fail); a breach **mandates** a leakage investigation before M1/M3 are trusted. Pinned here so the rule is fixed before any run. |
+| **AG** | Adversarial-set advantage (bias guard §6, item 4) | **diagnostic tripwire (non-gating): C − B ≤ +3 pp on the 20 adversarial questions** | New rule, pinned 2026-07-19 (v0.2 named the adversarial set but pinned no number). On questions where aphelion's machinery structurally cannot help, C must not gain more than the very margin M1 requires it to gain on the real set; a larger adversarial gain signals arm-identity leakage or spurious signal. Non-gating because N = 20 (+3pp ≈ 0.6 questions cannot support a hard pass/fail); a breach **mandates** a leakage investigation before M1/M3 are trusted. Pinned here so the rule is fixed before any run. |
 
 **Also pre-registered (see §5, §6):** fixed random seed, answering-model
 temperature = 0, pinned answering + judge model identifiers. The commit that
@@ -249,7 +262,7 @@ Two model roles, both pinned:
 | Local GB10 ollama `gpt-oss:120b` (`192.168.1.134:11434`) | Zero token cost; on-prem; fully reproducible; same model can serve all three arms → arm differences attributable to memory quality, not model variance. | Below-frontier capability; ollama has minor batch nondeterminism even at temp 0; weaker as a judge. |
 | Pinned frontier API snapshot (dated Claude or GPT) | Higher capability; stronger judge fidelity; snapshot pin gives reproducibility. | Per-token cost; reproducibility depends on the vendor not deprecating the snapshot. |
 
-### 5.2 Recommendation (final pins OPEN for Chris)
+### 5.2 Recommendation (pinned 2026-07-19)
 
 **Split the roles:**
 
@@ -264,12 +277,19 @@ Whatever is chosen, the **same answering model and the same retriever must serve
 A, B, and C** — the only variable is the memory layer. That is the core
 internal-validity guard.
 
-**OPEN pins (Chris to freeze before any run):**
+**Pinned models, retriever & knobs (frozen 2026-07-19):**
 
-- Answering-model exact tag (draft: `gpt-oss:120b` @ GB10 ollama).
-- Judge-model exact snapshot id (draft: a dated frontier snapshot such as
-  `claude-opus-4-8` or an equivalent pinned GPT snapshot — **exact id OPEN**).
-- Seed (draft: `20260717`).
+- **Answering model** = `gpt-oss:120b` @ GB10 ollama (`192.168.1.134:11434`).
+- **Extractor model** = `gpt-oss:120b` @ GB10 ollama (`192.168.1.134:11434`) — the
+  same model as answering.
+- **Judge model** = `claude-opus-4-8` via `claude -p` (subscription); fallback
+  `gemini-2.5-pro`.
+- **Retriever** = shared deterministic BM25 (stdlib), identical across arms.
+- **Seed** = `20260717`.
+- **Answering temperature** = 0.
+- **Fairness constraint** — the answering model, extractor model, and retriever
+  MUST be identical across arms A/B/C; the memory layer is the only independent
+  variable.
 
 ---
 
@@ -400,6 +420,11 @@ that it is a shared, arm-independent stage.
     unpack → re-pack byte-identity, already exercised by the repo's differential
     tests) plus external-reader verdict agreement — and mark M5 as *not yet* a
     true two-implementation cross-check until (a) lands.
+  - **Decision (maintainer, 2026-07-19):** option **(a)** is pinned — `W-M5` (the
+    full canonical independent reader) is scheduled for the **execution drive**.
+    The M5 gate is the true two-implementation byte-equality check and therefore
+    **cannot run before `W-M5` lands**; until then M5 is blocked, not waived and
+    not silently downgraded to (b).
 - **Metric fixtures** reuse `samples/`: `revise-withdraw-flow` (create→revise→
   withdraw chain, final state `withdrawn`) for M3 suppression; `contradictory-claim`
   for R4 `contradiction`; `duplicate-reaffirm-collision` for M2 dedup edges.
