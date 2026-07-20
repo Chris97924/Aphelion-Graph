@@ -131,11 +131,9 @@ def test_index_by_type_sorted_and_unique() -> None:
 @pytest.mark.unit
 def test_sampling_algorithm_records_the_pinned_rule() -> None:
     text = corpus.SAMPLING_ALGORITHM
-    assert "sort question_ids lexicographically" in text
+    assert "question_ids sorted lexicographically per pool" in text
     assert "random.Random(20260717).sample" in text
     assert "KU pool taken in full (no sampling)" in text
-    assert "sample 122 of 133" in text
-    assert "sample 20 from the union" in text
 
 
 @pytest.mark.unit
@@ -191,6 +189,28 @@ def test_build_manifest_is_byte_identical_across_runs(tmp_path: Path) -> None:
     out_a = corpus.write_manifest(corpus.build_manifest(tmp_path), tmp_path / "a.json")
     out_b = corpus.write_manifest(corpus.build_manifest(tmp_path), tmp_path / "b.json")
     assert out_a.read_bytes() == out_b.read_bytes()
+
+
+_PREREGISTER_PATH = Path(corpus.__file__).resolve().parent / "preregister.json"
+
+
+def _load_preregister_sampling_algorithm() -> str:
+    with _PREREGISTER_PATH.open(encoding="utf-8") as handle:
+        return json.load(handle)["sampling_algorithm"]
+
+
+def test_sampling_algorithm_matches_preregister_byte_identical(tmp_path: Path) -> None:
+    """The manifest's ``sampling_algorithm`` must never drift from the pinned
+    ``preregister.json`` wording -- preregister.json is the anchor, so this
+    compares both the raw constant and the built manifest field against it for
+    exact string equality.
+    """
+    preregistered = _load_preregister_sampling_algorithm()
+    assert corpus.SAMPLING_ALGORITHM == preregistered
+
+    _write_synthetic_corpus(tmp_path)
+    manifest = corpus.build_manifest(tmp_path)
+    assert manifest["sampling_algorithm"] == preregistered
 
 
 def test_verify_ground_truth_rejects_wrong_counts(tmp_path: Path) -> None:

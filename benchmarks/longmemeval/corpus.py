@@ -55,11 +55,18 @@ MS_TYPE = "multi-session"
 ADVERSARIAL_TYPES = ("single-session-preference", "single-session-user")
 
 # Recorded verbatim in the manifest so the frozen split documents its own rule.
+# MUST stay byte-identical to preregister.json's ``sampling_algorithm`` --
+# enforced by tests/test_benchmarks_corpus.py -- since preregister.json is the
+# pinned anchor and this constant is required to mirror it exactly, not
+# paraphrase it.
+#
+# In concrete terms this rule means: multi_session samples 122 of the 133
+# multi-session question_ids, and adversarial samples 20 from the union pool of
+# single-session-preference + single-session-user question_ids (both via the
+# lexicographic-sort + random.Random(20260717).sample procedure named below).
 SAMPLING_ALGORITHM = (
-    "per pool, sort question_ids lexicographically, then "
-    "random.Random(20260717).sample. KU pool taken in full (no sampling). "
-    "multi_session: sample 122 of 133. adversarial: sample 20 from the union "
-    "pool of single-session-preference + single-session-user question_ids."
+    "question_ids sorted lexicographically per pool, then "
+    "random.Random(20260717).sample; KU pool taken in full (no sampling)"
 )
 
 MANIFEST_PATH = Path(__file__).resolve().parent / "split_manifest.json"
