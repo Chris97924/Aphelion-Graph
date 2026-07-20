@@ -119,7 +119,12 @@ def test_preregister_carries_exactly_the_pinned_values() -> None:
 
 
 def test_design_doc_sha256_matches_recorded() -> None:
-    """Recompute the design-doc SHA-256 and assert it matches the recorded value."""
+    """Recompute the design-doc SHA-256 and assert it matches the recorded value.
+
+    The doc is hashed after normalizing CRLF -> LF so the pin is checkout-line-ending
+    independent: a Windows CRLF working tree and a Linux/CI LF checkout of the same
+    committed content must hash identically.
+    """
     recorded_hash = _load_preregister()["design_doc_sha256"]
 
     assert isinstance(recorded_hash, str) and len(recorded_hash) == 64, (
@@ -127,7 +132,8 @@ def test_design_doc_sha256_matches_recorded() -> None:
     )
     assert recorded_hash == recorded_hash.lower(), "design_doc_sha256 must be lowercase hex"
 
-    computed = hashlib.sha256(DESIGN_DOC.read_bytes()).hexdigest()
+    normalized = DESIGN_DOC.read_bytes().replace(b"\r\n", b"\n")
+    computed = hashlib.sha256(normalized).hexdigest()
     assert computed == recorded_hash, (
         "design doc SHA-256 mismatch -- was the doc edited after pinning?\n"
         f"  recorded = {recorded_hash}\n"
