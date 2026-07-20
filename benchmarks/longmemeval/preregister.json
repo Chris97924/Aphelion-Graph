@@ -1,0 +1,52 @@
+{
+  "benchmark": "longmemeval-3arm",
+  "status": "pinned",
+  "pinned_date": "2026-07-19",
+  "design_doc": "docs/benchmark/longmemeval-3arm-design.md",
+  "design_doc_sha256": "755dfaf02a57a164940040ff130cd7edfec6222b80db71186d00ef4896c17fac",
+  "split": {
+    "knowledge_update": 78,
+    "knowledge_update_basis": "all",
+    "multi_session": 122,
+    "multi_session_basis": "seeded sample",
+    "adversarial": 20,
+    "adversarial_basis": "seeded sample"
+  },
+  "sampling_algorithm": "question_ids sorted lexicographically per pool, then random.Random(20260717).sample; KU pool taken in full (no sampling)",
+  "metrics": {
+    "M1": {
+      "gate": "C-B >= +3pp on knowledge-update",
+      "N": 78,
+      "reporting": "directional, bootstrapped CI, C-A secondary"
+    },
+    "M2": {
+      "gate": "C.F1 > A.F1 + 0.10 AND C.F1 >= B.F1 - epsilon",
+      "epsilon": 0.02
+    },
+    "M3": {
+      "gate": "C <= 0.5 * A",
+      "N": 78,
+      "denominator": "knowledge-update"
+    },
+    "M4": {
+      "gate": "none (sanity-only)",
+      "tripwire": "10x Arm A"
+    },
+    "M5": {
+      "gate": "100/100 byte-identical canonical form",
+      "method": "option (a) W-M5 full canonical independent reader, true two-implementation byte-equality"
+    },
+    "AG": {
+      "gate": "C-B <= +3pp on adversarial set",
+      "N": 20,
+      "gating": "non-gating diagnostic tripwire"
+    }
+  },
+  "answering_model": "gpt-oss:120b @ GB10 ollama 192.168.1.134:11434",
+  "extractor_model": "gpt-oss:120b @ GB10 ollama 192.168.1.134:11434",
+  "model_fairness_constraint": "answering model, extractor model, and retriever MUST be identical across arms A/B/C; the memory layer is the only independent variable",
+  "judge_model": "claude-opus-4-8 via claude -p (subscription), fallback gemini-2.5-pro",
+  "retriever": "shared deterministic BM25 (stdlib), identical across arms",
+  "temperature": 0,
+  "seed": 20260717
+}
