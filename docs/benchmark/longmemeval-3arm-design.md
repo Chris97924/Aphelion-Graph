@@ -15,6 +15,7 @@
 **Status:** Pinned (design-only) — thresholds frozen 2026-07-19
 **Date:** 2026-07-17
 **Pinned:** 2026-07-19
+**Amended:** 2026-07-22 — §2.3 Arm C coalescing-rule *rationale* strengthened (codex r3 residual P2, PR #16): the conflict-preservation / R4-projection reasoning is now spelled out. The normative rule is unchanged, no §4 threshold moved, and no arm has run — a protocol-legal pre-registration amendment (§6.3).
 **Targets:** aphelion 0.6.0 · wire spec 0.4.0 · schema 2.0
 **Scope of this drive:** design only — no harness code, no benchmark execution.
 
@@ -97,6 +98,26 @@ forbidden — content-hash identity is lineage-scoped, not a similarity match. T
 Arm C **implementation** (next drive) MUST enforce both conditions and ship a
 regression test proving a same-`content_hash` / different-`claim_id` pair does NOT
 coalesce and that no proximity-only pair coalesces.
+
+**Amendment 2026-07-22 (codex r3 residual P2, PR #16) — why the `claim_id` gate is
+load-bearing.** The rule above was already lineage-gated at the 2026-07-19 pin; this
+amendment records the conflict-preservation reason codex r3 flagged as under-stated,
+and formally logs its closure. The `content_hash` identity projection
+(`spec/content-hash.md` §3–§4) deliberately **excludes** the R4 conflict fields —
+`supersedes`, `valid_from`, `polarity`, `conflict_class` — as well as `claim_id`
+itself; identity is projected over `subject`, `predicate`, `object`, `state`, and the
+other content fields only. Two claims can therefore be byte-equal in `content_hash`
+yet differ in R4 — e.g. opposite `polarity`, a live **contradiction**. Coalescing on
+`content_hash` alone (dropping the `claim_id` gate) would merge such a
+different-`claim_id` / same-`content_hash` pair **before** R4 runs and silently erase
+the conflict — but that pair is *not* a duplicate; it is exactly the input the §2.3
+R4 row must classify. A pre-R4 collapse both **inflates M2** (a false duplicate scored
+as a real merge) and **poisons M3** (the erased contradiction never surfaces, so
+stale/conflicting context escapes the contamination count). Gating coalescing on
+`claim_id` keeps it lineage-scoped so cross-lineage `content_hash` collisions reach R4
+intact. This strengthens rationale only: the normative rule text is unchanged, no §4
+numeric gate moves, and no arm has run — a protocol-legal pre-registration amendment
+(§6.3).
 
 At query time Arm C returns, for each retrieved candidate set, the R4-resolved
 result: `superseded`/`withdrawn` claims are removed, and the surviving active set
