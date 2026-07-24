@@ -3,7 +3,7 @@
   "status": "pinned",
   "pinned_date": "2026-07-19",
   "design_doc": "docs/benchmark/longmemeval-3arm-design.md",
-  "design_doc_sha256": "73bcf5ffda0d95894ce65f4fb587de960e64c9c455c84f9e220e6e2a5b77ef8c",
+  "design_doc_sha256": "57535c02147b2448820fb6fca748f98905303d65c176ce944a618d79249bacdc",
   "split": {
     "knowledge_update": 78,
     "knowledge_update_basis": "all",

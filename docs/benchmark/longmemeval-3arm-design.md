@@ -16,7 +16,7 @@
 **Date:** 2026-07-17
 **Pinned:** 2026-07-19
 **Amended:** 2026-07-22 — §2.3 Arm C coalescing-rule *rationale* strengthened (codex r3 residual P2, PR #16): the conflict-preservation / R4-projection reasoning is now spelled out. The normative rule is unchanged, no §4 threshold moved, and no arm has run — a protocol-legal pre-registration amendment (§6.3).
-**Amended:** 2026-07-24 — §2.3 amendment's R4-exclusion enumeration completed with `valid_until` (PR #18 residual P2): it is the fourth §6.5 R4-trigger field (`polarity`/`valid_from`/`valid_until`/`supersedes`) and is excluded from the `content_hash` identity projection like the others. Rationale-only — the normative rule is unchanged, no §4 threshold moved, and no arm has run — a protocol-legal pre-registration amendment (§6.3).
+**Amended:** 2026-07-24 — §2.3 amendment's R4-exclusion enumeration completed with `valid_until` (PR #18 residual P2): it is the fourth-and-final `spec/v0.3-claim-semantics.md` §6.5 R4-trigger field (`polarity`/`valid_from`/`valid_until`/`supersedes`) and is excluded from the `content_hash` identity projection like the others. Rationale-only — the normative rule is unchanged, no §4 threshold moved, and no arm has run — a protocol-legal pre-registration amendment (§6.3).
 **Targets:** aphelion 0.6.0 · wire spec 0.4.0 · schema 2.0
 **Scope of this drive:** design only — no harness code, no benchmark execution.
 
