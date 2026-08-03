@@ -31,6 +31,11 @@ class PlainStore:
         self._claims: list[Claim] = []
 
     @property
+    def retriever(self) -> Retriever:
+        """The ranking engine this store retrieves with — the run records it."""
+        return self._retriever
+
+    @property
     def claims(self) -> list[Claim]:
         """The stored claims, in insertion order (read-only copy)."""
         return list(self._claims)

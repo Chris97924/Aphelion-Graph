@@ -588,14 +588,21 @@ def _build_store(
 class QuestionRun:
     """One question's 3-arm answers, plus the M2 inputs it contributed.
 
-    ``rows`` and ``predictions`` are keyed by arm. No verdict is attached yet:
-    scoring is a single later pass over every arm's answers at once.
+    ``rows``, ``predictions`` and ``retriever_params`` are keyed by arm. No
+    verdict is attached yet: scoring is a single later pass over every arm's
+    answers at once.
+
+    ``retriever_params`` is carried through rather than re-read from the shared
+    retriever so the pooled result keeps the record ``run_arm`` verified against
+    each store's own retriever — which is what the cross-arm check in
+    :func:`~benchmarks.longmemeval.pipeline.score_blind` then compares.
     """
 
     rows: dict[str, dict]
     predictions: dict[str, str]
     duplicate_groups: list[list[str]]
     clusters: dict[str, list[list[str]]]
+    retriever_params: dict[str, dict]
 
 
 def run_three_arm_question(record: dict, retriever: Retriever) -> QuestionRun:
@@ -612,6 +619,7 @@ def run_three_arm_question(record: dict, retriever: Retriever) -> QuestionRun:
     rows: dict[str, dict] = {}
     predictions: dict[str, str] = {}
     clusters: dict[str, list[list[str]]] = {}
+    retriever_params: dict[str, dict] = {}
     for arm in ARM_STORES:
         store = _build_store(arm, retriever, build_extractor(config))
         result = run_arm(
@@ -624,6 +632,7 @@ def run_three_arm_question(record: dict, retriever: Retriever) -> QuestionRun:
         )
         clusters[arm] = store.clusters
         predictions[arm] = result.predictions[0]
+        retriever_params[arm] = result.retriever_params
         rows[arm] = {
             "kind": "arm_question",
             "question_id": record["question_id"],
@@ -638,6 +647,7 @@ def run_three_arm_question(record: dict, retriever: Retriever) -> QuestionRun:
         predictions=predictions,
         duplicate_groups=linker.duplicate_groups(),
         clusters=clusters,
+        retriever_params=retriever_params,
     )
 
 
@@ -695,11 +705,14 @@ def run_3arm_smoke(
         group for run in runs for group in run.duplicate_groups
     ]
 
+    # Every question ran that arm against the same shared retriever, and run_arm
+    # checked each store against it, so any question's record is the arm's record.
     scored = score_blind(
         {
             arm: ArmResult(
                 predictions=[run.predictions[arm] for run in runs],
                 pins=config.pins_record(),
+                retriever_params=runs[0].retriever_params[arm],
             )
             for arm in ARM_STORES
         },

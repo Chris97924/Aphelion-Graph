@@ -415,6 +415,60 @@ def test_confidence_without_a_subject_is_not_an_r4_trigger() -> None:
     assert [claim.id for claim in store.retrieve("5K personal best")] == ["L1"]
 
 
+@pytest.mark.parametrize("field,value", R4_TRIGGER_VALUES)
+@pytest.mark.parametrize("state", sorted(SUPPRESSED_STATES))
+def test_r4_metadata_without_a_subject_raises_in_a_suppressed_state_too(
+    state: str, field: str, value: object
+) -> None:
+    """A malformed record is malformed whatever its lifecycle state.
+
+    Suppression is a *retrieval* policy over well-formed claims; PX_E_4144 is a
+    *schema* verdict on the extraction. Filtering first would let a
+    ``superseded`` / ``withdrawn`` record carrying R4 metadata with no subject
+    leave the store silently — the extractor bug that produced it would never
+    surface, and the same bug on an active claim is what corrupts M1 and M3.
+    :class:`aphelion.read_adapter.AphelionReadAdapter` orders it the same way:
+    its step-0 subject check runs over every candidate before the active filter.
+    """
+    store = _store()
+    store.add_claims([_subjectless("L1", state=state, **{field: value})])
+
+    with pytest.raises(SchemaError) as excinfo:
+        store.retrieve("5K personal best")
+
+    assert excinfo.value.code is ErrorCode.CLAIM_SUBJECT_REQUIRED_FOR_CONFLICT
+    assert excinfo.value.code.value == "PX_E_4144"
+    assert field in str(excinfo.value)
+
+
+@pytest.mark.parametrize("state", sorted(SUPPRESSED_STATES))
+def test_a_malformed_suppressed_claim_is_not_masked_by_a_healthy_one(
+    state: str,
+) -> None:
+    """A retrieval that would otherwise succeed must still fail on the bad record."""
+    store = _store()
+    store.add_claims(
+        [
+            _claim("L-good", record_id="good"),
+            _subjectless("L-bad", state=state, polarity="negate"),
+        ]
+    )
+
+    with pytest.raises(SchemaError) as excinfo:
+        store.retrieve("5K personal best")
+    assert excinfo.value.code is ErrorCode.CLAIM_SUBJECT_REQUIRED_FOR_CONFLICT
+
+
+@pytest.mark.parametrize("state", sorted(SUPPRESSED_STATES))
+def test_a_suppressed_claim_with_no_r4_fields_is_still_just_suppressed(
+    state: str,
+) -> None:
+    """Validating before suppression must not turn suppression into an error."""
+    store = _store()
+    store.add_claims([_subjectless("L1", state=state)])
+    assert store.retrieve("5K personal best") == []
+
+
 # ---------------------------------------------------------------------------
 # Arm plumbing
 # ---------------------------------------------------------------------------

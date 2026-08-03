@@ -230,6 +230,11 @@ class AphelionStore:
         self._hash_by_lineage: dict[str, str] = {}
 
     @property
+    def retriever(self) -> Retriever:
+        """The ranking engine this store retrieves with — the run records it."""
+        return self._retriever
+
+    @property
     def claims(self) -> list[Claim]:
         """The retained claims, in insertion order (read-only copy)."""
         return list(self._claims)
@@ -281,13 +286,25 @@ class AphelionStore:
             self.add_claims(self._extractor(session))
 
     def retrieve(self, question: str) -> list[Claim]:
-        """Rank, suppress read-only states, then resolve R4 per subject group.
+        """Validate, suppress read-only states, then resolve R4 per subject group.
 
         The retriever and the candidate set are the ones Arms A and B see; the
         R4 pass is a *post-filter* over that same set, so the memory layer stays
         the only independent variable. Results keep retriever rank order.
+
+        Validation runs over every ranked claim *before* suppression, mirroring
+        :meth:`aphelion.read_adapter.AphelionReadAdapter.query`, whose step-0
+        subject-required check likewise precedes its active-state filter. The
+        ordering is load-bearing: suppression is a retrieval policy over
+        well-formed claims, while PX_E_4144 is a verdict on the extraction
+        itself. Filtering first would let a ``superseded`` / ``withdrawn`` record
+        carrying R4 metadata with no subject slip out unexamined, hiding the
+        extractor bug until the same bug lands on an active claim and corrupts
+        M1 and M3.
         """
         ranked = self._retriever.rank(question, self._claims)
+        for claim in ranked:
+            _require_subject_for_r4(claim)
         active = [claim for claim in ranked if not self.is_suppressed(claim)]
         surfaced = self._r4_surfaced_ids(active)
         return [claim for claim in active if lineage_id(claim) in surfaced]
@@ -311,9 +328,13 @@ class AphelionStore:
         A claim with no ``subject`` opts out of R4 entirely (R4 is subject-scoped
         by spec) and surfaces unchanged rather than being silently dropped — but
         only if it carries no R4 field at all. Carrying one *and* omitting
-        ``subject`` is ``spec/v0.3-claim-semantics.md`` §6.5's PX_E_4144, checked
-        here via :func:`_require_subject_for_r4`: this branch is the one path
-        that never reaches the adapter, so its step-0 re-check cannot catch it.
+        ``subject`` is ``spec/v0.3-claim-semantics.md`` §6.5's PX_E_4144.
+
+        :meth:`retrieve` has already checked every ranked claim by the time this
+        runs; the :func:`_require_subject_for_r4` call here is the same
+        defence-in-depth the adapter keeps in its own step 0, covering a caller
+        that reaches this method directly. It cannot be dropped in favour of the
+        adapter's check, because a subject-less claim never reaches the adapter.
         """
         surfaced: set[str] = set()
         groups: dict[str, list[Claim]] = {}

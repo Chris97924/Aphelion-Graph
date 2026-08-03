@@ -94,7 +94,15 @@ class MemoryStore(Protocol):
 
     ``ingest`` turns sessions into stored claims (applying the arm's retention
     policy); ``retrieve`` returns the arm's claims ranked for a question.
+
+    ``retriever`` is the ranking engine the store actually ranks with. It is part
+    of the contract because ``retrieve`` is where the answers come from, so the
+    store is the only honest source for the retriever a run records: a second
+    reference held by the caller can have drifted from it.
     """
+
+    @property
+    def retriever(self) -> Retriever: ...
 
     def ingest(self, sessions: list[Session]) -> None: ...
 
@@ -204,6 +212,30 @@ class PinMismatchError(ValueError):
     A/B/C — the memory layer is the only independent variable. Arms that ran
     against different pins are not a measurement of the memory layer, so scoring
     them against each other is refused instead of silently reported.
+    """
+
+
+class RetrieverMismatchError(ValueError):
+    """Two arms answered under different retriever settings.
+
+    Sibling of :class:`PinMismatchError`: ``preregister.json``'s
+    ``model_fairness_constraint`` pins the *retriever* across arms A/B/C exactly
+    as it pins the answering and extractor models. Identical model pins are
+    therefore not sufficient — arms ranked under different BM25 parameters showed
+    their answering model different context, so the difference between them
+    measures the retriever, not the memory layer.
+    """
+
+
+class RetrieverProvenanceError(ValueError):
+    """A run could not record the retriever that actually produced its answers.
+
+    Predictions come out of ``store.retrieve(...)``, so the store's own retriever
+    is the one that ranked them. Recording the separate reference passed to
+    :func:`run_arm` would let the results claim the shared, pinned retriever while
+    another one generated the answers — an audit trail that is worse than none,
+    because it reads as verified. Raised when the store names no retriever at all,
+    and when the two references disagree.
     """
 
 
@@ -437,6 +469,48 @@ class ArmResult:
         return sum(marks) / len(marks) if marks else 0.0
 
 
+def recorded_retriever_params(
+    store: MemoryStore, retriever: Retriever
+) -> dict[str, Any]:
+    """The parameters of the retriever that actually ranked this arm's claims.
+
+    Read off the *store*, because ``store.retrieve(...)`` is what produced the
+    predictions, and cross-checked against the ``retriever`` the caller passed
+    alongside it. Both halves matter: deriving from the store keeps the record
+    truthful, and the cross-check catches the caller's stale reference instead of
+    letting a run silently pair one arm's answers with another retriever's
+    settings.
+
+    The comparison is on parameters rather than object identity: the shared BM25
+    retriever is stateless (see :mod:`benchmarks.longmemeval.retriever`), so two
+    instances carrying the same parameters rank identically and the record is
+    unambiguous either way. Disagreeing parameters raise
+    :class:`RetrieverProvenanceError`.
+    """
+    own = getattr(store, "retriever", None)
+    if own is None:
+        raise RetrieverProvenanceError(
+            f"{type(store).__name__} exposes no 'retriever', so the retriever that "
+            "ranked its claims cannot be recorded, and this run would have to "
+            "stamp its results with whichever retriever happened to be passed to "
+            "run_arm. Give the store a 'retriever' property returning the instance "
+            "it retrieves with (the MemoryStore protocol requires one)."
+        )
+
+    recorded = dict(getattr(own, "params", {}))
+    passed = dict(getattr(retriever, "params", {}))
+    if own is not retriever and recorded != passed:
+        raise RetrieverProvenanceError(
+            f"{type(store).__name__} ranks with retriever settings {recorded}, but "
+            f"run_arm was passed a retriever with {passed}. The answers come from "
+            "the store's retriever, so recording the passed-in one would attribute "
+            "them to a retriever that ranked nothing. preregister.json requires one "
+            "shared retriever across arms A/B/C — build the store with the same "
+            "retriever you pass here."
+        )
+    return recorded
+
+
 def run_arm(
     store: MemoryStore,
     retriever: Retriever,
@@ -451,9 +525,11 @@ def run_arm(
 
     ``store`` is ingested, then every question is answered from its top-``k``
     retrieved claims. ``retriever`` is the shared ranking engine the store was
-    built with; it is passed explicitly so its parameters are recorded on the
-    result (documenting that one instance serves every arm) and so a future
-    re-ranking stage can reuse it.
+    built with; it is passed explicitly to document that one instance serves every
+    arm and so a future re-ranking stage can reuse it. The recorded parameters are
+    read off the *store's* retriever and cross-checked against it
+    (:func:`recorded_retriever_params`), so the result can never claim a retriever
+    that did not rank its claims.
 
     This function deliberately does **not** judge. Scoring every arm is a single
     later phase (:func:`score_blind`) so the judge receives one shuffled,
@@ -475,6 +551,8 @@ def run_arm(
             "at least one StageBinding(pin=ModelPin(...), call=<your client>)."
         )
 
+    retriever_params = recorded_retriever_params(store, retriever)
+
     answer = answerer if answerer is not None else build_answerer(config)
     store.ingest(list(sessions))
     predictions = [
@@ -484,7 +562,7 @@ def run_arm(
     return ArmResult(
         predictions=predictions,
         pins=pins,
-        retriever_params=dict(getattr(retriever, "params", {})),
+        retriever_params=retriever_params,
     )
 
 
@@ -546,13 +624,17 @@ def score_blind(
     payload stays ``(question, gold, candidate_answer)`` — the arm is carried
     only by the harness-side :class:`BlindSlot`.
 
-    Two fairness preconditions are enforced rather than assumed, because a breach
-    means the run is not measuring the memory layer:
+    Three fairness preconditions are enforced rather than assumed, because a
+    breach means the run is not measuring the memory layer. Per
+    ``preregister.json``'s ``model_fairness_constraint``:
 
     * every arm must carry a pin record (:class:`UnrecordedPinsError`);
     * it must be the *same* record the judge is pinned to
-      (:class:`PinMismatchError`), per ``preregister.json``'s
-      ``model_fairness_constraint``.
+      (:class:`PinMismatchError`);
+    * every arm must have retrieved under the same retriever settings
+      (:class:`RetrieverMismatchError`) — the constraint names the retriever
+      alongside the two models, and identical models over differently-ranked
+      context is still not a memory-layer comparison.
 
     ``seed`` defaults to the pre-registered seed read from ``preregister.json``.
     Returns new :class:`ArmResult`\\ s; the inputs are left unscored.
@@ -567,6 +649,12 @@ def score_blind(
             "attributed to a judge. Pass the PipelineConfig the run was produced "
             "under (see benchmarks/longmemeval/preregister.json)."
         )
+
+    # The first arm in sorted order is the reference every other arm's retriever
+    # record is held against, so the arm named in the error is a deterministic
+    # function of the results mapping rather than of its iteration order.
+    reference_arm: str | None = None
+    reference_retriever: dict[str, Any] = {}
 
     for arm, result in sorted(results.items()):
         if not result.pins:
@@ -583,6 +671,17 @@ def score_blind(
                 "model_fairness_constraint requires identical models across arms "
                 "A/B/C — the memory layer is the only independent variable — so "
                 "these arms are not comparable."
+            )
+        if reference_arm is None:
+            reference_arm, reference_retriever = arm, result.retriever_params
+        elif result.retriever_params != reference_retriever:
+            raise RetrieverMismatchError(
+                f"arm {arm!r} retrieved under {result.retriever_params}, but arm "
+                f"{reference_arm!r} retrieved under {reference_retriever}. "
+                "preregister.json's model_fairness_constraint requires the "
+                "retriever to be identical across arms A/B/C, so these answers "
+                "were produced from differently-ranked context and their "
+                "difference is not a measurement of the memory layer."
             )
         if len(result.predictions) != len(questions):
             raise ValueError(

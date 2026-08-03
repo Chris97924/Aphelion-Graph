@@ -39,6 +39,8 @@ from benchmarks.longmemeval.pipeline import (
     PinMismatchError,
     PipelineConfig,
     QAItem,
+    RetrieverMismatchError,
+    RetrieverProvenanceError,
     Session,
     StageBinding,
     UnpinnedStageError,
@@ -476,6 +478,202 @@ def test_scoring_refuses_an_arm_that_answered_a_different_question_count() -> No
     results = {"A": _unscored("A", 3), "B": _unscored("B", 2)}
     with pytest.raises(ValueError, match="B"):
         score_blind(results, questions, config=_STUB_CONFIG, judge=lambda *a: True)
+
+
+# --------------------------------------------------------------------------- #
+# F-7 / F-8 — the retriever is pinned too, and the record names the real one   #
+# --------------------------------------------------------------------------- #
+
+
+def _answers(arm: str, retriever_params: dict) -> ArmResult:
+    """One arm's answers under an explicit retriever record."""
+    return ArmResult(
+        predictions=[f"{arm}0"],
+        pins=_STUB_CONFIG.pins_record(),
+        retriever_params=retriever_params,
+    )
+
+
+@pytest.mark.unit
+def test_scoring_refuses_arms_retrieved_under_different_retriever_settings() -> None:
+    """``preregister.json`` pins the retriever across arms, not just the models.
+
+    Identical pins are not enough: answers produced under different BM25
+    parameters differ in what the answering model ever saw, so scoring them
+    against each other measures the retriever, not the memory layer.
+    """
+    shared = BM25Retriever()
+    tuned = BM25Retriever(k1=2.0, b=0.5)
+    assert shared.params != tuned.params
+
+    results = {
+        "A": _answers("A", shared.params),
+        "B": _answers("B", shared.params),
+        "C": _answers("C", tuned.params),
+    }
+    # The pins are byte-identical — this is exactly the case the pin check passes.
+    assert results["C"].pins == results["A"].pins
+
+    with pytest.raises(RetrieverMismatchError) as excinfo:
+        score_blind(
+            results,
+            [QAItem(question="q0", gold="g0")],
+            config=_STUB_CONFIG,
+            judge=lambda *a: True,
+        )
+
+    message = str(excinfo.value)
+    assert "'C'" in message, "the offending arm must be named"
+    assert "2.0" in message, "the disagreeing settings must be shown"
+
+
+@pytest.mark.unit
+def test_scoring_accepts_arms_that_share_one_retriever_record() -> None:
+    """The guard is scoped to disagreement; the shared-retriever run still scores."""
+    shared = BM25Retriever().params
+    scored = score_blind(
+        {arm: _answers(arm, shared) for arm in _ARMS},
+        [QAItem(question="q0", gold="g0")],
+        config=_STUB_CONFIG,
+        judge=lambda *a: True,
+    )
+    assert {arm: result.correct for arm, result in scored.items()} == {
+        arm: [True] for arm in _ARMS
+    }
+
+
+@pytest.mark.unit
+def test_run_arm_records_the_retriever_the_store_ranked_with() -> None:
+    """The audit trail describes the retriever that produced the answers."""
+    tuned = BM25Retriever(k1=2.0, b=0.5)
+    store = PlainStore(tuned, extractor=lambda s: [Claim(id=s.id, text=s.text)])
+
+    result = run_arm(
+        store,
+        tuned,
+        [Session(id="s1", text="22:00")],
+        [QAItem(question="q", gold="22:00")],
+        config=_STUB_CONFIG,
+        answerer=_echo_answerer,
+    )
+
+    assert result.retriever_params == tuned.params
+    assert result.retriever_params != BM25Retriever().params
+
+
+@pytest.mark.unit
+def test_run_arm_refuses_a_store_built_with_a_different_retriever() -> None:
+    """Recording the argument would claim a retriever that ranked nothing.
+
+    The store answers from ``store.retrieve(...)``, so the store's own retriever
+    is what produced the predictions. A run that recorded the passed-in one would
+    stamp the shared/pinned settings onto answers another retriever generated.
+    """
+    store = PlainStore(
+        BM25Retriever(k1=2.0, b=0.5),
+        extractor=lambda s: [Claim(id=s.id, text=s.text)],
+    )
+
+    with pytest.raises(RetrieverProvenanceError) as excinfo:
+        run_arm(
+            store,
+            BM25Retriever(),
+            [Session(id="s1", text="22:00")],
+            [QAItem(question="q", gold="22:00")],
+            config=_STUB_CONFIG,
+            answerer=_echo_answerer,
+        )
+
+    message = str(excinfo.value)
+    assert "2.0" in message and "1.5" in message, "both settings must be shown"
+
+
+@pytest.mark.unit
+def test_run_arm_accepts_two_references_to_the_same_retriever_settings() -> None:
+    """The invariant is the ranking configuration, not object identity.
+
+    ``BM25Retriever`` is stateless, so two instances carrying the same parameters
+    rank identically and the record is unambiguous either way.
+    """
+    store_retriever = BM25Retriever()
+    twin = BM25Retriever()
+    assert twin is not store_retriever
+
+    store = PlainStore(
+        store_retriever, extractor=lambda s: [Claim(id=s.id, text=s.text)]
+    )
+    result = run_arm(
+        store,
+        twin,
+        [Session(id="s1", text="22:00")],
+        [QAItem(question="q", gold="22:00")],
+        config=_STUB_CONFIG,
+        answerer=_echo_answerer,
+    )
+    assert result.retriever_params == store_retriever.params
+
+
+@pytest.mark.unit
+def test_run_arm_refuses_a_store_that_names_no_retriever() -> None:
+    """No silent fallback to the argument — that is the whole failure mode.
+
+    A store that will not say which retriever it ranked with cannot have its
+    answers attributed, so the run is refused rather than stamped with the
+    retriever that merely happened to be passed alongside it.
+    """
+
+    class _OpaqueStore:
+        def ingest(self, sessions: list[Session]) -> None:
+            return None
+
+        def retrieve(self, question: str) -> list[Claim]:
+            return []
+
+    with pytest.raises(RetrieverProvenanceError) as excinfo:
+        run_arm(
+            _OpaqueStore(),
+            BM25Retriever(),
+            [Session(id="s1", text="22:00")],
+            [QAItem(question="q", gold="22:00")],
+            config=_STUB_CONFIG,
+            answerer=_echo_answerer,
+        )
+    assert "retriever" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_every_arm_store_names_the_retriever_it_ranks_with() -> None:
+    """The provenance check is answerable by every arm, so no arm is exempt."""
+    for arm, store_cls in ARM_STORES.items():
+        retriever = BM25Retriever()
+        assert store_cls(retriever).retriever is retriever, arm
+
+
+@pytest.mark.unit
+def test_the_3arm_path_carries_a_real_retriever_record_into_scoring() -> None:
+    """The cross-arm retriever check needs something to compare.
+
+    The 3-arm run pools each question's answers into one :class:`ArmResult` per
+    arm. Pooling them without their retriever record would leave every arm's
+    record empty and equal, so the fairness check would pass vacuously on the one
+    path that actually runs three arms against each other.
+    """
+    retriever = BM25Retriever()
+    record = {
+        "question_id": "q-fixture",
+        "question": "what was my 5K PB?",
+        "answer": "22:00",
+        "answer_session_ids": ["s1"],
+        "haystack_session_ids": ["s1"],
+        "haystack_sessions": [[{"role": "user", "content": "my 5K PB is 22:00"}]],
+    }
+
+    run = run_mod.run_three_arm_question(record, retriever)
+
+    assert set(run.retriever_params) == set(ARM_STORES)
+    for arm, params in run.retriever_params.items():
+        assert params, "an empty record makes the cross-arm check vacuous"
+        assert params == retriever.params, arm
 
 
 @pytest.mark.unit
