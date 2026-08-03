@@ -27,7 +27,7 @@ Pure stdlib. No model or network calls.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -86,3 +86,63 @@ def contamination_rate(
         total=total,
         contaminated_ids=tuple(contaminated_ids),
     )
+
+
+# ---------------------------------------------------------------------------
+# Store bridge — building the retrieved contexts an arm actually surfaces
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class TextRecord(Protocol):
+    """Anything with a ``text`` body — the harness ``Claim`` satisfies this."""
+
+    text: str
+
+
+@runtime_checkable
+class RetrievingStore(Protocol):
+    """A memory store that can answer a question with ranked claims."""
+
+    def retrieve(self, question: str) -> Sequence[TextRecord]: ...
+
+
+def contexts_from_store(
+    store: RetrievingStore,
+    questions: Mapping[str, str],
+    *,
+    top_k: int,
+) -> dict[str, list[str]]:
+    """Retrieve each question's top-``k`` context strings from one arm's store.
+
+    ``questions`` maps ``question_id`` → question text; the result is keyed the
+    same way and feeds straight into :func:`contamination_rate`. The ``top_k``
+    slice is the *same* context the answering model would see, which is what M3
+    is defined over — the metric asks whether a stale value reaches the model,
+    not whether it merely survives in the store.
+    """
+    return {
+        qid: [record.text for record in store.retrieve(question)[:top_k]]
+        for qid, question in questions.items()
+    }
+
+
+def score_stores(
+    questions: Mapping[str, str],
+    old_value_labels: Mapping[str, Sequence[str]],
+    stores: Mapping[str, RetrievingStore],
+    *,
+    top_k: int,
+) -> dict[str, ContaminationScore]:
+    """Contamination score per arm over one shared question set.
+
+    Returns ``{arm label: ContaminationScore}``. Every arm is retrieved with the
+    same questions, labels and ``top_k``, so the M3 gate's ``C <= 0.5 * A``
+    comparison comes from a like-for-like measurement.
+    """
+    return {
+        arm: contamination_rate(
+            contexts_from_store(store, questions, top_k=top_k), old_value_labels
+        )
+        for arm, store in stores.items()
+    }

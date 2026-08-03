@@ -1,0 +1,392 @@
+"""Arm C — the full aphelion claim-semantics store.
+
+This is the arm under test. It exercises exactly the three mechanisms the G2
+kill-gate is meant to judge (design doc §2.3):
+
+* **content_hash coalescing** — RFC 8785 (JCS) canonicalisation of the identity
+  projection → SHA-256, via :func:`aphelion.content_hash.compute_content_hash`.
+  Two claims coalesce **iff** they share the same ``claim_id`` (same lineage)
+  **and** their 64-hex ``content_hash`` is byte-equal. Never by textual
+  proximity, embedding similarity, or any near-duplicate heuristic.
+* **event state machine** — ``superseded`` and ``withdrawn`` claims are
+  suppressed from retrieval surfacing.
+* **R4 conflict classification** — the surviving active set is subject-grouped
+  and resolved through :class:`aphelion.read_adapter.AphelionReadAdapter`.
+
+**Why the ``claim_id`` gate is load-bearing.** The ``content_hash`` identity
+projection (``spec/content-hash.md`` §3–§4) is a whitelist over ``subject`` /
+``predicate`` / ``object`` / ``state`` and the other content fields; it excludes
+``claim_id`` outright and drops every R4 field — ``supersedes``, ``valid_from``,
+``valid_until``, ``polarity``, ``conflict_class`` — by omission. Two claims can
+therefore be byte-equal in ``content_hash`` while differing in R4, e.g. opposite
+``polarity``: a live **contradiction**. Coalescing on ``content_hash`` alone
+would merge such a different-``claim_id`` pair *before* R4 runs, silently erasing
+the conflict — inflating M2 with a false duplicate and poisoning M3 by hiding the
+stale value. Gating on ``claim_id`` keeps coalescing lineage-scoped so
+cross-lineage collisions reach R4 intact.
+
+Same ``claim_id`` with a *differing* ``content_hash`` is not a coalesce either:
+``spec/lifecycle-state-machine.md`` §5.1 makes it a hard
+``ERR-SEM-DUPLICATE-HASH-COLLISION`` failure with no automatic reconciliation.
+
+Claim frontmatter travels in :attr:`Claim.metadata`; ``claim_id`` is required
+because without a lineage there is no legal way to coalesce.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Iterable, Mapping
+
+from aphelion.content_hash import compute_content_hash
+from aphelion.error_codes import ErrorCode
+from aphelion.errors import SchemaError, SemanticError
+from aphelion.read_adapter import AphelionReadAdapter, ConflictClass, QueryResult
+from aphelion.v03_validator import validate_subject_required_for_r4
+
+from benchmarks.longmemeval.pipeline import (
+    Claim,
+    Extractor,
+    Retriever,
+    Session,
+    default_extractor,
+)
+
+# States the event state machine makes read-only; they never reach surfacing.
+SUPPRESSED_STATES: frozenset[str] = frozenset({"superseded", "withdrawn"})
+
+# The R4 conflict fields the identity projection drops by omission (design doc
+# §2.3 amendment). Two records can be byte-equal in ``content_hash`` yet
+# disagree on any of these — which is exactly why coalescing must inspect them.
+R4_CONFLICT_FIELDS: tuple[str, ...] = (
+    "supersedes",
+    "valid_from",
+    "valid_until",
+    "polarity",
+    "conflict_class",
+)
+
+# Verdicts that surface exactly the R4 primary. ``ambiguity`` and
+# ``contradiction`` are handled separately: both surface more than one claim.
+_PRIMARY_ONLY_VERDICTS: frozenset[ConflictClass] = frozenset(
+    {ConflictClass.NONE, ConflictClass.SUPERSESSION}
+)
+
+
+class CoalesceConflictError(ValueError):
+    """Two same-lineage, same-``content_hash`` records disagree on an R4 field.
+
+    **Why refusal, and why this is a documented choice.**
+    ``spec/lifecycle-state-machine.md`` §5.1 says a consumer *MAY* coalesce two
+    records sharing a ``claim_id`` and a ``content_hash``, but it never says
+    whose R4 frontmatter survives — and those fields sit outside the identity
+    projection, so the pair can disagree on ``valid_until``, ``polarity`` or
+    ``supersedes``. Keeping whichever record arrived first makes retrieval depend
+    on ingest order, which §5.3 forbids outright: the state after
+    ``import(A); import(B)`` MUST equal the state after ``import(B); import(A)``.
+
+    Two resolutions are order-independent — pick a deterministic winner, or
+    refuse. The spec names no winner, and design doc §2.3's amendment spells out
+    why a silent merge is the dangerous direction: it inflates M2 with a false
+    duplicate and poisons M3 by hiding the value that should have conflicted. So
+    Arm C refuses, mirroring the resolution §5.3 already prescribes for the
+    irreconcilable same-lineage case — "both orderings MUST raise the same
+    error on the second import."
+
+    Deliberately *not* an :class:`aphelion.errors.SemanticError`: no spec error
+    code names this condition, and minting one would report a harness policy as
+    a spec verdict.
+    """
+
+
+def frontmatter(claim: Claim) -> dict[str, Any]:
+    """The aphelion claim frontmatter carried in ``claim.metadata``."""
+    return dict(claim.metadata)
+
+
+def lineage_id(claim: Claim) -> str:
+    """The claim's ``claim_id`` — its lineage. Required by Arm C.
+
+    Arm C's coalescing rule is lineage-gated, so a claim with no ``claim_id``
+    cannot be placed on either side of the rule. Failing here is deliberate:
+    silently treating it as its own lineage would let un-lineaged claims
+    accumulate and quietly change M2.
+    """
+    value = claim.metadata.get("claim_id")
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"Arm C requires a non-empty 'claim_id' in claim metadata; "
+            f"claim {claim.id!r} has {value!r}. Arm C coalescing is "
+            "lineage-gated (design doc §2.3) and cannot run without one."
+        )
+    return value
+
+
+def content_hash_of(claim: Claim) -> str:
+    """The 64-hex ``content_hash`` of a claim's identity projection.
+
+    Delegates to the reference implementation, so the R4 fields and ``claim_id``
+    are excluded by the package's own projection rather than by a local copy of
+    the rule.
+    """
+    return compute_content_hash(frontmatter(claim))
+
+
+def r4_metadata(claim: Claim) -> dict[str, Any]:
+    """The R4 conflict fields a claim carries — the part identity ignores."""
+    meta = claim.metadata
+    return {field: meta[field] for field in R4_CONFLICT_FIELDS if field in meta}
+
+
+def coalescing_key(claim: Claim) -> tuple[str, str]:
+    """The lineage-gated coalescing key: ``(claim_id, content_hash)``.
+
+    Both halves must match for two claims to merge. Equality on the hash alone
+    is *not* sufficient — that is the cross-lineage case R4 must still see.
+    """
+    return (lineage_id(claim), content_hash_of(claim))
+
+
+def _require_reconcilable(retained: Claim, incoming: Claim) -> None:
+    """Refuse to coalesce two records of one lineage that disagree on R4.
+
+    Raises :class:`CoalesceConflictError` — see its docstring for why refusing
+    beats picking a winner. The message is assembled order-independently (both
+    records named, sorted by id) so the two ingest orders raise byte-identical
+    errors, which is what ``spec/lifecycle-state-machine.md`` §5.3 demands.
+    """
+    kept, arriving = r4_metadata(retained), r4_metadata(incoming)
+    disagreements = sorted(
+        field
+        for field in set(kept) | set(arriving)
+        if kept.get(field) != arriving.get(field)
+    )
+    if not disagreements:
+        return
+
+    first, second = sorted(
+        ((retained.id, kept), (incoming.id, arriving)), key=lambda pair: pair[0]
+    )
+    detail = "; ".join(
+        f"{field}: {first[0]}={first[1].get(field)!r} vs {second[0]}={second[1].get(field)!r}"
+        for field in disagreements
+    )
+    raise CoalesceConflictError(
+        f"claim_id {lineage_id(incoming)!r} has two records with the same "
+        f"content_hash but disagreeing R4 metadata ({detail}). "
+        "spec/lifecycle-state-machine.md §5.1 licenses coalescing only as a "
+        "duplicate merge and names no winner for the R4 fields the identity "
+        "projection excludes, so retaining either record would make retrieval "
+        "depend on ingest order — forbidden by §5.3. Fix the corpus or the "
+        "linker so one lineage carries one R4 state."
+    )
+
+
+def _require_subject_for_r4(claim: Claim) -> None:
+    """Reject R4 metadata with no ``subject`` — ``spec/v0.3-claim-semantics.md`` §6.5.
+
+    Delegates to the package's own validator so the R4-trigger list
+    (``polarity`` / ``valid_from`` / ``valid_until`` / ``supersedes``, with
+    ``confidence`` excluded by the backward-compat carve-out) and the PX_E_4144
+    code come from the spec implementation rather than a copy living here.
+
+    Failing loud is the point. R4 groups by subject, so an extraction that emits
+    update metadata without one has no grouping key: the conflict is undetectable,
+    the update goes silently inert, and the stale claim keeps surfacing alongside
+    the current one — corrupting M1 and M3 with what looks like a normal result.
+    The raise is re-issued carrying the harness record id so the offending claim
+    is named; the code and message stay the validator's.
+    """
+    try:
+        validate_subject_required_for_r4(frontmatter(claim))
+    except SchemaError as error:
+        raise SchemaError(code=error.code, msg=error.msg, path=claim.id) from error
+
+
+class AphelionStore:
+    """Arm C — content_hash coalescing + event SM suppression + R4 resolution."""
+
+    def __init__(
+        self,
+        retriever: Retriever,
+        *,
+        extractor: Extractor = default_extractor,
+        adapter: AphelionReadAdapter | None = None,
+        query_time: datetime | None = None,
+    ) -> None:
+        self._retriever = retriever
+        self._extractor = extractor
+        self._adapter = adapter if adapter is not None else AphelionReadAdapter()
+        # Pinned query time keeps R2 valid-time filtering — and therefore the
+        # whole run — reproducible; the adapter would otherwise default to now().
+        self._query_time = query_time
+        self._claims: list[Claim] = []
+        # (claim_id, content_hash) -> ids of every claim coalesced into it.
+        self._members: dict[tuple[str, str], list[str]] = {}
+        # Same key -> the record actually retained, so a later member of the
+        # cluster can be checked against the R4 metadata that is standing.
+        self._retained: dict[tuple[str, str], Claim] = {}
+        # claim_id -> content_hash, to detect §5.1 collisions across lineages.
+        self._hash_by_lineage: dict[str, str] = {}
+
+    @property
+    def retriever(self) -> Retriever:
+        """The ranking engine this store retrieves with — the run records it."""
+        return self._retriever
+
+    @property
+    def claims(self) -> list[Claim]:
+        """The retained claims, in insertion order (read-only copy)."""
+        return list(self._claims)
+
+    @property
+    def clusters(self) -> list[list[str]]:
+        """M2 merge clusters — one per retained claim, listing every id it absorbed."""
+        return [list(members) for members in self._members.values()]
+
+    def add_claims(self, claims: list[Claim]) -> None:
+        """Coalesce iff same ``claim_id`` AND byte-equal ``content_hash``.
+
+        Two same-lineage failure modes are refused rather than reconciled:
+
+        * different ``content_hash`` — :class:`aphelion.errors.SemanticError`
+          with ``DUPLICATE_HASH_COLLISION`` (``spec/lifecycle-state-machine.md``
+          §5.1: MUST fail, no automatic reconciliation);
+        * same ``content_hash`` but disagreeing R4 metadata —
+          :class:`CoalesceConflictError`, because the surviving record would
+          otherwise be decided by ingest order (§5.3).
+        """
+        for claim in claims:
+            claim_id, chash = coalescing_key(claim)
+
+            prior = self._hash_by_lineage.get(claim_id)
+            if prior is not None and prior != chash:
+                raise SemanticError(
+                    code=ErrorCode.DUPLICATE_HASH_COLLISION,
+                    msg=(
+                        f"claim_id {claim_id!r} carries two different content "
+                        f"hashes ({prior} vs {chash}); spec/lifecycle-state-"
+                        "machine.md §5.1 forbids automatic reconciliation"
+                    ),
+                    path=claim.id,
+                )
+            self._hash_by_lineage[claim_id] = chash
+
+            existing = self._members.get((claim_id, chash))
+            if existing is not None:
+                _require_reconcilable(self._retained[(claim_id, chash)], claim)
+                existing.append(claim.id)
+                continue
+            self._members[(claim_id, chash)] = [claim.id]
+            self._retained[(claim_id, chash)] = claim
+            self._claims.append(claim)
+
+    def ingest(self, sessions: list[Session]) -> None:
+        for session in sessions:
+            self.add_claims(self._extractor(session))
+
+    def retrieve(self, question: str) -> list[Claim]:
+        """Validate, suppress read-only states, then resolve R4 per subject group.
+
+        The retriever and the candidate set are the ones Arms A and B see; the
+        R4 pass is a *post-filter* over that same set, so the memory layer stays
+        the only independent variable. Results keep retriever rank order.
+
+        Validation runs over every ranked claim *before* suppression, mirroring
+        :meth:`aphelion.read_adapter.AphelionReadAdapter.query`, whose step-0
+        subject-required check likewise precedes its active-state filter. The
+        ordering is load-bearing: suppression is a retrieval policy over
+        well-formed claims, while PX_E_4144 is a verdict on the extraction
+        itself. Filtering first would let a ``superseded`` / ``withdrawn`` record
+        carrying R4 metadata with no subject slip out unexamined, hiding the
+        extractor bug until the same bug lands on an active claim and corrupts
+        M1 and M3.
+        """
+        ranked = self._retriever.rank(question, self._claims)
+        for claim in ranked:
+            _require_subject_for_r4(claim)
+        active = [claim for claim in ranked if not self.is_suppressed(claim)]
+        surfaced = self._r4_surfaced_ids(active)
+        return [claim for claim in active if lineage_id(claim) in surfaced]
+
+    @staticmethod
+    def is_suppressed(claim: Claim) -> bool:
+        """True for ``superseded`` / ``withdrawn`` — the read-only states."""
+        return claim.metadata.get("state") in SUPPRESSED_STATES
+
+    def resolve_subject(self, subject: str, claims: Iterable[Claim]) -> QueryResult:
+        """R4-resolve one subject group; returns the adapter's ``QueryResult``."""
+        return self._adapter.query(
+            subject=subject,
+            candidate_claims=[frontmatter(claim) for claim in claims],
+            query_time=self._query_time,
+        )
+
+    def _r4_surfaced_ids(self, active: list[Claim]) -> set[str]:
+        """The ``claim_id``s R4 surfaces, across every subject group.
+
+        A claim with no ``subject`` opts out of R4 entirely (R4 is subject-scoped
+        by spec) and surfaces unchanged rather than being silently dropped — but
+        only if it carries no R4 field at all. Carrying one *and* omitting
+        ``subject`` is ``spec/v0.3-claim-semantics.md`` §6.5's PX_E_4144.
+
+        :meth:`retrieve` has already checked every ranked claim by the time this
+        runs; the :func:`_require_subject_for_r4` call here is the same
+        defence-in-depth the adapter keeps in its own step 0, covering a caller
+        that reaches this method directly. It cannot be dropped in favour of the
+        adapter's check, because a subject-less claim never reaches the adapter.
+        """
+        surfaced: set[str] = set()
+        groups: dict[str, list[Claim]] = {}
+        for claim in active:
+            subject = claim.metadata.get("subject")
+            if not isinstance(subject, str) or not subject:
+                _require_subject_for_r4(claim)
+                surfaced.add(lineage_id(claim))
+                continue
+            groups.setdefault(subject, []).append(claim)
+
+        for subject, group in groups.items():
+            surfaced.update(_surfaced_lineages(self.resolve_subject(subject, group)))
+        return surfaced
+
+
+def _surfaced_lineages(result: QueryResult) -> set[str]:
+    """Map one R4 ``QueryResult`` onto the lineages Arm C surfaces.
+
+    Per design doc §2.3 the verdict governs surfacing:
+
+    * ``none`` / ``supersession`` — a single ``primary``;
+    * ``ambiguity`` — the ``primary`` (the definite claim) **plus** the others;
+    * ``contradiction`` — **no** ``primary``; every conflicting claim is
+      surfaced. Collapsing a contradiction to one claim would hide a live
+      conflict and is an Arm C implementation bug, not a result (design doc
+      §2.3 "Harness note").
+    * ``not_found`` — nothing survives R2 valid-time filtering.
+    """
+    if result.conflict_class in _PRIMARY_ONLY_VERDICTS:
+        if result.primary is None:
+            return set()
+        return {result.primary["claim_id"]}
+    if result.conflict_class in (
+        ConflictClass.AMBIGUITY,
+        ConflictClass.CONTRADICTION,
+    ):
+        return {claim["claim_id"] for claim in result.surfaced}
+    return set()
+
+
+def claim_from_frontmatter(
+    fields: Mapping[str, Any],
+    text: str = "",
+    *,
+    record_id: str | None = None,
+) -> Claim:
+    """Build a harness :class:`Claim` carrying aphelion frontmatter.
+
+    The harness claim id defaults to the ``claim_id``, so a single-lineage claim
+    needs no separate identifier; pass ``record_id`` to distinguish two harness
+    records that share one lineage — the coalescing case.
+    """
+    meta = dict(fields)
+    return Claim(id=str(record_id or meta["claim_id"]), text=text, metadata=meta)

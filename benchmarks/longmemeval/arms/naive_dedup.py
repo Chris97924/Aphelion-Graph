@@ -42,20 +42,35 @@ class NaiveDedupStore:
         self._retriever = retriever
         self._extractor = extractor
         self._claims: list[Claim] = []
-        self._seen: set[str] = set()
+        # Normalised body -> the ids of every claim that collapsed into it, in
+        # arrival order. Keyed insertion order matches ``_claims`` order, so the
+        # two stay aligned without a second index.
+        self._members: dict[str, list[str]] = {}
+
+    @property
+    def retriever(self) -> Retriever:
+        """The ranking engine this store retrieves with — the run records it."""
+        return self._retriever
 
     @property
     def claims(self) -> list[Claim]:
         """The retained claims, in insertion order (read-only copy)."""
         return list(self._claims)
 
+    @property
+    def clusters(self) -> list[list[str]]:
+        """M2 merge clusters — one per retained claim, listing every id it absorbed."""
+        return [list(members) for members in self._members.values()]
+
     def add_claims(self, claims: list[Claim]) -> None:
         """Keep the first claim per normalised body; drop later collisions."""
         for claim in claims:
             key = normalize_body(claim.text)
-            if key in self._seen:
+            existing = self._members.get(key)
+            if existing is not None:
+                existing.append(claim.id)
                 continue
-            self._seen.add(key)
+            self._members[key] = [claim.id]
             self._claims.append(claim)
 
     def ingest(self, sessions: list[Session]) -> None:
