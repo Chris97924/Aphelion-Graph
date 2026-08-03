@@ -105,11 +105,33 @@ Extractor = Callable[[Session], list[Claim]]
 # An answerer synthesises an answer string from the retrieved claims.
 Answerer = Callable[[str, Sequence[Claim]], str]
 
-# A judge decides whether a predicted answer matches the gold answer.
-Judge = Callable[[str, str], bool]
+
+class Judge(Protocol):
+    """Decides whether a candidate answer matches the gold answer.
+
+    Per design doc §6.1 (blind scoring) a judge receives
+    ``(question, gold, candidate_answer)`` and never an arm label. The question
+    is mandatory, not decorative: a short or context-dependent gold ("22:00",
+    "yes") cannot be scored without knowing what was asked.
+    """
+
+    def __call__(self, question: str, gold: str, candidate_answer: str) -> bool: ...
+
 
 # The three model-backed stage names, in pipeline order.
 STAGE_NAMES: tuple[str, ...] = ("extractor", "answering", "judge")
+
+
+class JudgeVerdictError(TypeError):
+    """A judge binding returned something that is not a ``bool``.
+
+    Subclasses :class:`TypeError` because the binding violated its declared
+    return type. The harness deliberately refuses to coerce or parse the value:
+    ``bool("false")``, ``bool("incorrect")`` and ``bool("error: rate limited")``
+    are all ``True``, so coercion would silently inflate M1. Turning a text
+    verdict into a boolean is the pinned judge prompt's job (design doc §6.1),
+    not this module's.
+    """
 
 
 class UnpinnedStageError(NotImplementedError):
@@ -241,15 +263,28 @@ def build_answerer(config: PipelineConfig) -> Answerer:
 
 
 def build_judge(config: PipelineConfig) -> Judge:
-    """Bind the pinned judge model into a :data:`Judge`.
+    """Bind the pinned judge model into a :class:`Judge`.
 
-    Per design doc §6.1 (blind scoring) the judge sees only
-    ``(question-answer, gold)`` — no arm label ever reaches it.
+    Per design doc §6.1 (blind scoring) the judge receives
+    ``(question, gold, candidate_answer)`` — no arm label ever reaches it.
+
+    The verdict must be a real ``bool``; anything else raises
+    :class:`JudgeVerdictError` instead of being coerced.
     """
     binding = require_binding(config, "judge")
 
-    def judge(predicted: str, gold: str) -> bool:
-        return bool(binding.call(predicted, gold, pin=binding.pin))
+    def judge(question: str, gold: str, candidate_answer: str) -> bool:
+        verdict = binding.call(question, gold, candidate_answer, pin=binding.pin)
+        if not isinstance(verdict, bool):
+            raise JudgeVerdictError(
+                f"the judge binding returned {type(verdict).__name__} "
+                f"({verdict!r}); the judge stage must return a bool. Make "
+                "PipelineConfig.judge.call return True/False — this harness will "
+                "not coerce or parse the value, because a truthy 'false' or error "
+                "string would silently inflate M1. Verdict parsing belongs to the "
+                "pinned judge prompt (design doc §6.1)."
+            )
+        return verdict
 
     return judge
 
@@ -274,9 +309,9 @@ def default_answerer(question: str, claims: Sequence[Claim]) -> str:
     return build_answerer(UNPINNED)(question, claims)
 
 
-def default_judge(predicted: str, gold: str) -> bool:
+def default_judge(question: str, gold: str, candidate_answer: str) -> bool:
     """Resolve the judge from the unpinned config — always fails loud."""
-    return build_judge(UNPINNED)(predicted, gold)
+    return build_judge(UNPINNED)(question, gold, candidate_answer)
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +367,7 @@ def run_arm(
         retrieved = store.retrieve(item.question)[:top_k]
         predicted = answerer(item.question, retrieved)
         predictions.append(predicted)
-        correct.append(judge(predicted, item.gold))
+        correct.append(judge(item.question, item.gold, predicted))
     return ArmResult(
         predictions=predictions,
         correct=correct,

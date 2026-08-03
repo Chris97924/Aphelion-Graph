@@ -190,7 +190,7 @@ def test_deferred_hooks_raise_not_implemented() -> None:
     with pytest.raises(NotImplementedError):
         default_answerer("q", [])
     with pytest.raises(NotImplementedError):
-        default_judge("a", "b")
+        default_judge("q", "gold", "candidate")
 
 
 def test_stores_satisfy_memory_store_protocol() -> None:
@@ -208,8 +208,8 @@ def test_run_arm_is_arm_agnostic_and_deterministic() -> None:
     def answerer(question: str, claims: list[Claim]) -> str:
         return claims[0].text if claims else ""
 
-    def judge(predicted: str, gold: str) -> bool:
-        return predicted == gold
+    def judge(question: str, gold: str, candidate_answer: str) -> bool:
+        return candidate_answer == gold
 
     sessions = [
         Session(id="s1", text="my 5K personal best is 22 minutes"),

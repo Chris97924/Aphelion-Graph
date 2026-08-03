@@ -32,8 +32,10 @@ from benchmarks.longmemeval.arms.plain import PlainStore
 from benchmarks.longmemeval.metrics import m2_dedup, m3_contamination, m5_roundtrip
 from benchmarks.longmemeval.pipeline import (
     Claim,
+    JudgeVerdictError,
     ModelPin,
     PipelineConfig,
+    QAItem,
     Session,
     StageBinding,
     UnpinnedStageError,
@@ -43,6 +45,7 @@ from benchmarks.longmemeval.pipeline import (
     default_answerer,
     default_extractor,
     default_judge,
+    run_arm,
 )
 from benchmarks.longmemeval.retriever import BM25Retriever
 
@@ -90,7 +93,7 @@ def test_default_stages_resolve_through_the_unpinned_config() -> None:
     with pytest.raises(UnpinnedStageError):
         default_answerer("q", [])
     with pytest.raises(UnpinnedStageError):
-        default_judge("a", "b")
+        default_judge("q", "gold", "candidate")
 
 
 @pytest.mark.unit
@@ -106,9 +109,11 @@ def test_pinned_config_builds_working_stages() -> None:
         seen.append(pin)
         return claims[0].text if claims else ""
 
-    def judge(predicted: str, gold: str, *, pin: ModelPin) -> bool:
+    def judge(
+        question: str, gold: str, candidate_answer: str, *, pin: ModelPin
+    ) -> bool:
         seen.append(pin)
-        return predicted == gold
+        return candidate_answer == gold
 
     config = PipelineConfig(
         extractor=StageBinding(pin=_PIN, call=extract),
@@ -119,8 +124,90 @@ def test_pinned_config_builds_working_stages() -> None:
     claims = build_extractor(config)(Session(id="s1", text="hello"))
     assert [claim.text for claim in claims] == ["hello"]
     assert build_answerer(config)("q", claims) == "hello"
-    assert build_judge(config)("hello", "hello") is True
+    assert build_judge(config)("q", "hello", "hello") is True
     assert seen == [_PIN, _PIN, _PIN]
+
+
+# --------------------------------------------------------------------------- #
+# Judge contract: blind scoring gets the question; verdicts must be real bools  #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+def test_judge_receives_the_question_with_the_gold_and_candidate() -> None:
+    """Design doc §6.1: the judge sees ``(question, gold, candidate_answer)``.
+
+    Without the question a short or context-dependent gold ("22:00", "yes")
+    cannot be scored reliably, so M1 silently mis-scores.
+    """
+    seen: list[tuple[str, str, str]] = []
+
+    def judge(
+        question: str, gold: str, candidate_answer: str, *, pin: ModelPin
+    ) -> bool:
+        seen.append((question, gold, candidate_answer))
+        return True
+
+    bound = build_judge(PipelineConfig(judge=StageBinding(pin=_PIN, call=judge)))
+    assert bound("what was my 5K PB?", "22:00", "22:00") is True
+    assert seen == [("what was my 5K PB?", "22:00", "22:00")]
+
+
+@pytest.mark.unit
+def test_run_arm_forwards_each_question_to_the_judge() -> None:
+    """The question reaching the judge must be the item's own question."""
+    judged: list[tuple[str, str, str]] = []
+
+    def judge(question: str, gold: str, candidate_answer: str) -> bool:
+        judged.append((question, gold, candidate_answer))
+        return gold == candidate_answer
+
+    store = PlainStore(
+        BM25Retriever(), extractor=lambda s: [Claim(id=s.id, text=s.text)]
+    )
+    result = run_arm(
+        store,
+        BM25Retriever(),
+        [Session(id="s1", text="22:00")],
+        [QAItem(question="what was my 5K PB?", gold="22:00")],
+        answerer=lambda question, claims: claims[0].text if claims else "",
+        judge=judge,
+    )
+
+    assert judged == [("what was my 5K PB?", "22:00", "22:00")]
+    assert result.correct == [True]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "verdict", ["false", "incorrect", "no", "0", "error: rate limited", 1, 0, None, ""]
+)
+def test_non_boolean_judge_verdict_fails_loud(verdict: object) -> None:
+    """``bool(...)`` on a text verdict silently inflates M1 — reject it instead.
+
+    ``"false"`` / ``"incorrect"`` / an error string are all truthy, and ``1`` /
+    ``0`` are ints, not verdicts. The harness refuses to guess a parse: parsing
+    semantics belong to the pinned judge prompt, so a non-bool is an error.
+    """
+    bound = build_judge(
+        PipelineConfig(judge=StageBinding(pin=_PIN, call=lambda *a, **k: verdict))
+    )
+    with pytest.raises(JudgeVerdictError) as excinfo:
+        bound("q", "gold", "candidate")
+
+    message = str(excinfo.value)
+    assert "judge" in message
+    assert type(verdict).__name__ in message
+
+
+@pytest.mark.unit
+def test_boolean_judge_verdicts_pass_through_unchanged() -> None:
+    """Real bools — and only real bools — are accepted, both ways."""
+    for verdict in (True, False):
+        bound = build_judge(
+            PipelineConfig(judge=StageBinding(pin=_PIN, call=lambda *a, **k: verdict))
+        )
+        assert bound("q", "gold", "candidate") is verdict
 
 
 @pytest.mark.unit

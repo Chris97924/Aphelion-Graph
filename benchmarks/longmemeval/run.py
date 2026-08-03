@@ -130,9 +130,14 @@ def stub_answerer(question: str, claims: Sequence[Claim]) -> str:
     return claims[0].text if claims else ""
 
 
-def stub_judge(predicted: str, gold: str) -> bool:
-    """Exact-match judge: the prediction must equal the gold answer verbatim."""
-    return predicted == gold
+def stub_judge(question: str, gold: str, candidate_answer: str) -> bool:
+    """Exact-match judge: the candidate must equal the gold answer verbatim.
+
+    ``question`` is unused by an exact-match stub but is part of the §6.1 judge
+    contract every judge is called under — the pinned model-backed judge needs it
+    to score short, context-dependent gold answers.
+    """
+    return candidate_answer == gold
 
 
 # ---------------------------------------------------------------------------
