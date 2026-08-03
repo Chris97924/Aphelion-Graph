@@ -35,6 +35,15 @@ class PlainStore:
         """The stored claims, in insertion order (read-only copy)."""
         return list(self._claims)
 
+    @property
+    def clusters(self) -> list[list[str]]:
+        """M2 merge clusters — all singletons: Arm A never merges anything.
+
+        Arm A therefore predicts *no* duplicate pairs, which is the floor M2's
+        ``C.F1 > A.F1 + 0.10`` arm is measured against.
+        """
+        return [[claim.id] for claim in self._claims]
+
     def add_claims(self, claims: list[Claim]) -> None:
         """Store every claim verbatim — Arm A keeps all duplicates."""
         self._claims.extend(claims)
