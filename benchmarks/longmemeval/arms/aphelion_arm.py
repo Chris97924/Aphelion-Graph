@@ -54,11 +54,48 @@ from benchmarks.longmemeval.pipeline import (
 # States the event state machine makes read-only; they never reach surfacing.
 SUPPRESSED_STATES: frozenset[str] = frozenset({"superseded", "withdrawn"})
 
+# The R4 conflict fields the identity projection drops by omission (design doc
+# §2.3 amendment). Two records can be byte-equal in ``content_hash`` yet
+# disagree on any of these — which is exactly why coalescing must inspect them.
+R4_CONFLICT_FIELDS: tuple[str, ...] = (
+    "supersedes",
+    "valid_from",
+    "valid_until",
+    "polarity",
+    "conflict_class",
+)
+
 # Verdicts that surface exactly the R4 primary. ``ambiguity`` and
 # ``contradiction`` are handled separately: both surface more than one claim.
 _PRIMARY_ONLY_VERDICTS: frozenset[ConflictClass] = frozenset(
     {ConflictClass.NONE, ConflictClass.SUPERSESSION}
 )
+
+
+class CoalesceConflictError(ValueError):
+    """Two same-lineage, same-``content_hash`` records disagree on an R4 field.
+
+    **Why refusal, and why this is a documented choice.**
+    ``spec/lifecycle-state-machine.md`` §5.1 says a consumer *MAY* coalesce two
+    records sharing a ``claim_id`` and a ``content_hash``, but it never says
+    whose R4 frontmatter survives — and those fields sit outside the identity
+    projection, so the pair can disagree on ``valid_until``, ``polarity`` or
+    ``supersedes``. Keeping whichever record arrived first makes retrieval depend
+    on ingest order, which §5.3 forbids outright: the state after
+    ``import(A); import(B)`` MUST equal the state after ``import(B); import(A)``.
+
+    Two resolutions are order-independent — pick a deterministic winner, or
+    refuse. The spec names no winner, and design doc §2.3's amendment spells out
+    why a silent merge is the dangerous direction: it inflates M2 with a false
+    duplicate and poisons M3 by hiding the value that should have conflicted. So
+    Arm C refuses, mirroring the resolution §5.3 already prescribes for the
+    irreconcilable same-lineage case — "both orderings MUST raise the same
+    error on the second import."
+
+    Deliberately *not* an :class:`aphelion.errors.SemanticError`: no spec error
+    code names this condition, and minting one would report a harness policy as
+    a spec verdict.
+    """
 
 
 def frontmatter(claim: Claim) -> dict[str, Any]:
@@ -94,6 +131,12 @@ def content_hash_of(claim: Claim) -> str:
     return compute_content_hash(frontmatter(claim))
 
 
+def r4_metadata(claim: Claim) -> dict[str, Any]:
+    """The R4 conflict fields a claim carries — the part identity ignores."""
+    meta = claim.metadata
+    return {field: meta[field] for field in R4_CONFLICT_FIELDS if field in meta}
+
+
 def coalescing_key(claim: Claim) -> tuple[str, str]:
     """The lineage-gated coalescing key: ``(claim_id, content_hash)``.
 
@@ -101,6 +144,41 @@ def coalescing_key(claim: Claim) -> tuple[str, str]:
     is *not* sufficient — that is the cross-lineage case R4 must still see.
     """
     return (lineage_id(claim), content_hash_of(claim))
+
+
+def _require_reconcilable(retained: Claim, incoming: Claim) -> None:
+    """Refuse to coalesce two records of one lineage that disagree on R4.
+
+    Raises :class:`CoalesceConflictError` — see its docstring for why refusing
+    beats picking a winner. The message is assembled order-independently (both
+    records named, sorted by id) so the two ingest orders raise byte-identical
+    errors, which is what ``spec/lifecycle-state-machine.md`` §5.3 demands.
+    """
+    kept, arriving = r4_metadata(retained), r4_metadata(incoming)
+    disagreements = sorted(
+        field
+        for field in set(kept) | set(arriving)
+        if kept.get(field) != arriving.get(field)
+    )
+    if not disagreements:
+        return
+
+    first, second = sorted(
+        ((retained.id, kept), (incoming.id, arriving)), key=lambda pair: pair[0]
+    )
+    detail = "; ".join(
+        f"{field}: {first[0]}={first[1].get(field)!r} vs {second[0]}={second[1].get(field)!r}"
+        for field in disagreements
+    )
+    raise CoalesceConflictError(
+        f"claim_id {lineage_id(incoming)!r} has two records with the same "
+        f"content_hash but disagreeing R4 metadata ({detail}). "
+        "spec/lifecycle-state-machine.md §5.1 licenses coalescing only as a "
+        "duplicate merge and names no winner for the R4 fields the identity "
+        "projection excludes, so retaining either record would make retrieval "
+        "depend on ingest order — forbidden by §5.3. Fix the corpus or the "
+        "linker so one lineage carries one R4 state."
+    )
 
 
 class AphelionStore:
@@ -123,6 +201,9 @@ class AphelionStore:
         self._claims: list[Claim] = []
         # (claim_id, content_hash) -> ids of every claim coalesced into it.
         self._members: dict[tuple[str, str], list[str]] = {}
+        # Same key -> the record actually retained, so a later member of the
+        # cluster can be checked against the R4 metadata that is standing.
+        self._retained: dict[tuple[str, str], Claim] = {}
         # claim_id -> content_hash, to detect §5.1 collisions across lineages.
         self._hash_by_lineage: dict[str, str] = {}
 
@@ -139,10 +220,14 @@ class AphelionStore:
     def add_claims(self, claims: list[Claim]) -> None:
         """Coalesce iff same ``claim_id`` AND byte-equal ``content_hash``.
 
-        Raises :class:`aphelion.errors.SemanticError` with
-        ``DUPLICATE_HASH_COLLISION`` when one lineage carries two different
-        content hashes (``spec/lifecycle-state-machine.md`` §5.1: MUST fail, no
-        automatic reconciliation).
+        Two same-lineage failure modes are refused rather than reconciled:
+
+        * different ``content_hash`` — :class:`aphelion.errors.SemanticError`
+          with ``DUPLICATE_HASH_COLLISION`` (``spec/lifecycle-state-machine.md``
+          §5.1: MUST fail, no automatic reconciliation);
+        * same ``content_hash`` but disagreeing R4 metadata —
+          :class:`CoalesceConflictError`, because the surviving record would
+          otherwise be decided by ingest order (§5.3).
         """
         for claim in claims:
             claim_id, chash = coalescing_key(claim)
@@ -162,9 +247,11 @@ class AphelionStore:
 
             existing = self._members.get((claim_id, chash))
             if existing is not None:
+                _require_reconcilable(self._retained[(claim_id, chash)], claim)
                 existing.append(claim.id)
                 continue
             self._members[(claim_id, chash)] = [claim.id]
+            self._retained[(claim_id, chash)] = claim
             self._claims.append(claim)
 
     def ingest(self, sessions: list[Session]) -> None:

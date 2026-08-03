@@ -20,6 +20,7 @@ All pure stdlib plus the ``aphelion`` package; no model or network calls.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -32,6 +33,7 @@ from aphelion.read_adapter import ConflictClass
 from benchmarks.longmemeval.arms.aphelion_arm import (
     SUPPRESSED_STATES,
     AphelionStore,
+    CoalesceConflictError,
     claim_from_frontmatter,
     coalescing_key,
     content_hash_of,
@@ -130,6 +132,105 @@ def test_same_claim_id_different_hash_is_a_collision_error() -> None:
             [_claim("L1", record_id="r1"), _claim("L1", record_id="r2", object="24:30")]
         )
     assert excinfo.value.code is ErrorCode.DUPLICATE_HASH_COLLISION
+
+
+# ---------------------------------------------------------------------------
+# Import-order irrelevance (spec/lifecycle-state-machine.md §5.3)
+# ---------------------------------------------------------------------------
+
+
+def _ingest_outcome(claims: list) -> tuple:
+    """Everything one ingest order can be observed to produce.
+
+    Either the loud error (type + message) or the full retained/retrieved state,
+    rendered canonically so two orders compare byte-for-byte. Metadata is part of
+    the comparison on purpose: the order-dependence being pinned here is invisible
+    in the claim *count* and shows up only in the surviving frontmatter.
+    """
+    store = _store()
+    try:
+        store.add_claims(list(claims))
+    except Exception as exc:  # noqa: BLE001 — the outcome under comparison
+        return ("error", type(exc).__name__, str(exc))
+    return (
+        "ok",
+        tuple(claim.id for claim in store.retrieve("5K personal best")),
+        tuple(sorted(tuple(sorted(members)) for members in store.clusters)),
+        tuple(
+            json.dumps(claim.metadata, sort_keys=True, default=str)
+            for claim in sorted(store.claims, key=lambda claim: claim.id)
+        ),
+    )
+
+
+def test_expired_then_active_matches_active_then_expired() -> None:
+    """The concrete import-order bug: R2 validity decided by ingest order.
+
+    ``valid_until`` is excluded from the identity projection, so these two share
+    a ``content_hash`` and the same lineage. Keeping whichever arrived first
+    means expired-then-active retrieves nothing while active-then-expired
+    surfaces the claim — M1/M3 would depend on corpus ordering.
+    """
+    expired = _claim("L1", record_id="r1", valid_until="2026-01-01T00:00:00Z")
+    active = _claim("L1", record_id="r2")
+    assert content_hash_of(expired) == content_hash_of(active)
+
+    assert _ingest_outcome([expired, active]) == _ingest_outcome([active, expired])
+
+
+@pytest.mark.parametrize("field,left,right", R4_EXCLUDED_FIELDS)
+def test_same_lineage_r4_difference_is_import_order_independent(
+    field: str, left: object, right: object
+) -> None:
+    """``import(A); import(B)`` must equal ``import(B); import(A)`` for every R4 field.
+
+    ``spec/lifecycle-state-machine.md`` §5.3 makes this a MUST, and §5.1's second
+    clause fixes the shape of the alternative: when a same-lineage pair cannot be
+    reconciled, *both* orderings raise the same error.
+    """
+    a = _claim("L1", record_id="r1", **{field: left})
+    b = _claim("L1", record_id="r2", **{field: right})
+    assert content_hash_of(a) == content_hash_of(b)
+
+    assert _ingest_outcome([a, b]) == _ingest_outcome([b, a])
+
+
+@pytest.mark.parametrize("field,left,right", R4_EXCLUDED_FIELDS)
+def test_conflicting_r4_metadata_is_rejected_not_silently_merged(
+    field: str, left: object, right: object
+) -> None:
+    """Same lineage + same hash + disagreeing R4 is not a duplicate — fail loud."""
+    store = _store()
+    with pytest.raises(CoalesceConflictError, match=field):
+        store.add_claims(
+            [
+                _claim("L1", record_id="r1", **{field: left}),
+                _claim("L1", record_id="r2", **{field: right}),
+            ]
+        )
+
+
+def test_identical_r4_metadata_still_coalesces() -> None:
+    """The rejection is scoped to *disagreement*; a true duplicate still merges."""
+    store = _store()
+    store.add_claims(
+        [
+            _claim(
+                "L1",
+                record_id="r1",
+                polarity="affirm",
+                valid_from="2026-01-01T00:00:00Z",
+            ),
+            _claim(
+                "L1",
+                record_id="r2",
+                polarity="affirm",
+                valid_from="2026-01-01T00:00:00Z",
+            ),
+        ]
+    )
+    assert len(store.claims) == 1
+    assert store.clusters == [["r1", "r2"]]
 
 
 def test_missing_claim_id_fails_loud() -> None:
