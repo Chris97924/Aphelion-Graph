@@ -1,31 +1,39 @@
-"""M5 — round-trip agreement with the independent Aphelion reader (skeleton).
+"""M5 — cross-tool round-trip determinism for Aphelion packages.
 
-M5 asks whether an *independent* reader reproduces the reference verdict for an
-Aphelion package. This module is the **verdict-level** wrapper over the current
-``scripts/external_reader.py``: for each sample it compares the reader's
-``validator_verdict`` (valid / invalid) against the sample's committed
-``expected-normalized.json``.
+M5 asks whether an Aphelion package survives a round trip byte-for-byte. This
+module provides the two checks that are buildable today, and refuses to let the
+pinned gate be reported from either of them alone:
 
-The full M5 gate pinned in ``preregister.json`` is stronger — option (a) W-M5:
-a second, fully independent canonical reader with **byte-for-byte** equality of
-the normalized output (100/100). That two-implementation byte-equality reader is
-scheduled for the EXECUTION drive (Chris 2026-07-19) and is deliberately NOT
-built here; this skeleton establishes only the callable contract and the
-verdict-level agreement check the execution drive will harden.
+1. :func:`roundtrip_agreement` — **verdict level, genuinely cross-tool.** Wraps
+   ``scripts/external_reader.py``, a stdlib-only reader that never imports
+   ``aphelion``, and compares its ``validator_verdict`` against each sample's
+   committed ``expected-normalized.json``.
+2. :func:`byte_equality` — **byte level, reference implementation only.** Drives
+   the ``aphelion`` package's own public API (``packer.pack`` → ``unpacker.unpack``
+   → ``packer.pack``) and SHA-256-compares the two archives. Everything goes
+   through the installed package; nothing here re-implements canonical
+   serialization, so a serialization bug cannot be masked by a second copy of the
+   same mistake.
 
-The comparison mirrors ``external_reader.run``'s own semantics, including its one
-special case: a duplicate-hash-collision fixture nests two sub-packages that are
-each individually valid (the collision is only illegal at merge time, out of the
-minimal reader's scope), so agreement there means "every sub-package is valid".
+**The pinned M5 gate is NOT satisfied by either.** ``preregister.json`` pins
+option (a) ``W-M5``: a *second, fully independent* canonical reader whose bytes
+are compared against the reference (design doc §7.4). Check 1 is cross-tool but
+only verdict-deep; check 2 is byte-deep but single-implementation. Together they
+are design-doc option **(b)**, which §7.4 records as explicitly *not* pinned —
+"M5 is blocked, not waived and not silently downgraded to (b)". Landing W-M5
+means expanding ``scripts/external_reader.py`` into a full canonical reader.
+:func:`gate_status` exists so a runner reports that blockage instead of quietly
+publishing an option-(b) number as if it were the gate.
 
-Pure stdlib. Imports the reader by file path (it is a script, not a package) and
-makes no model or network calls.
+Pure stdlib plus the ``aphelion`` package itself. No model or network calls.
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -128,4 +136,159 @@ def roundtrip_agreement(samples_root: Path) -> VerdictAgreement:
         total=total,
         agreements=total - len(disagreements),
         disagreements=tuple(disagreements),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Byte-level round trip, through the aphelion package's own public API
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ByteEquality:
+    """Byte-level round-trip outcome over a set of sample directories.
+
+    ``unpackable`` records the samples that could not be packed at all, with the
+    Aphelion error code that rejected them. Those are the deliberately-invalid
+    fixtures (an illegal lifecycle stream, a nested multi-package collision
+    fixture); they are reported rather than silently skipped so the denominator
+    stays auditable.
+    """
+
+    total: int
+    identical: int
+    mismatches: tuple[str, ...]
+    unpackable: tuple[tuple[str, str], ...]
+
+    @property
+    def rate(self) -> float:
+        """Fraction of packable samples that round-tripped byte-identically."""
+        return self.identical / self.total if self.total else 0.0
+
+    @property
+    def all_identical(self) -> bool:
+        return self.total > 0 and not self.mismatches
+
+
+def package_digest(archive: Path) -> str:
+    """SHA-256 of an archive's bytes, as lowercase hex."""
+    return hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
+def roundtrip_digests(sample: Path, workdir: Path) -> tuple[str, str]:
+    """Pack → unpack → re-pack one sample; return both archives' SHA-256s.
+
+    Every step runs through the installed ``aphelion`` package's public API, so
+    this measures the reference implementation's own canonical determinism (a
+    prerequisite for M5, not the two-implementation gate itself — see the module
+    docstring).
+    """
+    from aphelion.packer import pack
+    from aphelion.unpacker import unpack
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    first = Path(pack(sample, workdir / "first.aphelion.tar"))
+    unpacked = unpack(first, workdir / "unpacked")
+    second = Path(pack(unpacked, workdir / "second.aphelion.tar"))
+    return package_digest(first), package_digest(second)
+
+
+def roundtrip_is_byte_identical(sample: Path, workdir: Path) -> bool:
+    """True iff packing, unpacking and re-packing ``sample`` reproduces its bytes."""
+    first, second = roundtrip_digests(sample, workdir)
+    return first == second
+
+
+def independent_verdict(sample: Path, workdir: Path) -> str:
+    """``"valid"`` / the Aphelion error code, via ``aphelion.verifier.verify_package``.
+
+    Uses the package's own end-to-end verifier rather than a local re-check, so
+    the verdict is the one the shipped tool would give.
+    """
+    from aphelion.errors import AphelionError
+    from aphelion.packer import pack
+    from aphelion.verifier import verify_package
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        archive = Path(pack(sample, workdir / "verify.aphelion.tar"))
+        verify_package(archive)
+    except AphelionError as exc:
+        return str(exc.code.value if hasattr(exc.code, "value") else exc.code)
+    return "valid"
+
+
+def byte_equality(samples_root: Path, workdir: Path | None = None) -> ByteEquality:
+    """Byte-level round-trip over every sample that packs.
+
+    ``workdir`` defaults to a temporary directory that is removed on return, so
+    the check leaves nothing behind and never writes into ``samples/``.
+    """
+    if workdir is None:
+        with tempfile.TemporaryDirectory() as tmp:
+            return byte_equality(samples_root, Path(tmp))
+
+    from aphelion.errors import AphelionError
+
+    identical = 0
+    mismatches: list[str] = []
+    unpackable: list[tuple[str, str]] = []
+    for index, sample in enumerate(_scored_samples(samples_root)):
+        try:
+            ok = roundtrip_is_byte_identical(sample, workdir / f"s{index:03d}")
+        except AphelionError as exc:
+            code = exc.code.value if hasattr(exc.code, "value") else exc.code
+            unpackable.append((sample.name, str(code)))
+            continue
+        if ok:
+            identical += 1
+        else:
+            mismatches.append(sample.name)
+
+    return ByteEquality(
+        total=identical + len(mismatches),
+        identical=identical,
+        mismatches=tuple(mismatches),
+        unpackable=tuple(unpackable),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate status — the pinned M5 gate cannot be reported from this module
+# ---------------------------------------------------------------------------
+
+#: Why the pinned M5 gate cannot run yet. ``preregister.json`` pins option (a):
+#: a second, fully independent canonical reader (``W-M5``). Until that lands in
+#: ``scripts/external_reader.py``, the byte-level check here covers only the
+#: reference implementation, so the gate is blocked — design doc §7.4 forbids
+#: silently downgrading it to option (b).
+GATE_BLOCKER = (
+    "W-M5 not landed: scripts/external_reader.py reproduces the validator "
+    "verdict only, not canonical bytes, so no second implementation exists to "
+    "byte-compare against. preregister.json M5 pins option (a); design doc §7.4 "
+    "records that M5 is blocked, not waived and not downgraded to option (b)."
+)
+
+
+@dataclass(frozen=True)
+class GateStatus:
+    """Whether the pinned M5 gate is runnable, and the evidence gathered so far."""
+
+    runnable: bool
+    blocker: str
+    verdict_agreement: VerdictAgreement
+    byte_equality: ByteEquality
+
+
+def gate_status(samples_root: Path, workdir: Path | None = None) -> GateStatus:
+    """Collect both M5 checks and report the pinned gate as **not** runnable.
+
+    Returning a status object rather than a bare pass/fail keeps a runner from
+    publishing the option-(b) numbers as if they were the pinned option-(a) gate.
+    """
+    return GateStatus(
+        runnable=False,
+        blocker=GATE_BLOCKER,
+        verdict_agreement=roundtrip_agreement(samples_root),
+        byte_equality=byte_equality(samples_root, workdir),
     )

@@ -28,7 +28,7 @@ Pure stdlib. No model or network calls.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Hashable, Iterable
+from typing import Hashable, Iterable, Mapping, Protocol, runtime_checkable
 
 # An unordered pair of claim ids. ``frozenset`` makes {a, b} == {b, a} and keys
 # cleanly into sets, so pair arithmetic is order-independent by construction.
@@ -125,3 +125,55 @@ def score_arm(
     derived from it via :func:`cluster_pairs`.
     """
     return dedup_prf(labeled_pairs, cluster_pairs(arm_clusters))
+
+
+# ---------------------------------------------------------------------------
+# Store bridge — scoring an arm straight from its memory layer
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ClusteringStore(Protocol):
+    """A memory store that can report how it merged the claims it ingested.
+
+    Every arm implements this: Arm A returns singletons (it merges nothing),
+    Arm B groups by normalised body, Arm C by ``(claim_id, content_hash)``.
+    """
+
+    @property
+    def clusters(self) -> list[list[str]]: ...
+
+
+def labeled_pairs_from_groups(
+    groups: Iterable[Iterable[Hashable]],
+) -> set[frozenset]:
+    """Ground-truth duplicate *groups* → the labeled pair set ``T``.
+
+    Ground truth is naturally authored as "these ids are all the same fact";
+    scoring needs pairs. This is the same expansion :func:`cluster_pairs` applies
+    to an arm's predictions, named for the ground-truth side so a caller cannot
+    mix up which argument is which.
+    """
+    return cluster_pairs(groups)
+
+
+def score_store(
+    labeled_pairs: Iterable[Iterable[Hashable]],
+    store: ClusteringStore,
+) -> DedupScore:
+    """Score one arm directly from its store, using the store's own clusters."""
+    return score_arm(labeled_pairs, store.clusters)
+
+
+def score_stores(
+    labeled_pairs: Iterable[Iterable[Hashable]],
+    stores: Mapping[str, ClusteringStore],
+) -> dict[str, DedupScore]:
+    """Score every arm against one shared ground truth.
+
+    Returns ``{arm label: DedupScore}``. The labeled pairs are materialised once
+    and reused, so every arm is judged against a byte-identical ground truth —
+    the comparison M2's two-armed gate depends on.
+    """
+    labeled = _normalize_pairs(labeled_pairs)
+    return {arm: score_store(labeled, store) for arm, store in stores.items()}
