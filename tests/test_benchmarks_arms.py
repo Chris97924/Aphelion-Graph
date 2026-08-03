@@ -22,14 +22,28 @@ from benchmarks.longmemeval.pipeline import (
     ArmResult,
     Claim,
     MemoryStore,
+    ModelPin,
+    PipelineConfig,
     QAItem,
     Session,
+    StageBinding,
     default_answerer,
     default_extractor,
     default_judge,
     run_arm,
+    score_blind,
 )
 from benchmarks.longmemeval.retriever import BM25Retriever, tokenize
+
+_PIN = ModelPin(model="stub-model", endpoint="stub://local", temperature=0.0, seed=1)
+
+# A pinned config so a run is recordable; the stage callables are supplied
+# per-test through ``answerer=`` / ``judge=``.
+_CONFIG = PipelineConfig(
+    extractor=StageBinding(pin=_PIN, call=lambda session, *, pin: []),
+    answering=StageBinding(pin=_PIN, call=lambda question, claims, *, pin: ""),
+    judge=StageBinding(pin=_PIN, call=lambda *args, **kwargs: True),
+)
 
 
 def _claim(cid: str, text: str) -> Claim:
@@ -226,11 +240,18 @@ def test_run_arm_is_arm_agnostic_and_deterministic() -> None:
     plain = PlainStore(retriever, extractor=extractor)
     dedup = NaiveDedupStore(retriever, extractor=extractor)
 
+    # Both arms answer first; scoring is one blind cross-arm pass afterwards.
     plain_result = run_arm(
-        plain, retriever, sessions, questions, answerer=answerer, judge=judge
+        plain, retriever, sessions, questions, config=_CONFIG, answerer=answerer
     )
     dedup_result = run_arm(
-        dedup, retriever, sessions, questions, answerer=answerer, judge=judge
+        dedup, retriever, sessions, questions, config=_CONFIG, answerer=answerer
+    )
+    scored = score_blind(
+        {"A": plain_result, "B": dedup_result},
+        questions,
+        config=_CONFIG,
+        judge=judge,
     )
 
     # Same shared retriever/params recorded for both arms.
@@ -239,8 +260,8 @@ def test_run_arm_is_arm_agnostic_and_deterministic() -> None:
 
     # Both arms answer correctly; the memory layer is the only difference —
     # Arm A stored the duplicate, Arm B collapsed it.
-    assert plain_result.correct == [True]
-    assert dedup_result.correct == [True]
+    assert scored["A"].correct == [True]
+    assert scored["B"].correct == [True]
     assert len(plain.claims) == 3
     assert len(dedup.claims) == 2
     assert isinstance(plain_result, ArmResult)
@@ -252,4 +273,4 @@ def test_run_arm_with_default_hooks_hits_the_deferred_seam() -> None:
     retriever = BM25Retriever()
     store = PlainStore(retriever)
     with pytest.raises(NotImplementedError):
-        run_arm(store, retriever, [Session(id="s", text="x")], [])
+        run_arm(store, retriever, [Session(id="s", text="x")], [], config=_CONFIG)

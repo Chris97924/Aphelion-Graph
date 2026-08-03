@@ -17,6 +17,7 @@ Covers the S1 acceptance contract outside Arm C itself (which has its own file):
 from __future__ import annotations
 
 import http.client
+import itertools
 import json
 import socket
 import urllib.request
@@ -31,21 +32,28 @@ from benchmarks.longmemeval.arms.naive_dedup import NaiveDedupStore
 from benchmarks.longmemeval.arms.plain import PlainStore
 from benchmarks.longmemeval.metrics import m2_dedup, m3_contamination, m5_roundtrip
 from benchmarks.longmemeval.pipeline import (
+    ArmResult,
     Claim,
     JudgeVerdictError,
     ModelPin,
+    PinMismatchError,
     PipelineConfig,
     QAItem,
     Session,
     StageBinding,
     UnpinnedStageError,
+    UnrecordedPinsError,
+    UnscoredArmError,
+    blind_batch_order,
     build_answerer,
     build_extractor,
     build_judge,
     default_answerer,
     default_extractor,
     default_judge,
+    pinned_seed,
     run_arm,
+    score_blind,
 )
 from benchmarks.longmemeval.retriever import BM25Retriever
 
@@ -60,6 +68,30 @@ requires_oracle = pytest.mark.skipif(
 )
 
 _PIN = ModelPin(model="stub-model", endpoint="stub://local", temperature=0.0, seed=1)
+
+# A fully pinned config whose stage calls are inert. Tests below inject the
+# behaviour they need through ``answerer=`` / ``judge=`` and use the config only
+# for the pin record every run is required to carry.
+_STUB_CONFIG = PipelineConfig(
+    extractor=StageBinding(pin=_PIN, call=lambda session, *, pin: []),
+    answering=StageBinding(pin=_PIN, call=lambda question, claims, *, pin: ""),
+    judge=StageBinding(pin=_PIN, call=lambda *args, **kwargs: True),
+)
+
+# The arms the blind-scoring tests pool into one judge batch.
+_ARMS: tuple[str, ...] = ("A", "B", "C")
+
+
+def _echo_answerer(question: str, claims) -> str:
+    return claims[0].text if claims else ""
+
+
+def _unscored(arm: str, num_questions: int) -> ArmResult:
+    """One arm's answers, each naming its own arm so a transcript is attributable."""
+    return ArmResult(
+        predictions=[f"{arm}{index}" for index in range(num_questions)],
+        pins=_STUB_CONFIG.pins_record(),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +186,7 @@ def test_judge_receives_the_question_with_the_gold_and_candidate() -> None:
 
 
 @pytest.mark.unit
-def test_run_arm_forwards_each_question_to_the_judge() -> None:
+def test_blind_scoring_forwards_each_question_to_the_judge() -> None:
     """The question reaching the judge must be the item's own question."""
     judged: list[tuple[str, str, str]] = []
 
@@ -165,17 +197,19 @@ def test_run_arm_forwards_each_question_to_the_judge() -> None:
     store = PlainStore(
         BM25Retriever(), extractor=lambda s: [Claim(id=s.id, text=s.text)]
     )
-    result = run_arm(
+    questions = [QAItem(question="what was my 5K PB?", gold="22:00")]
+    produced = run_arm(
         store,
         BM25Retriever(),
         [Session(id="s1", text="22:00")],
-        [QAItem(question="what was my 5K PB?", gold="22:00")],
-        answerer=lambda question, claims: claims[0].text if claims else "",
-        judge=judge,
+        questions,
+        config=_STUB_CONFIG,
+        answerer=_echo_answerer,
     )
+    scored = score_blind({"A": produced}, questions, config=_STUB_CONFIG, judge=judge)
 
     assert judged == [("what was my 5K PB?", "22:00", "22:00")]
-    assert result.correct == [True]
+    assert scored["A"].correct == [True]
 
 
 @pytest.mark.unit
@@ -208,6 +242,240 @@ def test_boolean_judge_verdicts_pass_through_unchanged() -> None:
             PipelineConfig(judge=StageBinding(pin=_PIN, call=lambda *a, **k: verdict))
         )
         assert bound("q", "gold", "candidate") is verdict
+
+
+# --------------------------------------------------------------------------- #
+# Blind scoring — ONE pinned-shuffled cross-arm batch (design doc §6.1 guard 1) #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+def test_run_arm_produces_answers_and_does_not_judge() -> None:
+    """Answer production is separate from scoring.
+
+    Judging inside ``run_arm`` handed the judge one arm's answers as a
+    contiguous batch, which leaks the arm through ordering even with no label
+    attached (design doc §6.1 guard 1). Scoring therefore happens once, across
+    every arm, in :func:`score_blind`.
+    """
+    store = PlainStore(
+        BM25Retriever(), extractor=lambda s: [Claim(id=s.id, text=s.text)]
+    )
+    result = run_arm(
+        store,
+        BM25Retriever(),
+        [Session(id="s1", text="22:00")],
+        [QAItem(question="what was my 5K PB?", gold="22:00")],
+        config=_STUB_CONFIG,
+        answerer=_echo_answerer,
+    )
+
+    assert result.predictions == ["22:00"]
+    assert result.correct is None
+    assert result.scored is False
+    # An unscored arm has no accuracy — returning 0.0 would read as "got them
+    # all wrong" rather than "was never judged".
+    with pytest.raises(UnscoredArmError):
+        _ = result.accuracy
+
+
+@pytest.mark.unit
+def test_the_judge_batch_interleaves_the_arms_and_is_deterministic() -> None:
+    """The judge must never see one arm as a contiguous run of candidates.
+
+    Inline per-arm judging produced ``AAAA BBBB CCCC``; position alone would then
+    tell the judge which arm it is scoring, which is exactly what guard 1 forbids.
+    The replacement order is a shuffle seeded from the pre-registration, so it is
+    both non-arm-ordered and reproducible.
+    """
+    questions = [QAItem(question=f"q{i}", gold=f"g{i}") for i in range(6)]
+
+    def transcript() -> list[str]:
+        seen: list[str] = []
+
+        def judge(question: str, gold: str, candidate_answer: str) -> bool:
+            seen.append(candidate_answer)
+            return True
+
+        score_blind(
+            {arm: _unscored(arm, len(questions)) for arm in _ARMS},
+            questions,
+            config=_STUB_CONFIG,
+            judge=judge,
+        )
+        return seen
+
+    first, second = transcript(), transcript()
+
+    assert first == second, "the pinned seed must make the batch order reproducible"
+    assert sorted(first) == sorted(
+        f"{arm}{index}" for arm in _ARMS for index in range(len(questions))
+    ), "every arm's every answer must be scored exactly once"
+
+    arms_in_order = [candidate[0] for candidate in first]
+    # ``sorted`` is precisely the buggy grouping: all of A, then all of B, then C.
+    assert arms_in_order != sorted(arms_in_order)
+    longest_run = max(len(list(group)) for _, group in itertools.groupby(arms_in_order))
+    assert longest_run < len(questions)
+
+
+@pytest.mark.unit
+def test_the_judge_batch_maps_every_verdict_back_to_its_own_arm() -> None:
+    """Shuffling must not scramble attribution: each verdict lands on its arm."""
+    questions = [QAItem(question=f"q{i}", gold=f"g{i}") for i in range(4)]
+
+    # An arbitrary verdict pattern no ordering could reproduce by accident.
+    def judge(question: str, gold: str, candidate_answer: str) -> bool:
+        return candidate_answer.startswith("B") or candidate_answer == "C2"
+
+    scored = score_blind(
+        {arm: _unscored(arm, len(questions)) for arm in _ARMS},
+        questions,
+        config=_STUB_CONFIG,
+        judge=judge,
+    )
+
+    assert scored["A"].correct == [False, False, False, False]
+    assert scored["B"].correct == [True, True, True, True]
+    assert scored["C"].correct == [False, False, True, False]
+    assert scored["B"].accuracy == 1.0
+    assert scored["C"].accuracy == 0.25
+
+
+@pytest.mark.unit
+def test_the_judge_never_receives_an_arm_label() -> None:
+    """Guard 1's de-identification: the payload is ``(question, gold, candidate)``."""
+    questions = [QAItem(question="q0", gold="g0")]
+    payloads: list[tuple] = []
+
+    def judge(*args, **kwargs) -> bool:
+        payloads.append((args, kwargs))
+        return True
+
+    score_blind(
+        {arm: _unscored(arm, 1) for arm in _ARMS},
+        questions,
+        config=_STUB_CONFIG,
+        judge=judge,
+    )
+
+    assert len(payloads) == len(_ARMS)
+    for args, kwargs in payloads:
+        assert kwargs == {}
+        assert len(args) == 3
+        assert args[0] == "q0" and args[1] == "g0"
+
+
+@pytest.mark.unit
+def test_the_batch_order_is_a_pure_function_of_seed_arms_and_length() -> None:
+    """Arm iteration order must not change the batch — the base order is sorted."""
+    assert blind_batch_order(["C", "A", "B"], 3, seed=7) == blind_batch_order(
+        ["A", "B", "C"], 3, seed=7
+    )
+    assert blind_batch_order(["A", "B"], 4, seed=1) != blind_batch_order(
+        ["A", "B"], 4, seed=2
+    )
+
+
+@pytest.mark.unit
+def test_the_shuffle_seed_is_read_from_the_preregistration(tmp_path: Path) -> None:
+    """The seed is loaded from ``preregister.json`` at run time, never re-hardcoded."""
+    recorded = json.loads(
+        (_BENCH_ROOT / "preregister.json").read_text(encoding="utf-8")
+    )["seed"]
+    assert pinned_seed() == recorded
+
+    # Reading a different pre-registration yields its seed — proof the value
+    # comes off disk rather than out of a constant in the harness.
+    alternate = tmp_path / "preregister.json"
+    alternate.write_text(json.dumps({"seed": 1}), encoding="utf-8")
+    assert pinned_seed(alternate) == 1
+
+
+# --------------------------------------------------------------------------- #
+# F-5 — every result carries the model pin record it was produced under        #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+def test_run_arm_records_the_pins_it_ran_under() -> None:
+    """Two runs under different model snapshots must not be indistinguishable."""
+    store = PlainStore(
+        BM25Retriever(), extractor=lambda s: [Claim(id=s.id, text=s.text)]
+    )
+    result = run_arm(
+        store,
+        BM25Retriever(),
+        [Session(id="s1", text="22:00")],
+        [QAItem(question="q", gold="22:00")],
+        config=_STUB_CONFIG,
+        answerer=_echo_answerer,
+    )
+
+    assert result.pins == _STUB_CONFIG.pins_record()
+    assert result.pins["answering"] == {
+        "model": "stub-model",
+        "endpoint": "stub://local",
+        "temperature": 0.0,
+        "seed": 1,
+    }
+
+
+@pytest.mark.unit
+def test_run_arm_refuses_a_run_with_no_recorded_pins() -> None:
+    """An unpinned result cannot be audited against ``preregister.json``."""
+    store = PlainStore(
+        BM25Retriever(), extractor=lambda s: [Claim(id=s.id, text=s.text)]
+    )
+    with pytest.raises(UnrecordedPinsError) as excinfo:
+        run_arm(
+            store,
+            BM25Retriever(),
+            [Session(id="s1", text="22:00")],
+            [QAItem(question="q", gold="22:00")],
+            config=PipelineConfig(),
+            answerer=_echo_answerer,
+        )
+    assert "preregister.json" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_scoring_refuses_arms_produced_under_different_pins() -> None:
+    """``preregister.json`` model_fairness_constraint: identical models across arms.
+
+    An A/B/C comparison whose arms ran against different model snapshots,
+    endpoints, temperatures or seeds is not measuring the memory layer.
+    """
+    other_pin = ModelPin(
+        model="stub-model", endpoint="stub://local", temperature=0.7, seed=1
+    )
+    other = PipelineConfig(
+        answering=StageBinding(pin=other_pin, call=lambda q, c, *, pin: "")
+    )
+    questions = [QAItem(question="q0", gold="g0")]
+
+    results = {arm: _unscored(arm, 1) for arm in _ARMS}
+    results["C"] = ArmResult(predictions=["C0"], pins=other.pins_record())
+
+    with pytest.raises(PinMismatchError) as excinfo:
+        score_blind(results, questions, config=_STUB_CONFIG, judge=lambda *a: True)
+    assert "C" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_scoring_refuses_results_with_no_pin_record() -> None:
+    questions = [QAItem(question="q0", gold="g0")]
+    results = {"A": ArmResult(predictions=["A0"], pins={})}
+    with pytest.raises(UnrecordedPinsError):
+        score_blind(results, questions, config=_STUB_CONFIG, judge=lambda *a: True)
+
+
+@pytest.mark.unit
+def test_scoring_refuses_an_arm_that_answered_a_different_question_count() -> None:
+    questions = [QAItem(question=f"q{i}", gold=f"g{i}") for i in range(3)]
+    results = {"A": _unscored("A", 3), "B": _unscored("B", 2)}
+    with pytest.raises(ValueError, match="B"):
+        score_blind(results, questions, config=_STUB_CONFIG, judge=lambda *a: True)
 
 
 @pytest.mark.unit
@@ -470,6 +738,56 @@ def test_3arm_smoke_emits_all_arms_and_a_metrics_row(tmp_path: Path) -> None:
     # The smoke's own numbers must carry their caveats.
     assert "not an M2 result" in metrics["m2_caveat"]
     assert "not an M3 result" in metrics["m3_caveat"]
+
+
+@requires_oracle
+@pytest.mark.integration
+def test_3arm_smoke_rows_carry_the_pin_record_they_ran_under(tmp_path: Path) -> None:
+    """Every emitted result is auditable: which models, at which settings (F-5)."""
+    rows = run_mod.run_3arm_smoke(tmp_path / "out.jsonl", data_directory=_DATA_DIR)
+    arm_rows = [row for row in rows if row["kind"] == "arm_question"]
+    recorded_seed = json.loads(
+        (_BENCH_ROOT / "preregister.json").read_text(encoding="utf-8")
+    )["seed"]
+
+    assert arm_rows
+    for row in arm_rows:
+        assert set(row["pins"]) == {"extractor", "answering", "judge"}
+        for stage in row["pins"].values():
+            assert stage["seed"] == recorded_seed
+            assert stage["temperature"] == 0.0
+
+    # Cross-arm fairness: one identical pin record behind all three arms.
+    assert len({json.dumps(row["pins"], sort_keys=True) for row in arm_rows}) == 1
+
+
+@requires_oracle
+@pytest.mark.integration
+def test_3arm_smoke_judges_one_blind_cross_arm_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The smoke binds judging through the blind phase, not per arm (F-4)."""
+    seen: list[str] = []
+    real_judge = run_mod.stub_judge
+
+    def recording_judge(question: str, gold: str, candidate_answer: str) -> bool:
+        seen.append(question)
+        return real_judge(question, gold, candidate_answer)
+
+    monkeypatch.setattr(run_mod, "stub_judge", recording_judge)
+    run_mod.run_3arm_smoke(tmp_path / "out.jsonl", data_directory=_DATA_DIR)
+
+    records = run_mod.load_pinned_ku_questions(_DATA_DIR)
+    order = blind_batch_order(list(ARM_STORES), len(records), seed=pinned_seed())
+    expected = [records[slot.question_index]["question"] for slot in order]
+
+    assert len(seen) == len(records) * len(ARM_STORES)
+    assert seen == expected, "the smoke must judge through the pinned blind order"
+
+    # That order is not the one inline per-arm judging produced, where a
+    # question's three arms arrived back to back.
+    inline = [record["question"] for record in records for _ in ARM_STORES]
+    assert expected != inline
 
 
 @requires_oracle

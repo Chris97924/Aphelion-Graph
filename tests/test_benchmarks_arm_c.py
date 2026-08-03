@@ -27,8 +27,9 @@ import pytest
 
 from aphelion.content_hash import EXCLUDED_KEYS, IDENTITY_FIELDS
 from aphelion.error_codes import ErrorCode
-from aphelion.errors import SemanticError
+from aphelion.errors import SchemaError, SemanticError
 from aphelion.read_adapter import ConflictClass
+from aphelion.v03_validator import R4_TRIGGER_FIELDS
 
 from benchmarks.longmemeval.arms.aphelion_arm import (
     SUPPRESSED_STATES,
@@ -343,6 +344,75 @@ def test_r2_valid_time_filters_an_expired_claim() -> None:
     store = _store()
     store.add_claims([_claim("L1", record_id="r1", valid_until="2026-01-01T00:00:00Z")])
     assert store.retrieve("5K personal best") == []
+
+
+# ---------------------------------------------------------------------------
+# Spec §6.5 — R4 metadata with no subject must fail, never surface
+# ---------------------------------------------------------------------------
+
+# One representative value per normative R4-trigger field (spec §6.5). The set is
+# asserted against the package's own list below, so a spec change cannot leave
+# this parametrisation quietly testing the wrong fields.
+R4_TRIGGER_VALUES: tuple[tuple[str, object], ...] = (
+    ("polarity", "affirm"),
+    ("valid_from", "2026-01-01T00:00:00Z"),
+    ("valid_until", "2026-09-01T00:00:00Z"),
+    ("supersedes", ["L-old"]),
+)
+
+
+def _subjectless(claim_id: str, **extra) -> object:
+    """A claim carrying every base field except ``subject``."""
+    fields = {key: value for key, value in BASE_FIELDS.items() if key != "subject"}
+    return claim_from_frontmatter(
+        {**fields, "claim_id": claim_id, **extra}, "5K PB 22:00"
+    )
+
+
+def test_r4_trigger_values_cover_the_packages_normative_list() -> None:
+    assert {field for field, _ in R4_TRIGGER_VALUES} == set(R4_TRIGGER_FIELDS)
+
+
+@pytest.mark.parametrize("field,value", R4_TRIGGER_VALUES)
+def test_r4_metadata_without_a_subject_raises_px_e_4144(
+    field: str, value: object
+) -> None:
+    """spec §6.5 D1.5: an R4-trigger field with no ``subject`` is a hard failure.
+
+    Arm C groups by subject before calling the adapter, so a subject-less claim
+    never reaches the adapter's step-0 re-check. Surfacing it unchanged would
+    make the update metadata silently inert — the stale claim and the current one
+    both stay retrievable, corrupting M1 and M3.
+    """
+    store = _store()
+    store.add_claims([_subjectless("L1", **{field: value})])
+
+    with pytest.raises(SchemaError) as excinfo:
+        store.retrieve("5K personal best")
+
+    assert excinfo.value.code is ErrorCode.CLAIM_SUBJECT_REQUIRED_FOR_CONFLICT
+    assert excinfo.value.code.value == "PX_E_4144"
+    assert field in str(excinfo.value)
+
+
+def test_a_subjectless_claim_with_no_r4_fields_still_surfaces() -> None:
+    """R4 is subject-scoped: opting out of R4 entirely stays legal (spec §6.5)."""
+    store = _store()
+    store.add_claims([_subjectless("L1")])
+    assert [claim.id for claim in store.retrieve("5K personal best")] == ["L1"]
+
+
+def test_confidence_without_a_subject_is_not_an_r4_trigger() -> None:
+    """spec §6.5 backward-compat carve-out: ``confidence`` never triggers PX_E_4144.
+
+    Including it would have made every existing v0.4 claim that carries
+    ``confidence`` without ``subject`` a validation error — breaking, not
+    additive.
+    """
+    assert "confidence" not in R4_TRIGGER_FIELDS
+    store = _store()
+    store.add_claims([_subjectless("L1", confidence=0.850)])
+    assert [claim.id for claim in store.retrieve("5K personal best")] == ["L1"]
 
 
 # ---------------------------------------------------------------------------

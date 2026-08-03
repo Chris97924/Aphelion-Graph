@@ -40,8 +40,9 @@ from typing import Any, Iterable, Mapping
 
 from aphelion.content_hash import compute_content_hash
 from aphelion.error_codes import ErrorCode
-from aphelion.errors import SemanticError
+from aphelion.errors import SchemaError, SemanticError
 from aphelion.read_adapter import AphelionReadAdapter, ConflictClass, QueryResult
+from aphelion.v03_validator import validate_subject_required_for_r4
 
 from benchmarks.longmemeval.pipeline import (
     Claim,
@@ -181,6 +182,27 @@ def _require_reconcilable(retained: Claim, incoming: Claim) -> None:
     )
 
 
+def _require_subject_for_r4(claim: Claim) -> None:
+    """Reject R4 metadata with no ``subject`` — ``spec/v0.3-claim-semantics.md`` §6.5.
+
+    Delegates to the package's own validator so the R4-trigger list
+    (``polarity`` / ``valid_from`` / ``valid_until`` / ``supersedes``, with
+    ``confidence`` excluded by the backward-compat carve-out) and the PX_E_4144
+    code come from the spec implementation rather than a copy living here.
+
+    Failing loud is the point. R4 groups by subject, so an extraction that emits
+    update metadata without one has no grouping key: the conflict is undetectable,
+    the update goes silently inert, and the stale claim keeps surfacing alongside
+    the current one — corrupting M1 and M3 with what looks like a normal result.
+    The raise is re-issued carrying the harness record id so the offending claim
+    is named; the code and message stay the validator's.
+    """
+    try:
+        validate_subject_required_for_r4(frontmatter(claim))
+    except SchemaError as error:
+        raise SchemaError(code=error.code, msg=error.msg, path=claim.id) from error
+
+
 class AphelionStore:
     """Arm C — content_hash coalescing + event SM suppression + R4 resolution."""
 
@@ -286,14 +308,19 @@ class AphelionStore:
     def _r4_surfaced_ids(self, active: list[Claim]) -> set[str]:
         """The ``claim_id``s R4 surfaces, across every subject group.
 
-        Claims with no ``subject`` carry no R4 machinery (R4 is subject-scoped by
-        spec), so they surface unchanged rather than being silently dropped.
+        A claim with no ``subject`` opts out of R4 entirely (R4 is subject-scoped
+        by spec) and surfaces unchanged rather than being silently dropped — but
+        only if it carries no R4 field at all. Carrying one *and* omitting
+        ``subject`` is ``spec/v0.3-claim-semantics.md`` §6.5's PX_E_4144, checked
+        here via :func:`_require_subject_for_r4`: this branch is the one path
+        that never reaches the adapter, so its step-0 re-check cannot catch it.
         """
         surfaced: set[str] = set()
         groups: dict[str, list[Claim]] = {}
         for claim in active:
             subject = claim.metadata.get("subject")
             if not isinstance(subject, str) or not subject:
+                _require_subject_for_r4(claim)
                 surfaced.add(lineage_id(claim))
                 continue
             groups.setdefault(subject, []).append(claim)

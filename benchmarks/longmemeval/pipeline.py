@@ -11,7 +11,11 @@ Because only the memory layer differs:
 * :class:`Session` and :class:`Claim` are the shared data records.
 * :class:`MemoryStore` is the structural contract each arm implements
   (see ``benchmarks.longmemeval.arms.plain`` / ``.naive_dedup``).
-* :func:`run_arm` is the arm-agnostic evaluation loop.
+* :func:`run_arm` is the arm-agnostic *answer-production* loop, and
+  :func:`score_blind` is the separate scoring phase that judges every arm at
+  once. Evaluation is split in two because design doc §6.1 guard 1 requires the
+  judge to see one shuffled, de-identified batch: judging inline, arm by arm,
+  hands it three arm-correlated runs and lets the arm leak through ordering.
 
 The extractor / answerer / judge stages are the three model-backed stages. They
 are supplied through the :class:`PipelineConfig` injection surface below rather
@@ -25,8 +29,11 @@ Pure stdlib.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, Sequence, runtime_checkable
+import json
+import random
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +128,42 @@ class Judge(Protocol):
 # The three model-backed stage names, in pipeline order.
 STAGE_NAMES: tuple[str, ...] = ("extractor", "answering", "judge")
 
+# The pre-registration sits next to this module. Pinned knobs are read from it at
+# call time rather than copied into this source, so the frozen value and the code
+# that consumes it cannot drift apart (design doc §5.2, §6.1 guard 2).
+PREREGISTER_PATH = Path(__file__).resolve().parent / "preregister.json"
+
+
+def preregistered(key: str, path: Path = PREREGISTER_PATH) -> Any:
+    """Return one pinned value from ``preregister.json``.
+
+    Raises :class:`KeyError` rather than defaulting: a knob the pre-registration
+    does not carry is a maintainer decision this harness may not invent.
+    """
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if key not in record:
+        raise KeyError(
+            f"{path} carries no pinned {key!r}. The pre-registration is the only "
+            "source for it and this harness will not default it."
+        )
+    return record[key]
+
+
+def pinned_seed(path: Path = PREREGISTER_PATH) -> int:
+    """The pre-registered seed — the only seed this harness may draw from.
+
+    Design doc §6.1 guard 2 pins one seed for the whole benchmark; the blind
+    scoring shuffle uses it so the batch order is reproducible and auditable
+    against the pre-registration instead of against a constant in this file.
+    """
+    seed = preregistered("seed", path)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            f"the pinned seed must be an int; {path} carries "
+            f"{type(seed).__name__} ({seed!r})"
+        )
+    return seed
+
 
 class JudgeVerdictError(TypeError):
     """A judge binding returned something that is not a ``bool``.
@@ -140,6 +183,35 @@ class UnpinnedStageError(NotImplementedError):
     Subclasses :class:`NotImplementedError` because an unpinned stage genuinely
     has no implementation to run: the benchmark refuses to invent a model
     identity, so the stage stays unimplemented until a maintainer pins one.
+    """
+
+
+class UnrecordedPinsError(ValueError):
+    """A run would have produced results carrying no model pin record.
+
+    Two evaluations against different model snapshots, endpoints, temperatures
+    or seeds are otherwise indistinguishable once they are numbers in a results
+    file, and neither can be audited against ``preregister.json``. The harness
+    therefore refuses to start such a run rather than emit unattributable rows.
+    """
+
+
+class PinMismatchError(ValueError):
+    """Two arms were produced under different model pins.
+
+    ``preregister.json``'s ``model_fairness_constraint`` requires the answering
+    model, the extractor model and the retriever to be identical across arms
+    A/B/C — the memory layer is the only independent variable. Arms that ran
+    against different pins are not a measurement of the memory layer, so scoring
+    them against each other is refused instead of silently reported.
+    """
+
+
+class UnscoredArmError(ValueError):
+    """An arm's accuracy was read before the blind scoring phase ran.
+
+    Returning ``0.0`` would read as "got every question wrong" rather than "was
+    never judged", so the unscored state is an error, not a value.
     """
 
 
@@ -321,19 +393,48 @@ def default_judge(question: str, gold: str, candidate_answer: str) -> bool:
 
 @dataclass
 class ArmResult:
-    """Outcome of running one arm over a question set."""
+    """One arm's answers, plus the verdicts once the blind phase has scored them.
+
+    ``correct`` is ``None`` until :func:`score_blind` runs. Answer production and
+    scoring are deliberately separate phases: a judge that sees one arm's answers
+    as a contiguous batch can read the arm off the ordering alone, which design
+    doc §6.1 guard 1 forbids.
+
+    ``pins`` is the :meth:`PipelineConfig.pins_record` the answers were produced
+    under — which models, at which endpoints, temperatures and seeds. Without it
+    two runs against different model snapshots yield indistinguishable results
+    and nothing can be audited against ``preregister.json``.
+    """
 
     predictions: list[str]
-    correct: list[bool]
+    pins: dict[str, Any]
+    correct: list[bool] | None = None
     retriever_params: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def scored(self) -> bool:
+        """True once the blind scoring phase has attached verdicts."""
+        return self.correct is not None
+
+    @property
     def num_questions(self) -> int:
-        return len(self.correct)
+        return len(self.predictions)
+
+    @property
+    def verdicts(self) -> list[bool]:
+        """The per-question verdicts; raises while the arm is still unscored."""
+        if self.correct is None:
+            raise UnscoredArmError(
+                "this arm has not been judged yet. Answers are produced by "
+                "run_arm and scored afterwards by score_blind, which judges every "
+                "arm in one shuffled batch (design doc §6.1)."
+            )
+        return self.correct
 
     @property
     def accuracy(self) -> float:
-        return sum(self.correct) / len(self.correct) if self.correct else 0.0
+        marks = self.verdicts
+        return sum(marks) / len(marks) if marks else 0.0
 
 
 def run_arm(
@@ -342,34 +443,178 @@ def run_arm(
     sessions: Sequence[Session],
     questions: Sequence[QAItem],
     *,
-    answerer: Answerer = default_answerer,
-    judge: Judge = default_judge,
+    config: PipelineConfig,
+    answerer: Answerer | None = None,
     top_k: int = 10,
 ) -> ArmResult:
-    """Run one arm end-to-end; the memory layer is the only thing that varies.
+    """Produce one arm's answers; the memory layer is the only thing that varies.
 
     ``store`` is ingested, then every question is answered from its top-``k``
-    retrieved claims and scored. ``retriever`` is the shared ranking engine the
-    store was built with; it is passed explicitly so its parameters are recorded
-    on the result (documenting that one instance serves every arm) and so a
-    future re-ranking stage can reuse it.
+    retrieved claims. ``retriever`` is the shared ranking engine the store was
+    built with; it is passed explicitly so its parameters are recorded on the
+    result (documenting that one instance serves every arm) and so a future
+    re-ranking stage can reuse it.
 
-    ``answerer`` and ``judge`` default to the unpinned resolvers and therefore
-    raise :class:`UnpinnedStageError`; pass ones built from a pinned
-    :class:`PipelineConfig` (:func:`build_answerer` / :func:`build_judge`), or
-    deterministic offline stages for a smoke run. The ingest + retrieval
-    plumbing exercised here is fully implemented.
+    This function deliberately does **not** judge. Scoring every arm is a single
+    later phase (:func:`score_blind`) so the judge receives one shuffled,
+    de-identified batch rather than three arm-correlated ones.
+
+    ``config`` supplies both the answering stage and the pin record stamped onto
+    the result, and a config that pins nothing raises
+    :class:`UnrecordedPinsError` before the run starts. ``answerer`` overrides
+    only the *callable*, for a deterministic offline stage; the record still
+    describes ``config``, so overriding it with a different model would make the
+    result claim a model it did not run.
     """
+    pins = config.pins_record()
+    if not pins:
+        raise UnrecordedPinsError(
+            "this run would record no model pins, so its results could not be "
+            "attributed to any model or audited against "
+            "benchmarks/longmemeval/preregister.json. Pass a PipelineConfig with "
+            "at least one StageBinding(pin=ModelPin(...), call=<your client>)."
+        )
+
+    answer = answerer if answerer is not None else build_answerer(config)
     store.ingest(list(sessions))
-    predictions: list[str] = []
-    correct: list[bool] = []
-    for item in questions:
-        retrieved = store.retrieve(item.question)[:top_k]
-        predicted = answerer(item.question, retrieved)
-        predictions.append(predicted)
-        correct.append(judge(item.question, item.gold, predicted))
+    predictions = [
+        answer(item.question, store.retrieve(item.question)[:top_k])
+        for item in questions
+    ]
     return ArmResult(
         predictions=predictions,
-        correct=correct,
+        pins=pins,
         retriever_params=dict(getattr(retriever, "params", {})),
     )
+
+
+# ---------------------------------------------------------------------------
+# Blind scoring — one shuffled, de-identified batch across every arm
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BlindSlot:
+    """One candidate answer's place in the blind batch.
+
+    The slot is the harness's *private* bookkeeping: it names the arm so verdicts
+    can be routed home afterwards, and it never travels to the judge, which only
+    ever sees ``(question, gold, candidate_answer)``.
+    """
+
+    arm: str
+    question_index: int
+
+
+def blind_batch_order(
+    arms: Sequence[str], num_questions: int, *, seed: int
+) -> list[BlindSlot]:
+    """Every ``(arm, question)`` candidate, shuffled under the pinned ``seed``.
+
+    Design doc §6.1 guard 1 requires candidates from A/B/C to be shuffled before
+    scoring: an arm leaks through position even when no label is attached, so a
+    judge fed all of A, then all of B, then all of C could favour "the fancy one"
+    from ordering alone.
+
+    The pre-shuffle order is built from ``sorted(arms)``, so the result is a pure
+    function of the arm *set*, the question count and the seed — it cannot drift
+    with a caller's mapping iteration order.
+    """
+    slots = [
+        BlindSlot(arm=arm, question_index=index)
+        for arm in sorted(arms)
+        for index in range(num_questions)
+    ]
+    random.Random(seed).shuffle(slots)
+    return slots
+
+
+def score_blind(
+    results: Mapping[str, ArmResult],
+    questions: Sequence[QAItem],
+    *,
+    config: PipelineConfig,
+    judge: Judge | None = None,
+    seed: int | None = None,
+) -> dict[str, ArmResult]:
+    """Score every arm's answers in ONE pinned-shuffled, de-identified batch.
+
+    This is the second half of the two-phase protocol design doc §6.1 guard 1
+    mandates. Every arm's answers are collected first (:func:`run_arm`), then
+    pooled and shuffled with :func:`blind_batch_order` before a single pass over
+    the judge; verdicts are routed back to their own arm afterwards. The judge
+    payload stays ``(question, gold, candidate_answer)`` — the arm is carried
+    only by the harness-side :class:`BlindSlot`.
+
+    Two fairness preconditions are enforced rather than assumed, because a breach
+    means the run is not measuring the memory layer:
+
+    * every arm must carry a pin record (:class:`UnrecordedPinsError`);
+    * it must be the *same* record the judge is pinned to
+      (:class:`PinMismatchError`), per ``preregister.json``'s
+      ``model_fairness_constraint``.
+
+    ``seed`` defaults to the pre-registered seed read from ``preregister.json``.
+    Returns new :class:`ArmResult`\\ s; the inputs are left unscored.
+    """
+    if not results:
+        raise ValueError("score_blind needs at least one arm's results to score")
+
+    expected_pins = config.pins_record()
+    if not expected_pins:
+        raise UnrecordedPinsError(
+            "the scoring config pins no model, so the verdicts could not be "
+            "attributed to a judge. Pass the PipelineConfig the run was produced "
+            "under (see benchmarks/longmemeval/preregister.json)."
+        )
+
+    for arm, result in sorted(results.items()):
+        if not result.pins:
+            raise UnrecordedPinsError(
+                f"arm {arm!r} carries no model pin record, so its answers cannot "
+                "be attributed to any model. Produce arm results through run_arm "
+                "with a pinned PipelineConfig."
+            )
+        if result.pins != expected_pins:
+            raise PinMismatchError(
+                f"arm {arm!r} was produced under a different model pin record "
+                f"({result.pins}) than the one scoring is pinned to "
+                f"({expected_pins}). preregister.json's "
+                "model_fairness_constraint requires identical models across arms "
+                "A/B/C — the memory layer is the only independent variable — so "
+                "these arms are not comparable."
+            )
+        if len(result.predictions) != len(questions):
+            raise ValueError(
+                f"arm {arm!r} answered {len(result.predictions)} questions but "
+                f"{len(questions)} were passed for scoring; every arm must answer "
+                "the same question set."
+            )
+
+    verdict_of = judge if judge is not None else build_judge(config)
+    order = blind_batch_order(
+        list(results),
+        len(questions),
+        seed=pinned_seed() if seed is None else seed,
+    )
+
+    # Keyed by question index rather than appended, because the batch is
+    # shuffled: a verdict's position in the batch says nothing about which
+    # question it answered. Verdicts are stored exactly as the judge returned
+    # them — coercing here would undo build_judge's strict-bool guard.
+    verdicts: dict[str, dict[int, bool]] = {arm: {} for arm in results}
+    for slot in order:
+        item = questions[slot.question_index]
+        candidate = results[slot.arm].predictions[slot.question_index]
+        verdicts[slot.arm][slot.question_index] = verdict_of(
+            item.question, item.gold, candidate
+        )
+
+    # Indexing every slot back out fails loudly if the batch missed one.
+    return {
+        arm: replace(
+            result,
+            correct=[verdicts[arm][index] for index in range(len(questions))],
+        )
+        for arm, result in results.items()
+    }

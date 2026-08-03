@@ -12,6 +12,13 @@ stages so nothing calls a model or the network:
 * **stub judge** — exact string match against the gold answer
   (:func:`stub_judge`).
 
+All three are injected as pinned stages (:func:`smoke_config`), so every emitted
+row records which stages produced it — stubs here, the ``preregister.json``
+models on the real run. Judging is not inline: each arm answers first, then
+:func:`~benchmarks.longmemeval.pipeline.score_blind` scores one shuffled,
+de-identified batch of every (arm, question) candidate, which is what design doc
+§6.1 guard 1 requires of blind scoring.
+
 The five questions are the first five ``knowledge-update`` ``question_id``\\ s in
 lexicographic order (:data:`SMOKE_KU_QUESTION_IDS`), pinned here and re-derived
 from the corpus at run time so a drift in the frozen corpus fails loudly rather
@@ -46,7 +53,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Callable, Sequence
 
 from benchmarks.longmemeval import corpus
 from benchmarks.longmemeval.arms import ARM_STORES
@@ -55,13 +62,22 @@ from benchmarks.longmemeval.arms.naive_dedup import NaiveDedupStore, normalize_b
 from benchmarks.longmemeval.arms.plain import PlainStore
 from benchmarks.longmemeval.metrics import m2_dedup, m3_contamination, m5_roundtrip
 from benchmarks.longmemeval.pipeline import (
+    ArmResult,
     Claim,
+    Extractor,
     MemoryStore,
+    ModelPin,
+    PipelineConfig,
     QAItem,
     Retriever,
     Session,
+    StageBinding,
+    build_extractor,
     default_extractor,
+    pinned_seed,
+    preregistered,
     run_arm,
+    score_blind,
 )
 from benchmarks.longmemeval.retriever import BM25Retriever
 
@@ -140,6 +156,51 @@ def stub_judge(question: str, gold: str, candidate_answer: str) -> bool:
     return candidate_answer == gold
 
 
+def _offline_binding(pin: ModelPin, stub: Callable[..., Any]) -> StageBinding:
+    """Bind a deterministic offline stub as a pinned pipeline stage.
+
+    The stub reaches no model, so it takes no ``pin`` and the wrapper drops it.
+    The pin still travels on the binding, which is what the run records.
+    """
+
+    def call(*args: Any, pin: ModelPin, **kwargs: Any) -> Any:
+        return stub(*args, **kwargs)
+
+    return StageBinding(pin=pin, call=call)
+
+
+def smoke_pin() -> ModelPin:
+    """The offline stubs' own recorded identity.
+
+    The stubs are not models, so they carry their own name rather than borrowing
+    a pinned model's: a smoke row must never be mistakable for a real result. The
+    decoding knobs are read from ``preregister.json`` so the recorded settings
+    are the pre-registered ones rather than a second set of constants.
+    """
+    return ModelPin(
+        model="offline-stub",
+        endpoint="stub://offline",
+        temperature=float(preregistered("temperature")),
+        seed=pinned_seed(),
+    )
+
+
+def smoke_config(extractor: Extractor = stub_extractor) -> PipelineConfig:
+    """The three stub stages under one pin, so every smoke result is attributable.
+
+    ``extractor`` varies across the smokes — the 3-arm path binds a per-question
+    :class:`SharedLinker` — but the recorded identity does not, so every config
+    this returns yields the same :meth:`PipelineConfig.pins_record` and the
+    cross-arm fairness check in :func:`score_blind` sees one pin record.
+    """
+    pin = smoke_pin()
+    return PipelineConfig(
+        extractor=_offline_binding(pin, extractor),
+        answering=_offline_binding(pin, stub_answerer),
+        judge=_offline_binding(pin, stub_judge),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Corpus -> pipeline records
 # ---------------------------------------------------------------------------
@@ -215,43 +276,69 @@ def _evidence_sessions(record: dict) -> list[Session]:
 # ---------------------------------------------------------------------------
 
 
-def run_arm_smoke(
-    arm: str,
-    record: dict,
-    retriever: Retriever,
-) -> dict:
-    """Run one arm over one question end-to-end and return its result row.
+@dataclass
+class ArmAnswers:
+    """One arm's answers over the pinned question list, plus its per-question rows.
 
-    Ingests the question's evidence sessions through the arm's store (with the
-    stub extractor), answers from the top-``SMOKE_TOP_K`` retrieved claims via the
-    stub answerer, and scores with the exact-match judge. The returned row carries
-    the fields the results file is contracted to expose plus a couple of
-    deterministic diagnostics.
+    The rows are complete except for ``correct``, which only exists after the
+    blind cross-arm scoring phase has run.
     """
-    store: MemoryStore = SMOKE_ARM_STORES[arm](retriever, extractor=stub_extractor)
-    sessions = _evidence_sessions(record)
-    question = QAItem(question=record["question"], gold=record["answer"])
 
-    result = run_arm(
-        store,
-        retriever,
-        sessions,
-        [question],
-        answerer=stub_answerer,
-        judge=stub_judge,
-        top_k=SMOKE_TOP_K,
+    result: ArmResult
+    rows: list[dict]
+
+
+def answer_arm_smoke(
+    arm: str,
+    records: Sequence[dict],
+    retriever: Retriever,
+    config: PipelineConfig,
+) -> ArmAnswers:
+    """Produce one arm's answers for every pinned question — no scoring here.
+
+    Each question gets a fresh store, so its memory stays independent of the
+    others; the answers are pooled across questions because the judge scores all
+    arms in one shuffled batch afterwards (design doc §6.1 guard 1).
+    """
+    predictions: list[str] = []
+    rows: list[dict] = []
+    retriever_params: dict = {}
+
+    for record in records:
+        store: MemoryStore = SMOKE_ARM_STORES[arm](
+            retriever, extractor=build_extractor(config)
+        )
+        question = QAItem(question=record["question"], gold=record["answer"])
+        result = run_arm(
+            store,
+            retriever,
+            _evidence_sessions(record),
+            [question],
+            config=config,
+            top_k=SMOKE_TOP_K,
+        )
+        predictions.extend(result.predictions)
+        retriever_params = result.retriever_params
+        # Recompute the retrieved slice the answer came from (retrieval is
+        # stateless and deterministic, so this reproduces it exactly).
+        rows.append(
+            {
+                "question_id": record["question_id"],
+                "arm": arm,
+                "retrieved": len(store.retrieve(question.question)[:SMOKE_TOP_K]),
+                "num_claims": len(store.claims),
+                "pins": result.pins,
+            }
+        )
+
+    return ArmAnswers(
+        result=ArmResult(
+            predictions=predictions,
+            pins=config.pins_record(),
+            retriever_params=retriever_params,
+        ),
+        rows=rows,
     )
-    # Recompute the retrieved slice run_arm answered from (retrieval is stateless
-    # and deterministic, so this reproduces exactly what was scored).
-    retrieved = store.retrieve(question.question)[:SMOKE_TOP_K]
-
-    return {
-        "question_id": record["question_id"],
-        "arm": arm,
-        "retrieved": len(retrieved),
-        "num_claims": len(store.claims),
-        "correct": result.correct[0],
-    }
 
 
 def run_smoke(
@@ -260,18 +347,33 @@ def run_smoke(
 ) -> list[dict]:
     """Run arms A and B over the five pinned questions and write ``results.jsonl``.
 
-    Returns the emitted rows (one per question x arm, questions in pinned order,
-    arms in ``A, B`` order). One shared :class:`BM25Retriever` serves every arm,
-    documenting arm-invariance. The output is written deterministically so a rerun
-    is byte-identical.
+    Both arms answer first; the judge then scores one shuffled, de-identified
+    batch of every (arm, question) candidate. Returns the emitted rows (one per
+    question x arm, questions in pinned order, arms in ``A, B`` order). One shared
+    :class:`BM25Retriever` serves every arm, documenting arm-invariance. The
+    output is written deterministically so a rerun is byte-identical.
     """
     records = load_pinned_ku_questions(data_directory)
     retriever = BM25Retriever()
+    config = smoke_config()
+    questions = [QAItem(question=r["question"], gold=r["answer"]) for r in records]
+
+    answers = {
+        arm: answer_arm_smoke(arm, records, retriever, config)
+        for arm in SMOKE_ARM_STORES
+    }
+    scored = score_blind(
+        {arm: answer.result for arm, answer in answers.items()},
+        questions,
+        config=config,
+    )
 
     rows: list[dict] = []
-    for record in records:
+    for index in range(len(records)):
         for arm in SMOKE_ARM_STORES:
-            rows.append(run_arm_smoke(arm, record, retriever))
+            rows.append(
+                {**answers[arm].rows[index], "correct": scored[arm].verdicts[index]}
+            )
 
     _write_jsonl(out_path, rows)
     return rows
@@ -484,50 +586,56 @@ def _build_store(
 
 @dataclass
 class QuestionRun:
-    """One question's 3-arm outcome, plus the M2 inputs it contributed."""
+    """One question's 3-arm answers, plus the M2 inputs it contributed.
 
-    rows: list[dict]
+    ``rows`` and ``predictions`` are keyed by arm. No verdict is attached yet:
+    scoring is a single later pass over every arm's answers at once.
+    """
+
+    rows: dict[str, dict]
+    predictions: dict[str, str]
     duplicate_groups: list[list[str]]
     clusters: dict[str, list[list[str]]]
 
 
 def run_three_arm_question(record: dict, retriever: Retriever) -> QuestionRun:
-    """Run arms A, B and C over one question.
+    """Answer one question with arms A, B and C — scoring happens later, blind.
 
     A single :class:`SharedLinker` serves all three arms, so the extracted claims
     are byte-identical across them — the design's fairness constraint.
     """
     linker = SharedLinker(record["question_id"])
+    config = smoke_config(linker)
     sessions = _evidence_sessions(record)
     question = QAItem(question=record["question"], gold=record["answer"])
 
-    rows: list[dict] = []
+    rows: dict[str, dict] = {}
+    predictions: dict[str, str] = {}
     clusters: dict[str, list[list[str]]] = {}
     for arm in ARM_STORES:
-        store = _build_store(arm, retriever, linker)
+        store = _build_store(arm, retriever, build_extractor(config))
         result = run_arm(
             store,
             retriever,
             sessions,
             [question],
-            answerer=stub_answerer,
-            judge=stub_judge,
+            config=config,
             top_k=SMOKE_TOP_K,
         )
         clusters[arm] = store.clusters
-        rows.append(
-            {
-                "kind": "arm_question",
-                "question_id": record["question_id"],
-                "arm": arm,
-                "retrieved": len(store.retrieve(question.question)[:SMOKE_TOP_K]),
-                "num_claims": len(store.claims),
-                "correct": result.correct[0],
-            }
-        )
+        predictions[arm] = result.predictions[0]
+        rows[arm] = {
+            "kind": "arm_question",
+            "question_id": record["question_id"],
+            "arm": arm,
+            "retrieved": len(store.retrieve(question.question)[:SMOKE_TOP_K]),
+            "num_claims": len(store.claims),
+            "pins": result.pins,
+        }
 
     return QuestionRun(
         rows=rows,
+        predictions=predictions,
         duplicate_groups=linker.duplicate_groups(),
         clusters=clusters,
     )
@@ -572,16 +680,37 @@ def run_3arm_smoke(
     summary row carrying the M2 / M3 / M5 outcomes and the caveats that keep the
     smoke's numbers from being read as benchmark results. Deterministic: a rerun
     is byte-identical.
+
+    All three arms answer first; the judge then scores one shuffled,
+    de-identified batch of every (arm, question) candidate, per design doc §6.1
+    guard 1.
     """
     records = load_pinned_ku_questions(data_directory)
     retriever = BM25Retriever()
+    config = smoke_config()
+    questions = [QAItem(question=r["question"], gold=r["answer"]) for r in records]
+
+    runs = [run_three_arm_question(record, retriever) for record in records]
+    labeled_groups: list[list[str]] = [
+        group for run in runs for group in run.duplicate_groups
+    ]
+
+    scored = score_blind(
+        {
+            arm: ArmResult(
+                predictions=[run.predictions[arm] for run in runs],
+                pins=config.pins_record(),
+            )
+            for arm in ARM_STORES
+        },
+        questions,
+        config=config,
+    )
 
     rows: list[dict] = []
-    labeled_groups: list[list[str]] = []
-    for record in records:
-        run = run_three_arm_question(record, retriever)
-        rows.extend(run.rows)
-        labeled_groups.extend(run.duplicate_groups)
+    for index, run in enumerate(runs):
+        for arm in ARM_STORES:
+            rows.append({**run.rows[arm], "correct": scored[arm].verdicts[index]})
 
     # The corpus slice's labeled duplicate set, pooled across questions (claim
     # ids are question-scoped, so pooling cannot create cross-question pairs).
