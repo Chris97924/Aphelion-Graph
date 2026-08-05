@@ -11,10 +11,13 @@ What the linker assigns
 
 * ``subject`` — the topic an update is detected *against*. R4 is subject-scoped
   (``spec/v0.3-claim-semantics.md``), so this is the grouping key.
-* ``claim_id`` — one lineage node per distinct claim body within a subject. Two
-  exact restatements of the same body share a lineage, which is precisely the
-  pair Arm C coalesces (design doc §2.3: same ``claim_id`` **and** byte-equal
-  ``content_hash``).
+* ``claim_id`` — one lineage node per distinct value standing on a subject. Two
+  exact restatements of the value currently standing share a lineage, which is
+  precisely the pair Arm C coalesces (design doc §2.3: same ``claim_id`` **and**
+  byte-equal ``content_hash``). A body that returns *after* the subject moved on
+  (``A -> B -> A``) is a **revert**, not a restatement, and mints a fresh node
+  superseding the head — see :meth:`SharedLinker._revert_lineage` for why reusing
+  the original lineage would make Arm C surface the stale value as current.
 * ``supersedes`` — the update edge. When a subject that already carries a value
   receives a *different* body, the new lineage supersedes the subject's current
   head, so R4 resolves the group to the newest value and Arm C stops surfacing
@@ -187,6 +190,7 @@ class SharedLinker:
         # Subject -> the claim_id currently at the head of its update chain.
         self._head_by_subject: dict[str, str] = {}
         self._subjects: list[str] = []
+        self._lineage_seq = 0
         self._supersedes_edges = 0
         self._updated_subjects: set[str] = set()
         # Record id -> the claim emitted for it, in first-emission order. A dict
@@ -211,31 +215,88 @@ class SharedLinker:
             if not line.strip():
                 continue
             record_id = f"{session.id}#L{line_no:03d}"
-            claim = self._link(record_id, line, occurred_at)
-            self._claims.setdefault(record_id, claim)
-            claims.append(claim)
+            # A record's lineage is decided once, on first sight; re-linking is a
+            # pure replay. The decision depends on what stood at the head of the
+            # subject *at that moment*, so re-deriving it on a later pass would
+            # read a head that has since moved and mint a spurious revert.
+            settled = self._claims.get(record_id)
+            if settled is None:
+                settled = self._link(record_id, line, occurred_at)
+                self._claims[record_id] = settled
+            claims.append(settled)
         return claims
 
     # -- linking ------------------------------------------------------------
 
+    def _mint_claim_id(self) -> str:
+        """Allocate the next lineage id in this scope.
+
+        Counted separately from the body table because a lineage and a distinct
+        body are no longer one-to-one: a revert mints a second lineage for a body
+        already seen (see :meth:`_revert_lineage`).
+        """
+        claim_id = f"{self._scope}#C{self._lineage_seq:05d}"
+        self._lineage_seq += 1
+        return claim_id
+
     def _link(self, record_id: str, line: str, occurred_at: object) -> Claim:
         body = normalize_body(line)
-        known = self._meta_by_body.get(body)
-        if known is not None:
-            restatements = self._ids_by_body[body]
-            if record_id not in restatements:
-                restatements.append(record_id)
-            return Claim(id=record_id, text=line, metadata=dict(known))
+        restatements = self._ids_by_body.setdefault(body, [])
+        if record_id not in restatements:
+            restatements.append(record_id)
 
-        meta = self._new_lineage(body, occurred_at)
+        known = self._meta_by_body.get(body)
+        if known is None:
+            meta = self._new_lineage(body, occurred_at)
+        elif self._head_by_subject.get(known["subject"]) == known["claim_id"]:
+            # The value this body carries is still the one standing on its
+            # subject, so this is a plain restatement: re-emit verbatim.
+            meta = known
+        else:
+            meta = self._revert_lineage(known, occurred_at)
+
         self._meta_by_body[body] = meta
-        self._ids_by_body[body] = [record_id]
         return Claim(id=record_id, text=line, metadata=dict(meta))
+
+    def _revert_lineage(
+        self, prior: dict[str, Any], occurred_at: object
+    ) -> dict[str, Any]:
+        """Mint a fresh update node for a value that was current, then was not.
+
+        The ``A -> B -> A`` case. The third claim restates a body this scope has
+        already seen, but the subject moved on in between: ``B`` now stands at the
+        head. Re-using ``A``'s original lineage would put back a claim that ``B``
+        supersedes, so R4 resolves the subject to ``B`` and Arm C surfaces the
+        **stale** value as current even though the latest session reverted to
+        ``A`` — the exact contamination Arm C exists to prevent. A revert is an
+        update like any other, so it gets its own lineage superseding the head.
+
+        The new node's ``content_hash`` equals the original ``A`` node's — same
+        ``subject``/``predicate``/``object``/``state``/``type`` — while carrying a
+        different ``claim_id``. That is precisely the cross-lineage,
+        same-``content_hash`` pair design doc §2.3's amendment requires to reach
+        R4 intact rather than coalesce, and Arm C's lineage gate keeps them apart
+        by construction.
+        """
+        subject = str(prior["subject"])
+        meta = dict(prior)
+        meta["claim_id"] = self._mint_claim_id()
+        meta["supersedes"] = [self._head_by_subject[subject]]
+        # Drop any valid_from inherited from when this body was itself an update;
+        # this node became true at *this* session's instant, or at none at all.
+        meta.pop("valid_from", None)
+        if isinstance(occurred_at, str) and occurred_at:
+            meta["valid_from"] = occurred_at
+
+        self._supersedes_edges += 1
+        self._updated_subjects.add(subject)
+        self._head_by_subject[subject] = meta["claim_id"]
+        return meta
 
     def _new_lineage(self, body: str, occurred_at: object) -> dict[str, Any]:
         """Mint the frontmatter for a body this scope has not seen before."""
         subject = self._subject_policy(body)
-        claim_id = f"{self._scope}#C{len(self._meta_by_body):05d}"
+        claim_id = self._mint_claim_id()
 
         if subject is None:
             # No detectable topic: give the claim a subject of its own so R4
@@ -279,7 +340,7 @@ class SharedLinker:
         """The recall numbers that bound Arm C (design doc §7.3)."""
         return LinkerStats(
             records=len(self._claims),
-            lineages=len(self._meta_by_body),
+            lineages=self._lineage_seq,
             subjects=len(self._subjects),
             supersedes_edges=self._supersedes_edges,
             updated_subjects=len(self._updated_subjects),

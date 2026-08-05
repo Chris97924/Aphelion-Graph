@@ -122,16 +122,20 @@ class LineageAttribution:
     """Whether an M2 deficit is a fragmentation artifact or a projection bug.
 
     ``missed`` is what the control caught and the treatment arm did not.
-    ``fully_attributable`` is the §8 first check: true only when there *is* a
-    deficit and every missed pair is cross-lineage, i.e. the annotation's
-    "linker lineage-fragmentation artifact" fully explains it. An empty deficit
-    is deliberately **not** attributable — there is nothing to excuse, and a flag
-    that read as "excused" on a passing arm would be worse than no flag.
+    ``treatment_false_positives`` is what the treatment arm merged that is not a
+    labeled duplicate at all — the *over-merging* half of §8's M2-fail diagnosis.
+
+    ``fully_attributable`` is the §8 first check, and it is true only when all
+    three hold: there *is* a deficit, every missed pair is cross-lineage, and the
+    treatment arm produced no false positives. An empty deficit is deliberately
+    **not** attributable — there is nothing to excuse, and a flag that read as
+    "excused" on a passing arm would be worse than no flag.
     """
 
     missed: frozenset[frozenset]
     within_lineage_missed: frozenset[frozenset]
     cross_lineage_missed: frozenset[frozenset]
+    treatment_false_positives: frozenset[frozenset]
     fully_attributable: bool
 
     def as_record(self) -> dict[str, object]:
@@ -140,6 +144,7 @@ class LineageAttribution:
             "missed": len(self.missed),
             "within_lineage_missed": len(self.within_lineage_missed),
             "cross_lineage_missed": len(self.cross_lineage_missed),
+            "treatment_false_positives": len(self.treatment_false_positives),
             "fully_attributable": self.fully_attributable,
         }
 
@@ -153,22 +158,36 @@ def cross_lineage_attribution(
     """Run M2's §8 first check on a treatment-vs-control deficit.
 
     ``control_pairs`` are the duplicate pairs the control arm (B) predicted and
-    ``treatment_pairs`` those the treatment arm (C) predicted. Only *labeled*
-    pairs count: a pair neither arm should have merged is a precision question,
-    not a deficit.
+    ``treatment_pairs`` those the treatment arm (C) predicted. The *deficit* is
+    measured over labeled pairs only — a pair neither arm should have merged is
+    not a missed duplicate — but the treatment arm's unlabeled predictions are
+    **not** discarded: they are collected as ``treatment_false_positives``.
 
     A ``fully_attributable`` result means the annotation's escape hatch applies —
     the deficit is lineage fragmentation upstream in the linker, not an identity
     projection that over- or under-merges — and the §8 projection recheck should
     **not** be the first move. Anything else leaves the §8 diagnosis standing.
+
+    **Why a treatment false positive vetoes the excuse.** The annotation exempts
+    a deficit only when it is *entirely* attributable to cross-lineage exact
+    duplicates. Lineage fragmentation can only cause a merge to be **missed** —
+    splitting a lineage never invents a merge — so a predicted pair that is not a
+    labeled duplicate cannot be fragmentation. It is instead direct evidence of
+    the "projection too coarse" (over-merging) branch §8 names as an M2-fail
+    diagnosis. Excusing the run while that is present would skip the very
+    projection recheck the check exists to trigger, so the false positives are
+    both reported and disqualifying.
     """
-    control = {frozenset(pair) for pair in control_pairs} & labeled.pairs
-    treatment = {frozenset(pair) for pair in treatment_pairs} & labeled.pairs
-    missed = control - treatment
+    control = {frozenset(pair) for pair in control_pairs}
+    treatment = {frozenset(pair) for pair in treatment_pairs}
+
+    false_positives = treatment - labeled.pairs
+    missed = (control & labeled.pairs) - (treatment & labeled.pairs)
     within_missed = missed & labeled.within_lineage
     return LineageAttribution(
         missed=frozenset(missed),
         within_lineage_missed=frozenset(within_missed),
         cross_lineage_missed=frozenset(missed & labeled.cross_lineage),
-        fully_attributable=bool(missed) and not within_missed,
+        treatment_false_positives=frozenset(false_positives),
+        fully_attributable=bool(missed) and not within_missed and not false_positives,
     )

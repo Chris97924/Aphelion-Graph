@@ -175,6 +175,82 @@ def test_linker_stats_report_the_recall_that_bounds_arm_c() -> None:
 
 
 @pytest.mark.unit
+def test_linker_revert_after_an_update_mints_a_new_current_node() -> None:
+    """A -> B -> A: the revert is an update, not a restatement.
+
+    Re-using A's original lineage would leave the store asserting a claim that B
+    supersedes, so R4 would resolve the subject to B and Arm C would surface the
+    stale value as current even though the latest session reverted to A.
+    """
+    link = linker.SharedLinker("q1")
+    first = link(_session("s1", ["user: my 5k personal best is 24:30"]))[0]
+    second = link(_session("s2", ["user: my 5k personal best is 22:00"]))[0]
+    reverted = link(_session("s3", ["user: my 5k personal best is 24:30"]))[0]
+
+    ids = [claim.metadata["claim_id"] for claim in (first, second, reverted)]
+    assert len(set(ids)) == 3, "the revert must not reuse the original lineage"
+    assert reverted.metadata["supersedes"] == [second.metadata["claim_id"]]
+    # Same value as the original, so the identity projection agrees...
+    assert reverted.metadata["object"] == first.metadata["object"]
+    # ...which makes this exactly the cross-lineage same-content_hash pair
+    # design doc §2.3's amendment requires reach R4 intact instead of coalescing.
+    assert reverted.metadata["claim_id"] != first.metadata["claim_id"]
+
+
+@pytest.mark.unit
+def test_arm_c_surfaces_a_reverted_value_as_current() -> None:
+    """The end-to-end consequence: Arm C must not report B after A -> B -> A."""
+    link = linker.SharedLinker("q1")
+    sessions = [
+        _session("s1", ["user: my 5k personal best is 24:30"], "2023-05-01T10:00:00Z"),
+        _session("s2", ["user: my 5k personal best is 22:00"], "2023-06-01T10:00:00Z"),
+        _session("s3", ["user: my 5k personal best is 24:30"], "2023-07-01T10:00:00Z"),
+    ]
+    store = AphelionStore(
+        BM25Retriever(), extractor=link, query_time=run_mod.SMOKE_QUERY_TIME
+    )
+    store.ingest(list(sessions))
+
+    surfaced = [claim.text for claim in store.retrieve("what is my 5k personal best")]
+
+    assert any("24:30" in text for text in surfaced), "the reverted value is current"
+    assert not any("22:00" in text for text in surfaced), "B was superseded by the revert"
+
+
+@pytest.mark.unit
+def test_linker_restates_without_minting_when_the_value_still_stands() -> None:
+    """Guard against over-correcting: a plain A -> A restatement reuses A."""
+    link = linker.SharedLinker("q1")
+    first = link(_session("s1", ["user: my 5k personal best is 24:30"]))[0]
+    again = link(_session("s2", ["user: my 5k personal best is 24:30"]))[0]
+
+    assert again.metadata == first.metadata
+    assert link.stats.supersedes_edges == 0
+
+
+@pytest.mark.unit
+def test_linker_revert_is_idempotent_across_arm_replays() -> None:
+    """The A -> B -> A scope replayed per arm must not mint extra lineages."""
+    link = linker.SharedLinker("q1")
+    sessions = [
+        _session("s1", ["user: my 5k personal best is 24:30"]),
+        _session("s2", ["user: my 5k personal best is 22:00"]),
+        _session("s3", ["user: my 5k personal best is 24:30"]),
+    ]
+
+    def link_all() -> list[tuple[str, dict]]:
+        return [
+            (claim.id, claim.metadata) for s in sessions for claim in link(s)
+        ]
+
+    first_pass = link_all()
+    assert link_all() == first_pass
+    assert link.stats.records == 3
+    assert link.stats.lineages == 3
+    assert link.stats.supersedes_edges == 2
+
+
+@pytest.mark.unit
 def test_linking_the_same_session_once_per_arm_does_not_inflate_the_stats() -> None:
     """One linker serves three arms, so it links the same sessions three times.
 
@@ -383,6 +459,43 @@ def test_attribution_refuses_to_excuse_a_within_lineage_miss() -> None:
 
     assert attribution.within_lineage_missed == labeled.within_lineage
     assert attribution.fully_attributable is False
+
+
+@pytest.mark.unit
+def test_attribution_refuses_to_excuse_a_deficit_when_the_treatment_over_merges() -> None:
+    """A treatment false positive vetoes the escape hatch.
+
+    The annotation's exemption applies only when a deficit is *entirely*
+    attributable to cross-lineage fragmentation. Fragmentation can only cause
+    *missed* merges -- it can never produce a spurious one -- so a predicted pair
+    that is not a labeled duplicate is affirmative evidence of the over-merging
+    §8 hunts, and must not be excused away with the misses.
+    """
+    labeled = labeled_pairs.labeled_pairs_from_claims(_labeled_claims())
+    attribution = labeled_pairs.cross_lineage_attribution(
+        labeled,
+        control_pairs=labeled.pairs,
+        # Every miss is cross-lineage, but the arm also merged an unlabeled pair.
+        treatment_pairs=labeled.within_lineage | {frozenset(("r1", "r4"))},
+    )
+
+    assert attribution.within_lineage_missed == set()
+    assert attribution.missed == labeled.cross_lineage
+    assert attribution.fully_attributable is False
+
+
+@pytest.mark.unit
+def test_attribution_reports_the_treatment_false_positives() -> None:
+    """The §8 diagnosis needs to see the over-merges, not just be blocked by them."""
+    labeled = labeled_pairs.labeled_pairs_from_claims(_labeled_claims())
+    attribution = labeled_pairs.cross_lineage_attribution(
+        labeled,
+        control_pairs=labeled.pairs,
+        treatment_pairs=labeled.pairs | {frozenset(("r1", "r4"))},
+    )
+
+    assert attribution.treatment_false_positives == {frozenset(("r1", "r4"))}
+    assert attribution.as_record()["treatment_false_positives"] == 1
 
 
 @pytest.mark.unit
