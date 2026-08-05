@@ -130,11 +130,40 @@ def verdict_agrees(sample: Path) -> bool:
 
 
 def _scored_samples(samples_root: Path) -> list[Path]:
-    """Sample subdirectories that carry an ``expected-normalized.json``."""
+    """Sample subdirectories that carry an ``expected-normalized.json``.
+
+    The **verdict** layer's enumeration: a sample is scorable here only if it
+    ships the fixture stating what it should validate to. The byte layer uses
+    :func:`_package_dirs` instead — see the note there for why the two must not
+    share one loop.
+    """
     return [
         sample
         for sample in sorted(samples_root.iterdir())
         if sample.is_dir() and (sample / _EXPECTED_FILENAME).exists()
+    ]
+
+
+def _package_dirs(samples_root: Path) -> list[Path]:
+    """Package directories under ``samples_root``, whatever metadata they carry.
+
+    The **byte** layer's enumeration, and deliberately not the verdict layer's.
+    Eligibility is decided by the format — a directory carrying
+    ``manifest.json``, via the reader's own :func:`is_package_dir` — never by
+    ``expected-normalized.json``, which is verdict-layer test metadata.
+
+    Sharing one fixture-gated loop made the pinned denominator unreachable by
+    construction: a real 100-package byte-equality corpus ships manifests, not
+    verdict fixtures, so every package in it was silently skipped, ``n_scored``
+    stayed at zero, and ``gate_verdict()`` refused on input that satisfied the
+    pin. A refusal state that the corpus meant to satisfy it cannot satisfy is
+    not a safeguard, it is a dead end.
+    """
+    is_package = _reader().is_package_dir
+    return [
+        candidate
+        for candidate in sorted(samples_root.iterdir())
+        if candidate.is_dir() and is_package(candidate)
     ]
 
 
@@ -285,12 +314,19 @@ class CrossImplementationEquality:
     rather than silently shrinking. A package the reference rejects has no
     reference bytes to compare against, so it is out of scope for this check —
     it is covered by :func:`roundtrip_agreement` at the verdict layer.
+
+    ``non_packages`` names directories under the root that are not packages at
+    all (no ``manifest.json``) — a container of packages, a stray directory, a
+    corpus laid out one level deeper than intended. Reported for the same reason
+    as ``unpackable``: a root whose contents mostly are not packages should be
+    visible as such, not read as a small corpus.
     """
 
     total: int
     identical: int
     mismatches: tuple[str, ...]
     unpackable: tuple[tuple[str, str], ...]
+    non_packages: tuple[str, ...] = ()
 
     @property
     def rate(self) -> float:
@@ -338,7 +374,14 @@ def cross_implementation_byte_equality(
     identical = 0
     mismatches: list[str] = []
     unpackable: list[tuple[str, str]] = []
-    for index, sample in enumerate(_scored_samples(samples_root)):
+    packages = _package_dirs(samples_root)
+    eligible = {package.name for package in packages}
+    non_packages = tuple(
+        candidate.name
+        for candidate in sorted(samples_root.iterdir())
+        if candidate.is_dir() and candidate.name not in eligible
+    )
+    for index, sample in enumerate(packages):
         try:
             reference, independent = cross_implementation_digests(
                 sample, workdir / f"x{index:03d}"
@@ -363,6 +406,7 @@ def cross_implementation_byte_equality(
         identical=identical,
         mismatches=tuple(mismatches),
         unpackable=tuple(unpackable),
+        non_packages=non_packages,
     )
 
 

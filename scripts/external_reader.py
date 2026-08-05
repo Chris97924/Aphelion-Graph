@@ -602,14 +602,27 @@ def _read_expected(sample: Path) -> dict | None:
     return json.loads(exp.read_text(encoding="utf-8"))
 
 
+def is_package_dir(path: Path | str) -> bool:
+    """True when ``path`` is itself an Aphelion package directory.
+
+    A package is a directory carrying ``manifest.json`` — the first file both
+    the reference packer and this reader open, and the only thing that decides
+    whether a directory can be canonicalized at all. Deliberately independent of
+    any surrounding test metadata: fixtures like ``expected-normalized.json``
+    describe what a *sample* should validate to, which is a separate question
+    from whether a directory is a package. Non-recursive, so a container of
+    packages is not itself one.
+    """
+    return (Path(path) / "manifest.json").is_file()
+
+
 def _iter_packages(sample: Path) -> list[Path]:
     """A sample dir is usually itself a package, but
     duplicate-reaffirm-collision nests package-a / package-b.
     """
-    if (sample / "manifest.json").exists():
+    if is_package_dir(sample):
         return [sample]
-    subs = [p for p in sorted(sample.iterdir()) if p.is_dir() and (p / "manifest.json").exists()]
-    return subs
+    return [p for p in sorted(sample.iterdir()) if p.is_dir() and is_package_dir(p)]
 
 
 def emit_sample_json(sample: Path) -> dict:

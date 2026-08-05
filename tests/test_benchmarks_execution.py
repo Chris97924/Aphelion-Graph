@@ -19,6 +19,7 @@ from __future__ import annotations
 import http.client
 import itertools
 import json
+import shutil
 import socket
 import urllib.request
 from pathlib import Path
@@ -908,13 +909,18 @@ def test_m5_pinned_gate_runs_now_that_w_m5_has_landed() -> None:
     assert cross.mismatches == ()
     assert cross.all_identical is True
     assert cross.rate == 1.0
-    # Samples the reference itself refuses to pack have no reference bytes to
-    # compare against; they are named, never silently dropped.
-    assert {name for name, _ in cross.unpackable} == {
-        "duplicate-reaffirm-collision",
-        "withdraw-then-illegal-reaffirm",
-    }
-    assert cross.total + len(cross.unpackable) == 8
+    # Two distinct out-of-scope reasons, and they are now told apart rather
+    # than lumped together. `withdraw-then-illegal-reaffirm` IS a package the
+    # reference refuses to pack; `duplicate-reaffirm-collision` is not a package
+    # at all (it nests package-a/package-b and carries no top-level manifest).
+    # Both are named, neither is silently dropped.
+    assert {name for name, _ in cross.unpackable} == {"withdraw-then-illegal-reaffirm"}
+    assert cross.non_packages == ("duplicate-reaffirm-collision",)
+    assert cross.total + len(cross.unpackable) + len(cross.non_packages) == 8
+
+    # The verdict layer keeps its own fixture-gated enumeration and still scores
+    # all eight, including the collision container the byte layer excludes.
+    assert status.verdict_agreement.total == 8
 
 
 @pytest.mark.unit
@@ -973,6 +979,98 @@ def test_m5_pinned_denominator_is_read_from_the_preregistration(
     amended.write_text(json.dumps(original), encoding="utf-8")
 
     assert m5_roundtrip.pinned_gate(amended).n == 42
+
+
+def _preregister_pinned_at(n: int, tmp_path: Path) -> Path:
+    """A copy of the pre-registration with M5's denominator amended to ``n``."""
+    record = json.loads((_BENCH_ROOT / "preregister.json").read_text(encoding="utf-8"))
+    record["metrics"]["M5"]["gate"] = f"{n}/{n} byte-identical canonical form"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    amended = tmp_path / "preregister.json"
+    amended.write_text(json.dumps(record), encoding="utf-8")
+    return amended
+
+
+@pytest.mark.unit
+def test_m5_byte_gate_enumerates_packages_not_verdict_fixtures(tmp_path: Path) -> None:
+    """Byte-gate eligibility is "is a package", not "has a verdict fixture".
+
+    A genuine byte-equality corpus carries manifests, not
+    ``expected-normalized.json`` — that fixture belongs to the verdict layer.
+    Gating the byte loop on it meant every package in such a corpus was silently
+    skipped.
+    """
+    from tests.canonical_corpus import build_corpus
+
+    root = tmp_path / "corpus"
+    packages = build_corpus(root)
+    assert not any(
+        (package.path / "expected-normalized.json").exists() for package in packages
+    ), "fixture-free corpus is the whole point of this test"
+
+    result = m5_roundtrip.cross_implementation_byte_equality(root)
+
+    assert result.total == len(packages)
+    assert result.identical == len(packages)
+    assert result.all_identical is True
+
+
+@pytest.mark.unit
+def test_m5_pinned_gate_is_satisfiable_by_a_real_byte_equality_corpus(
+    tmp_path: Path,
+) -> None:
+    """The refusal state must be escapable by the corpus meant to escape it.
+
+    Withholding the verdict below the pin is only honest if supplying the pinned
+    denominator actually produces a verdict. With the byte loop gated on verdict
+    fixtures it never could: a 100-package corpus scored zero and
+    ``gate_verdict()`` refused on input that satisfied the pin. Proven
+    end-to-end against an amended pin rather than by generating 100 packages.
+    """
+    from tests.canonical_corpus import build_corpus
+
+    root = tmp_path / "corpus"
+    packages = build_corpus(root)
+    amended = _preregister_pinned_at(len(packages), tmp_path)
+
+    status = m5_roundtrip.gate_status(root, preregister=amended)
+
+    assert status.runnable is True
+    assert status.n_scored == len(packages)
+    assert status.gate.n == len(packages)
+    assert status.n_matches_pin is True
+    assert status.verdict_reason == ""
+    assert status.passed is True
+    assert status.gate_verdict() is True
+
+    # One package short of the pin and the verdict is withheld again — the
+    # boundary holds in both directions.
+    strict = m5_roundtrip.gate_status(
+        root, preregister=_preregister_pinned_at(len(packages) + 1, tmp_path / "up")
+    )
+    assert strict.n_matches_pin is False
+    assert strict.passed is None
+
+
+@pytest.mark.unit
+def test_m5_byte_gate_accepts_a_manifest_bearing_dir_with_no_fixture(
+    tmp_path: Path,
+) -> None:
+    """The cheap structural form of the same rule."""
+    from tests.canonical_corpus import build_corpus
+
+    root = tmp_path / "one"
+    built = build_corpus(root)
+    keep = built[1].path.name
+    for package in built:
+        if package.path.name != keep:
+            shutil.rmtree(package.path)
+
+    package_dir = root / keep
+    assert (package_dir / "manifest.json").exists()
+    assert not (package_dir / "expected-normalized.json").exists()
+
+    assert m5_roundtrip.cross_implementation_byte_equality(root).total == 1
 
 
 @pytest.mark.unit
