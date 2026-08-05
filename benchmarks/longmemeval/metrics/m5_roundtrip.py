@@ -366,17 +366,25 @@ GATE_BLOCKER = (
     "records that M5 is blocked, not waived and not downgraded to option (b)."
 )
 
-#: Where the two implementations were found to disagree with the written spec.
-#: Both writers pad the archive to a 10240-byte record, which
-#: ``spec/canonical-serialization.md`` Rule 5 §10 ("exactly two zero-filled
-#: 512-byte blocks... No extra trailing bytes") does not describe. Surfaced by
-#: W-M5 and pending maintainer adjudication; it does not affect the gate, which
-#: compares two implementations against each other.
+#: Places where building a second implementation showed the written spec did not
+#: describe what any tar writer emits. None of these ever affected the gate,
+#: which compares the two implementations against each other rather than against
+#: the prose; they are recorded because a gate that passes while the spec is
+#: wrong is exactly the situation W-M5 exists to expose.
 SPEC_FINDINGS = (
-    "Rule 5 §10 (EOF blocks) does not describe what any tar writer emits: the "
-    "archive is padded to a 10240-byte record. Rule 5 §7 (device major/minor) "
-    "is satisfied by two different encodings of zero. Both were found by the "
-    "W-M5 second implementation; see scripts/external_reader.py.",
+    "F1 — RESOLVED 2026-08-05 (spec amended to document record padding, Chris): "
+    "Rule 5 §10 read 'exactly two zero-filled 512-byte blocks... No extra "
+    "trailing bytes', which described no tar writer; every writer pads the "
+    "archive to a 10240-byte record. Now normative in spec v1.1.",
+    "F2 — RESOLVED 2026-08-05 (folded into the same v1.1 amendment): Rule 5 §7 "
+    "(device major/minor = 0) admitted two byte-different encodings of zero. "
+    "v1.1 requires the empty (all-NUL) field tar actually writes.",
+    "F3 — OPEN, reported only: Rule 5 §1 mandates a pax extended header for "
+    "member paths over 100 bytes or containing non-ASCII, but the reference is "
+    "pinned to tarfile.USTAR_FORMAT, which cannot emit pax and would fall back "
+    "to the §1-forbidden prefix+name split. Unreachable for conformant v2.0 "
+    "packages, so it was left for a format-capability decision rather than "
+    "clarified. See scripts/external_reader.py.",
 )
 
 

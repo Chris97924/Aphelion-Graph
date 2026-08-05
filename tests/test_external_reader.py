@@ -520,35 +520,64 @@ def test_reader_cli_emits_the_canonical_digest(tmp_path: Path) -> None:
     assert broken.stdout.strip() == ""
 
 
-def test_spec_rule5_eof_padding_diverges_from_the_written_spec(
+def test_spec_rule5_eof_padding_matches_record_padding(
     reader: ModuleType, tmp_path: Path
 ) -> None:
-    """FINDING (W-M5): Rule 5 §10 does not describe what either writer emits.
+    """Rule 5 §10, as amended in spec v1.1, matches what both writers emit.
 
-    ``spec/canonical-serialization.md`` Rule 5 §10 says: "exactly two
-    zero-filled 512-byte blocks terminate the archive. No extra trailing
-    bytes." Both the reference writer (via Python ``tarfile``) and every
-    conventional tar implementation instead pad the archive out to a 20-block,
-    10240-byte record. A second implementer following §10 literally produces a
-    *shorter* archive and fails byte-equality on every package.
-
-    The independent reader therefore matches the observable format rather than
-    the §10 sentence, and this test pins the divergence so it stays visible for
-    maintainer adjudication instead of being buried in a helper. Per the spec's
-    own Determinism Checklist ("If any of the above differs between two
-    conformant implementers, this document is defective — file an issue against
-    the spec"), §10 is the defect, not the writers.
+    History: W-M5 found that §10 as originally written ("exactly two zero-filled
+    512-byte blocks terminate the archive. No extra trailing bytes") described
+    no tar writer in existence — the reference, via Python ``tarfile``, pads out
+    to a 10240-byte record like GNU and BSD tar. An implementer following the
+    old §10 literally failed byte-equality on every package. Chris adjudicated
+    on 2026-08-05 in favour of amending the spec, since both implementations
+    already agreed and only the document was wrong. This test now asserts the
+    three things §10 makes testable.
     """
     archive = reader.canonical_archive_bytes(SAMPLES / "architecture-claim")
     reference = _reference_archive_bytes(SAMPLES / "architecture-claim", tmp_path)
     assert archive == reference
 
+    # §10: a whole number of 10240-byte records, and never smaller than one.
+    assert reader.RECORD_SIZE == 10240
     assert len(archive) % reader.RECORD_SIZE == 0
-    spec_literal_length = reader.canonical_archive_bytes(
+    assert len(archive) >= reader.RECORD_SIZE
+
+    # §10: nothing but zero bytes after the two EOF blocks. `record_padding`
+    # stays available so the pre-1.1 reading is still expressible and the
+    # difference between the two remains measurable.
+    without_padding = reader.canonical_archive_bytes(
         SAMPLES / "architecture-claim", record_padding=False
     )
-    # The spec-literal reading really is a different archive — this is the
-    # divergence, quantified.
-    assert len(spec_literal_length) < len(archive)
-    assert archive.startswith(spec_literal_length)
-    assert set(archive[len(spec_literal_length):]) == {0}
+    assert len(without_padding) < len(archive)
+    assert archive.startswith(without_padding)
+    assert set(archive[len(without_padding):]) == {0}
+    # The unpadded form still ends in the two mandatory EOF blocks.
+    assert without_padding.endswith(b"\x00" * (reader.BLOCK_SIZE * 2))
+
+
+def test_spec_v1_1_documents_what_the_writers_emit(reader: ModuleType) -> None:
+    """The amended §10/§7 text must keep matching the code, not drift from it.
+
+    A spec amended to describe reality is only useful while it still does, so
+    the two normative constants the amendment introduced are asserted against
+    the implementation rather than left as prose.
+    """
+    spec = (ROOT / "spec" / "canonical-serialization.md").read_text(encoding="utf-8")
+    assert "**Version:** 1.1" in spec
+
+    # Scoped to the normative Rule 5 lines — the changelog quotes the old §10
+    # wording on purpose, and that history should not trip this check.
+    lines = spec.splitlines()
+    rule_10 = next(line for line in lines if line.startswith("10. **EOF"))
+    rule_7 = next(line for line in lines if line.startswith("7. **Device"))
+
+    assert str(reader.RECORD_SIZE) in rule_10, "§10 must name the record size"
+    assert "No extra trailing bytes" not in rule_10, "pre-1.1 §10 claim must be gone"
+    assert "NUL" in rule_7, "§7 must pin the empty-field encoding of zero"
+
+    # §7: device major/minor are 8 NUL bytes, not octal zero. Read the field
+    # straight out of a real header (offsets 329..345).
+    header = reader.canonical_tar_bytes([reader.TarMember("f", b"x")])[:512]
+    assert header[329:345] == b"\x00" * 16
+    assert b"0000000\x00" not in header[329:345]

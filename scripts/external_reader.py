@@ -33,19 +33,33 @@ Contract
   ``tests/test_external_reader.py::test_reader_is_not_delegating_the_layers_it_must_reimplement``.
 - Must run under Python 3.10+.
 
-Known divergence from the written spec
---------------------------------------
-``spec/canonical-serialization.md`` Rule 5 §10 states: "exactly two zero-filled
-512-byte blocks terminate the archive. No extra trailing bytes." No writer
-behaves that way. The reference implementation (Python ``tarfile``) — like GNU
-tar, BSD tar, and every other conventional implementation — pads the archive to
-a 20-block, 10240-byte record. An implementer following §10 literally produces
-a shorter archive and fails byte-equality on *every* package. This reader
-matches the observable format and exposes ``record_padding=False`` for the
-spec-literal reading, so the gap is measurable rather than hidden. Per the
-spec's own Determinism Checklist, that makes §10 a spec defect to be
-adjudicated, not a writer bug. Pinned by
-``tests/test_external_reader.py::test_spec_rule5_eof_padding_diverges_from_the_written_spec``.
+Spec gaps this implementation found (resolved 2026-08-05)
+---------------------------------------------------------
+Building a second implementation surfaced two places where
+``spec/canonical-serialization.md`` did not describe what any tar writer emits.
+Both were adjudicated by the maintainer (Chris) on 2026-08-05 in favour of
+amending the document — the two implementations already agreed, so it was the
+spec that was wrong — and both are now normative in **spec v1.1**:
+
+- **Rule 5 §10** previously read "exactly two zero-filled 512-byte blocks
+  terminate the archive. No extra trailing bytes." The reference (Python
+  ``tarfile``), like GNU and BSD tar, pads the archive to a 10240-byte record.
+  An implementer following the old text produced a shorter archive and failed
+  byte-equality on *every* package. §10 now states the record size.
+  ``record_padding=False`` is kept so the pre-1.1 reading stays expressible and
+  the difference stays measurable.
+- **Rule 5 §7** ("Device major/minor: 0") admitted two byte-different encodings
+  of zero; tar writes an empty (all-NUL) field for non-device entries, which is
+  what §7 now requires. Getting this wrong shifts the header checksum only,
+  making it painful to diagnose.
+
+Still open, reported but not resolved: **Rule 5 §1** mandates a pax extended
+header for member paths over 100 bytes or containing non-ASCII, but the
+reference is pinned to ``tarfile.USTAR_FORMAT``, which cannot emit pax and would
+fall back to the §1-forbidden ``prefix``+``name`` split. Unreachable for
+conformant v2.0 packages (claim paths are ``claims/<uuid>.md``), so this reader
+refuses such members rather than inventing an encoding. Resolving it is a
+format-capability decision, not a clarification.
 
 Usage
 -----
@@ -209,9 +223,9 @@ def _parse_json(raw: bytes, where: str) -> Any:
 # =========================================================================== #
 
 BLOCK_SIZE = 512
-#: Conventional tar blocking factor (20 blocks). See the module docstring's
-#: "Known divergence" note: Rule 5 §10 does not mention it, every writer emits
-#: it, and byte-equality is impossible without it.
+#: Tar record size — the conventional blocking factor of 20 × 512-byte blocks.
+#: Normative since spec v1.1 (Rule 5 §10); byte-equality is impossible without
+#: it, which is how the pre-1.1 wording was found to be wrong.
 RECORD_SIZE = 10240
 
 _USTAR_MAGIC = b"ustar\x0000"  # magic "ustar\0" + version "00"
@@ -296,10 +310,9 @@ def _ustar_header(member: TarMember) -> bytes:
         + _USTAR_MAGIC
         + b"\x00" * 32  # uname — Rule 5 §5
         + b"\x00" * 32  # gname
-        # Rule 5 §7 says device major/minor are 0. For non-device entries tar
-        # encodes that zero as an *empty* field (all NUL) rather than octal
-        # "0000000\0"; readers treat empty as 0. Both readings satisfy §7, only
-        # one reproduces the reference bytes.
+        # Rule 5 §7 (normative since spec v1.1): for non-device entries the
+        # device fields are an *empty* field, all NUL — not octal "0000000\0".
+        # Both denote zero; only this one reproduces the reference bytes.
         + b"\x00" * 8  # devmajor
         + b"\x00" * 8  # devminor
         + b"\x00" * 155  # prefix — Rule 5 §1 forbids using it
@@ -315,9 +328,9 @@ def canonical_tar_bytes(
 ) -> bytes:
     """Pack ``members`` into canonical uncompressed tar bytes (Rule 5).
 
-    ``record_padding=False`` emits the literal Rule 5 §10 reading (two EOF
-    blocks, nothing after). It does not match any real writer; see the module
-    docstring.
+    ``record_padding=False`` emits the pre-v1.1 reading of Rule 5 §10 (two EOF
+    blocks, nothing after). It matches no real writer and is retained only so
+    the difference the amendment settled stays expressible and measurable.
     """
     seen: set[str] = set()
     for member in members:
