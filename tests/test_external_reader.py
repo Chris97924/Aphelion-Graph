@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -386,6 +387,61 @@ def test_reader_ustar_framing_matches_a_conventional_tar_writer(
     assert reader.canonical_tar_bytes(members) == buf.getvalue()
 
 
+def test_reader_refuses_to_digest_a_schema_invalid_package(
+    reader: ModuleType, tmp_path: Path
+) -> None:
+    """Canonical JSON is not the same thing as a valid Aphelion package.
+
+    ``{"claims": []}`` parses as canonical JSON and satisfies the one structural
+    check the byte path made (claims is an array), but it carries no
+    ``format_version``, no ``package_id``, none of the required manifest fields.
+    The reference calls ``validate_package()`` before writing and rejects it, so
+    emitting a digest here mints an authoritative-looking canonical hash for a
+    package the reference would never produce.
+    """
+    from aphelion.errors import AphelionError
+    from aphelion.packer import pack
+
+    package = tmp_path / "canonical-json-but-not-a-package"
+    package.mkdir()
+    (package / "manifest.json").write_bytes(b'{"claims":[]}\n')
+    (package / "provenance.jsonl").write_bytes(b"")
+
+    # The reference refuses it — that is the behaviour to agree with.
+    with pytest.raises(AphelionError):
+        pack(package, tmp_path / "reference.aphelion.tar")
+
+    with pytest.raises(reader.CanonicalError) as excinfo:
+        reader.canonical_archive_sha256(package)
+    assert "ERR-SYN" in str(excinfo.value)
+
+    # Every canonical entry point, not just the digest wrapper.
+    with pytest.raises(reader.CanonicalError):
+        reader.canonical_archive_bytes(package)
+
+
+def test_reader_and_reference_agree_on_which_packages_to_refuse(
+    reader: ModuleType, tmp_path: Path
+) -> None:
+    """Two-implementation agreement has to cover the refusals, not just the bytes.
+
+    An independent reader that reproduces the reference byte-for-byte on valid
+    input but happily digests input the reference rejects is only half an
+    implementation — and the half that is missing is the one that would catch a
+    bad package.
+    """
+    from aphelion.errors import AphelionError
+
+    for name in ("withdraw-then-illegal-reaffirm", "duplicate-reaffirm-collision"):
+        sample = SAMPLES / name
+        with pytest.raises(AphelionError):
+            _reference_archive_bytes(sample, tmp_path / name)
+        with pytest.raises(reader.CanonicalError):
+            reader.canonical_archive_bytes(sample)
+        with pytest.raises(reader.CanonicalError):
+            reader.canonical_archive_sha256(sample)
+
+
 def test_reader_refuses_non_ascii_member_names(reader: ModuleType) -> None:
     """Rule 5 §1 mandates a pax header for ANY non-ASCII byte in a member path.
 
@@ -478,12 +534,20 @@ def test_reader_refuses_manifest_paths_that_escape_the_package(
     primitive for anyone who canonicalizes untrusted input and publishes the
     result. ``spec/packaging.md`` Rule 5 forbids these path forms outright.
     """
+    import json as _json
+
     outside_file = tmp_path / "outside.txt"
     outside_file.write_bytes(b"do-not-exfiltrate\n")
 
+    # Start from a genuinely valid package, so the only thing under test is the
+    # path — a stub manifest would now be refused by schema validation instead,
+    # and the containment guard would never be reached.
     package = tmp_path / "hostile"
-    (package / "claims").mkdir(parents=True)
-    (package / "provenance.jsonl").write_bytes(b"")
+    build_corpus(tmp_path / "src")
+    shutil.copytree(tmp_path / "src" / "single-claim", package)
+    manifest_path = package / "manifest.json"
+    pristine = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert reader.canonical_archive_bytes(package), "fixture must start valid"
 
     escapes = [
         "../outside.txt",
@@ -494,17 +558,15 @@ def test_reader_refuses_manifest_paths_that_escape_the_package(
         outside_file.as_posix(),  # absolute with forward slashes
     ]
     for path in escapes:
-        (package / "manifest.json").write_bytes(
-            canonical_json_for({"claims": [{"path": path}]})
-        )
+        hostile = _json.loads(_json.dumps(pristine))
+        hostile["claims"][0]["path"] = path
+        manifest_path.write_text(_json.dumps(hostile), encoding="utf-8")
         with pytest.raises(reader.CanonicalError):
             reader.canonical_archive_bytes(package)
 
-    # The legitimate shape still works.
-    (package / "claims" / "ok.md").write_bytes(b"fine\n")
-    (package / "manifest.json").write_bytes(
-        canonical_json_for({"claims": [{"path": "claims/ok.md"}]})
-    )
+    # Restoring the legitimate path makes it work again, so the refusals above
+    # are attributable to the path and nothing else.
+    manifest_path.write_text(_json.dumps(pristine), encoding="utf-8")
     assert reader.canonical_archive_bytes(package)
 
 

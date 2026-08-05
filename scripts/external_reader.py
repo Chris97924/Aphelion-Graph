@@ -85,6 +85,16 @@ class CanonicalError(ValueError):
     """Input cannot be expressed in Aphelion canonical form."""
 
 
+class PackageValidationError(CanonicalError):
+    """The directory is not a valid Aphelion package, so it has no canonical form.
+
+    Distinct from the other :class:`CanonicalError` cases, which are about input
+    this reader cannot *encode*. Here the bytes encode fine — the package is just
+    not one the format admits, and a digest for it would carry an authority it
+    has not earned.
+    """
+
+
 # =========================================================================== #
 # Rule 1 / Rule 2 — canonical JSON                                            #
 # =========================================================================== #
@@ -476,6 +486,49 @@ def canonical_provenance_bytes(package_dir: Path | str) -> bytes:
     return b"".join(lines)
 
 
+def _require_valid_package(package: Path) -> None:
+    """Refuse a package this reader's own validator classifies as invalid.
+
+    The reference packer runs ``validate_package()`` before it writes a byte, so
+    a canonical digest only ever exists for a package that passes validation.
+    Without the same gate here this reader would mint authoritative-looking
+    digests for input the reference rejects outright — and the whole point of a
+    second implementation is that the two agree, which has to include agreeing
+    on what to *refuse*.
+
+    Reuses the lifecycle/schema classification this script has carried since
+    before W-M5 (:func:`_classify_package`) rather than adding a second, weaker
+    notion of validity. Stdlib only; nothing here imports ``aphelion``.
+
+    One known asymmetry, measured rather than assumed: a manifest claim with no
+    ``create`` event in provenance is refused here (``ERR-SEM-LIFECYCLE-ILLEGAL``,
+    the "NEW-but-no-create" rule) but *accepted* by the reference, whose
+    lifecycle walk only visits claims that actually have events. No package in
+    the samples or the evidence corpus is shaped that way, so nothing currently
+    diverges; a future corpus containing one would surface as a byte-gate
+    mismatch that is really this strictness gap, not format drift. Left as-is
+    deliberately: loosening this reader would paper over a gap in the reference,
+    and tightening the reference is out of scope here.
+    """
+    try:
+        verdict, code, _states = _classify_package(package)
+    except CanonicalError:
+        raise
+    except (ValueError, KeyError, TypeError, OSError) as err:
+        # The classifier is internal and raises bare exceptions on malformed
+        # input; normalize them at this public boundary rather than letting an
+        # untyped error escape.
+        raise PackageValidationError(
+            f"{package.name}: package could not be validated: {err}"
+        ) from err
+    if verdict != "valid":
+        raise PackageValidationError(
+            f"{package.name}: not a valid Aphelion package ({code}); canonical "
+            "form is defined only for valid packages, and the reference packer "
+            "refuses this input too"
+        )
+
+
 def canonical_archive_bytes(
     package_dir: Path | str, *, record_padding: bool = True
 ) -> bytes:
@@ -484,11 +537,23 @@ def canonical_archive_bytes(
     Members are ``manifest.json``, ``provenance.jsonl``, every claim file named
     by the manifest, and ``NOTICE`` when present — the same set the reference
     packer emits, ordered and framed per Rule 5.
+
+    Raises :class:`PackageValidationError` for a directory that is not a valid
+    Aphelion package. This is the validated entry point: the member-level
+    helpers below it are building blocks and do not imply their package is
+    valid.
     """
     package = Path(package_dir)
+    # Parse strictly first, so a canonical-subset violation reports as itself
+    # rather than as a downstream schema complaint...
     manifest, members = _manifest_with_recomputed_hashes(package)
+    provenance = canonical_provenance_bytes(package)
+    # ...then refuse anything the format does not admit, before any bytes are
+    # returned to a caller that would hash them.
+    _require_valid_package(package)
+
     members.append(TarMember("manifest.json", canonical_json_bytes(manifest)))
-    members.append(TarMember("provenance.jsonl", canonical_provenance_bytes(package)))
+    members.append(TarMember("provenance.jsonl", provenance))
     if (package / "NOTICE").exists():
         members.append(TarMember("NOTICE", _read_member_bytes(package, "NOTICE")))
     return canonical_tar_bytes(members, record_padding=record_padding)
