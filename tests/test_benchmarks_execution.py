@@ -807,7 +807,7 @@ def test_m3_contexts_come_from_the_store_top_k() -> None:
 def test_m3_separates_the_arms_on_the_pinned_fixture() -> None:
     """Arm C suppresses the superseded value; A and B keep surfacing it."""
     retriever = BM25Retriever()
-    _, m3 = run_mod.run_fixture_metrics(retriever)
+    _, m3, _ = run_mod.run_fixture_metrics(retriever)
 
     assert m3["A"].rate == 0.5
     assert m3["B"].rate == 0.5
