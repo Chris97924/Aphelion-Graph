@@ -1,0 +1,10 @@
+# The frozen LongMemEval split is a byte-exact build artifact: it must equal, byte
+# for byte, what `python -m benchmarks.longmemeval.corpus` emits on any platform.
+# Under the default `core.autocrlf=true` on Windows git would hand a fresh checkout
+# a CRLF copy, which the generator would then immediately rewrite as LF — so the
+# working-tree form is pinned to LF rather than left to the checking-out machine.
+benchmarks/longmemeval/split_manifest.json text eol=lf
+
+# Same contract, same reason: the smoke's results files are written with write_bytes
+# precisely so a rerun is byte-identical across runs and operating systems.
+benchmarks/longmemeval/*.jsonl text eol=lf

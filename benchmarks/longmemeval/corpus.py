@@ -206,8 +206,16 @@ def dumps_manifest(manifest: dict) -> str:
 
 
 def write_manifest(manifest: dict, path: Path = MANIFEST_PATH) -> Path:
-    """Write the manifest to ``path`` as UTF-8 and return the path."""
-    path.write_text(dumps_manifest(manifest), encoding="utf-8")
+    """Write the manifest to ``path`` as UTF-8 and return the path.
+
+    ``write_bytes`` rather than ``write_text``: text mode applies the platform's
+    newline translation, so the same manifest would be written with CRLF on
+    Windows and LF elsewhere. The frozen split's whole claim is that it
+    regenerates byte-identically, and a file whose bytes depend on the operating
+    system that wrote it does not regenerate byte-identically anywhere but on
+    that operating system.
+    """
+    path.write_bytes(dumps_manifest(manifest).encode("utf-8"))
     return path
 
 

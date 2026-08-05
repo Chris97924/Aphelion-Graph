@@ -28,17 +28,32 @@ independent variable — and the run emits one ``results.jsonl`` row per
 (question, arm), deterministic and byte-identical across runs.
 
 A second entry point, ``--smoke-3arm``, extends this to **arms A + B + C** and
-**metrics M2 + M3 + M5**, still fully offline. It adds:
+**every metric that can run offline — M1, M2, M3, M4 and M5**. It adds:
 
-* a :class:`SharedLinker` — one arm-independent extract+link stage per question,
-  so all three arms see byte-identical claims carrying aphelion frontmatter;
-* **M2** micro-averaged over the slice from each arm's own merge clusters;
+* the shared :class:`~benchmarks.longmemeval.linker.SharedLinker` — one
+  arm-independent extract+link stage per question, so all three arms see
+  byte-identical claims carrying aphelion frontmatter — and reports its
+  :class:`~benchmarks.longmemeval.linker.LinkerStats`, because design doc §7.3
+  makes the linker's recall the ceiling on what Arm C can win;
+* **M1** over the stub judge's verdicts: accuracies, the pinned ``C − B``
+  contrast and its bootstrapped CI. The gate itself stays unanswered — five
+  questions cannot decide a gate pinned at N=78, and
+  :meth:`~benchmarks.longmemeval.metrics.m1_qa.M1Report.gate_verdict` refuses to
+  pretend otherwise;
+* **M2** micro-averaged over the slice from each arm's own merge clusters, plus
+  the labeled duplicate set's within/cross-lineage split, which is what the §8
+  M2-fail diagnosis needs (M2's 2026-07-19 annotation);
 * **M3** over a pinned synthetic fixture (the corpus ships no old-value labels);
+* **M4** p50/p95 and bytes/claim under a deterministic
+  :class:`~benchmarks.longmemeval.metrics.m4_perf.CountingClock`, with the
+  advisory 10× tripwire evaluated;
 * **M5** verdict agreement plus byte-level pack/unpack/re-pack equality.
 
 Both smokes are deterministic and byte-identical across runs, and neither opens a
-socket. M1 (QA accuracy) and M4 (latency) still need the pinned answering and
-judge models, so they remain part of the GB10-gated execution run.
+socket. Every metric number the 3-arm smoke emits is *plumbing evidence* and
+carries a caveat saying so: the real M1 needs the pinned answering and judge
+models, and the real M4 needs a real clock, so both remain part of the
+GB10-gated execution run.
 
 Run them with::
 
@@ -55,12 +70,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from benchmarks.longmemeval import corpus
+from benchmarks.longmemeval import corpus, labeled_pairs
 from benchmarks.longmemeval.arms import ARM_STORES
 from benchmarks.longmemeval.arms.aphelion_arm import AphelionStore
-from benchmarks.longmemeval.arms.naive_dedup import NaiveDedupStore, normalize_body
+from benchmarks.longmemeval.arms.naive_dedup import NaiveDedupStore
 from benchmarks.longmemeval.arms.plain import PlainStore
-from benchmarks.longmemeval.metrics import m2_dedup, m3_contamination, m5_roundtrip
+from benchmarks.longmemeval.linker import (
+    LinkerStats,
+    SharedLinker,
+    parse_corpus_instant,
+)
+from benchmarks.longmemeval.metrics import (
+    m1_qa,
+    m2_dedup,
+    m3_contamination,
+    m4_perf,
+    m5_roundtrip,
+)
 from benchmarks.longmemeval.pipeline import (
     ArmResult,
     Claim,
@@ -235,23 +261,64 @@ def load_pinned_ku_questions(data_directory: Path | None = None) -> list[dict]:
     return [by_id[qid] for qid in SMOKE_KU_QUESTION_IDS]
 
 
+def _session_order_key(session_id: str, occurred_at: str | None) -> tuple[int, str, str]:
+    """Order evidence sessions by when they happened, then by id.
+
+    The linker builds its ``supersedes`` chain in **ingestion** order, so feeding
+    sessions in session-id order is a correctness bug, not a cosmetic one: a
+    later-dated session whose id happens to sort earlier would be ingested first
+    and then marked as *superseded by* the older one. Arm C's R4 pass would
+    resolve the subject to the stale value, inverting M1 and M3 for that
+    question — the very contamination Arm C exists to prevent.
+
+    Instants are the 20-char ``YYYY-MM-DDTHH:MM:SSZ`` form, which orders
+    lexicographically exactly as it orders chronologically, so no date parsing is
+    needed here.
+
+    Undated sessions sort **first** — treated as the oldest, not the newest.
+    Their instant is genuinely unknown, so either placement is an assumption;
+    this is the conservative one, because it lets a claim whose date *is* known
+    supersede one whose date is not, rather than the reverse.
+
+    The session id is the final tie-breaker so equal instants still yield one
+    total order. That determinism is load-bearing: every arm re-runs the one
+    shared linker over this same sequence, and the three arms only see
+    byte-identical claims if the sequence is identical on every pass.
+    """
+    return (0 if occurred_at is None else 1, occurred_at or "", session_id)
+
+
 def _evidence_sessions(record: dict) -> list[Session]:
     """Build one :class:`Session` per evidence session of a question.
 
     Only the sessions named in ``answer_session_ids`` (the "oracle evidence
-    sessions") are used, visited in sorted id order for determinism. Each turn is
+    sessions") are used, visited in **occurrence order** — see
+    :func:`_session_order_key` for why feeding them in id order silently inverts
+    Arm C's supersedes chain. Each turn is
     rendered as a single ``"role: text"`` line with its content whitespace-collapsed
     so newline splitting in :func:`stub_extractor` yields exactly one claim per
     turn; blank turns are dropped.
+
+    Each session carries its corpus timestamp as ``occurred_at`` when the record
+    has one. That is the linker's only source for the ``valid_from`` it puts on
+    an update edge (design doc §7.3) — the harness never invents an instant, so a
+    session the corpus left undated simply yields no ``valid_from``.
     """
     qid = record["question_id"]
     evidence_ids = set(record["answer_session_ids"])
     by_session_id = dict(
         zip(record["haystack_session_ids"], record["haystack_sessions"])
     )
+    dates_by_session_id = dict(
+        zip(record["haystack_session_ids"], record.get("haystack_dates", []))
+    )
+
+    instants = {
+        sid: parse_corpus_instant(dates_by_session_id.get(sid)) for sid in evidence_ids
+    }
 
     sessions: list[Session] = []
-    for sid in sorted(evidence_ids):
+    for sid in sorted(evidence_ids, key=lambda s: _session_order_key(s, instants[s])):
         turns = by_session_id.get(sid)
         if turns is None:
             continue
@@ -261,12 +328,12 @@ def _evidence_sessions(record: dict) -> list[Session]:
             if not content:
                 continue
             lines.append(f"{turn.get('role', '?')}: {content}")
+        metadata: dict[str, Any] = {"question_id": qid, "session_id": sid}
+        occurred_at = instants[sid]
+        if occurred_at is not None:
+            metadata["occurred_at"] = occurred_at
         sessions.append(
-            Session(
-                id=f"{qid}::{sid}",
-                text="\n".join(lines),
-                metadata={"question_id": qid, "session_id": sid},
-            )
+            Session(id=f"{qid}::{sid}", text="\n".join(lines), metadata=metadata)
         )
     return sessions
 
@@ -409,77 +476,50 @@ SMOKE_QUERY_TIME = datetime(
 SMOKE_M3_TOP_K = SMOKE_TOP_K
 
 
-class SharedLinker:
-    """The shared, arm-independent extract + link stage (design doc §7.3).
+# Bootstrap replicates for the smoke's M1 interval. Far below
+# ``m1_qa.BOOTSTRAP_RESAMPLES`` because the smoke's five questions make the
+# interval meaningless anyway (see M1_SMOKE_CAVEAT) and the run should stay fast;
+# the count is pinned here so the emitted bounds are reproducible.
+SMOKE_M1_RESAMPLES = 1000
 
-    One instance serves arms A, B and C for a single question, so all three see
-    byte-identical claims — the fairness constraint that makes the memory layer
-    the only independent variable.
-
-    Linking is exact-restatement: every distinct normalised body gets one
-    lineage (``claim_id``), and a repeated body is re-linked to the lineage it
-    already has. This is the deterministic stdlib stand-in for the execution
-    drive's real linker; it detects no updates, so it assigns no ``supersedes``
-    edges and Arm C's R4 pass finds no conflicts — the "linker recall bounds Arm
-    C's ceiling" case the design doc calls out as the central validity risk.
-    """
-
-    def __init__(self, question_id: str) -> None:
-        self._question_id = question_id
-        self._lineage_by_body: dict[str, str] = {}
-        self._ids_by_body: dict[str, list[str]] = {}
-
-    def __call__(self, session: Session) -> list[Claim]:
-        claims: list[Claim] = []
-        for line_no, line in enumerate(session.text.split("\n")):
-            if not line.strip():
-                continue
-            body = normalize_body(line)
-            lineage = self._lineage_by_body.get(body)
-            if lineage is None:
-                lineage = f"{self._question_id}#C{len(self._lineage_by_body):05d}"
-                self._lineage_by_body[body] = lineage
-                self._ids_by_body[body] = []
-            record_id = f"{session.id}#L{line_no:03d}"
-            if record_id not in self._ids_by_body[body]:
-                self._ids_by_body[body].append(record_id)
-            claims.append(
-                Claim(
-                    id=record_id,
-                    text=line,
-                    # Aphelion frontmatter. Arms A and B ignore it; Arm C hashes
-                    # the identity projection out of it. ``subject`` tracks the
-                    # lineage because the stub linker has no subject model.
-                    metadata={
-                        "claim_id": lineage,
-                        "subject": lineage,
-                        "predicate": "states",
-                        "object": body,
-                        "state": "active",
-                        "type": "conversation_turn",
-                        "question_id": self._question_id,
-                    },
-                )
-            )
-        return claims
-
-    def duplicate_groups(self) -> list[list[str]]:
-        """Ground-truth exact-restatement groups — M2's labeled duplicate set."""
-        return [list(ids) for ids in self._ids_by_body.values()]
+# Step of the smoke's deterministic latency clock. A real p50/p95 needs a real
+# clock, which would make results.jsonl differ between runs and break the
+# byte-identity the smoke is built on — so the smoke times a counter instead and
+# says so in M4_SMOKE_CAVEAT.
+SMOKE_M4_CLOCK_STEP_SECONDS = 0.001
 
 
 # Neither M2 nor M3 is measurable on the 5-question corpus slice, for two
 # different and equally load-bearing reasons. Both are therefore scored on a
 # pinned synthetic fixture and labelled as plumbing evidence, never as a result.
 #
-# M2: the slice's evidence sessions contain no exact restatements at all, so the
-# labeled duplicate set is empty and every arm scores 0.0 for lack of labels
-# rather than for lack of dedup. The emitted ``m2_corpus_labeled_pairs`` count
-# makes that visible instead of letting three zeros look like a measurement.
+# M2: the slice's evidence sessions contain few exact restatements, so the
+# corpus-derived labeled set is far too thin to score. The emitted
+# ``m2_labeled_pairs`` counts make that visible — including the within/cross
+# lineage split the §8 M2-fail diagnosis needs — instead of letting three near-zero
+# F1s look like a measurement.
 M2_SMOKE_CAVEAT = (
-    "synthetic fixture: the 5-question corpus slice contains no exact "
-    "restatements (see m2_corpus_labeled_pairs), so M2 is exercised on pinned "
+    "synthetic fixture: the 5-question corpus slice carries too few exact "
+    "restatements to score (see m2_labeled_pairs), so M2 is exercised on pinned "
     "fixture claims. Plumbing evidence only, not an M2 result."
+)
+
+# M1: the stub judge is exact string match and the stub answerer echoes the
+# top-1 claim, so the accuracies below measure the retriever's luck, not a model.
+# The denominator is 5, not the pinned 78, so no gate verdict is even computable.
+M1_SMOKE_CAVEAT = (
+    "offline stubs over 5 questions: the answerer echoes the top-1 claim and the "
+    "judge is exact string match, and N=5 is not the pinned N=78, so no gate "
+    "verdict is computed. Plumbing evidence only, not an M1 result."
+)
+
+# M4: the timings come from a counting clock, not a real one, so the smoke's
+# results file stays byte-identical across runs.
+M4_SMOKE_CAVEAT = (
+    "deterministic counting clock, not wall time, so the smoke stays "
+    "byte-identical across runs; latencies are a fixed step per query and the "
+    "tripwire is exercised, not measured. Plumbing evidence only, not an M4 "
+    "result."
 )
 
 # M3: LongMemEval ships no old-value (stale) annotations, so a corpus-scored M3
@@ -603,13 +643,17 @@ class QuestionRun:
     duplicate_groups: list[list[str]]
     clusters: dict[str, list[list[str]]]
     retriever_params: dict[str, dict]
+    linked_claims: list[Claim]
+    linker_stats: LinkerStats
 
 
 def run_three_arm_question(record: dict, retriever: Retriever) -> QuestionRun:
     """Answer one question with arms A, B and C — scoring happens later, blind.
 
-    A single :class:`SharedLinker` serves all three arms, so the extracted claims
-    are byte-identical across them — the design's fairness constraint.
+    A single :class:`~benchmarks.longmemeval.linker.SharedLinker` serves all
+    three arms, so the extracted claims are byte-identical across them — the
+    design's fairness constraint. Its claims and stats are carried out because
+    M2's ground truth is derived from them and its recall is what bounds Arm C.
     """
     linker = SharedLinker(record["question_id"])
     config = smoke_config(linker)
@@ -648,6 +692,8 @@ def run_three_arm_question(record: dict, retriever: Retriever) -> QuestionRun:
         duplicate_groups=linker.duplicate_groups(),
         clusters=clusters,
         retriever_params=retriever_params,
+        linked_claims=linker.claims,
+        linker_stats=linker.stats,
     )
 
 
@@ -656,12 +702,15 @@ def run_fixture_metrics(
 ) -> tuple[
     dict[str, m2_dedup.DedupScore],
     dict[str, m3_contamination.ContaminationScore],
+    m4_perf.M4Report,
 ]:
-    """Score M2 and M3 for all three arms over the pinned fixture.
+    """Score M2, M3 and M4 for all three arms over the pinned fixture.
 
-    One set of stores is ingested and scored twice, so both metrics see the
-    identical memory state — the same guarantee the corpus path gets from the
-    shared linker.
+    One set of stores is ingested and scored three times, so every metric sees
+    the identical memory state — the same guarantee the corpus path gets from
+    the shared linker. M4 times a :class:`~benchmarks.longmemeval.metrics.m4_perf.CountingClock`
+    rather than wall time so the emitted numbers stay byte-identical across runs
+    (see :data:`M4_SMOKE_CAVEAT`).
     """
     stores: dict[str, MemoryStore] = {}
     for arm in ARM_STORES:
@@ -676,7 +725,35 @@ def run_fixture_metrics(
         stores,
         top_k=SMOKE_M3_TOP_K,
     )
-    return m2, m3
+    m4 = m4_perf.measure_arms(
+        stores,
+        FIXTURE_QUESTIONS,
+        top_k=SMOKE_M3_TOP_K,
+        clock_factory=lambda: m4_perf.CountingClock(SMOKE_M4_CLOCK_STEP_SECONDS),
+    )
+    return m2, m3, m4
+
+
+def _m5_cross_implementation(status: object) -> dict[str, Any]:
+    """The W-M5 two-implementation counts, when this tree's reader reports them.
+
+    Read with :func:`getattr` rather than attribute access because the second
+    canonical reader (design doc §7.4 option (a)) lands on its own branch: until
+    it merges, ``GateStatus`` carries no ``cross_implementation`` field at all,
+    and this row must not crash or drop the rest of the metrics on its absence.
+
+    ``None`` therefore means "this tree has no independent reader yet", which is a
+    different statement from ``0``: zero would claim the cross-check ran and
+    matched nothing. The pinned gate's own standing stays where it already is —
+    ``m5_gate_runnable`` / ``m5_gate_blocker``, read straight off the status.
+    """
+    cross = getattr(status, "cross_implementation", None)
+    if cross is None:
+        return {"identical": None, "total": None}
+    return {
+        "identical": getattr(cross, "identical", None),
+        "total": getattr(cross, "total", None),
+    }
 
 
 def run_3arm_smoke(
@@ -684,16 +761,16 @@ def run_3arm_smoke(
     data_directory: Path | None = None,
     samples_root: Path = SAMPLES_ROOT,
 ) -> list[dict]:
-    """Run arms A+B+C and metrics M2+M3+M5 end-to-end, offline.
+    """Run arms A+B+C and metrics M1+M2+M3+M4+M5 end-to-end, offline.
 
     Emits one ``arm_question`` row per (question, arm) plus one ``metrics``
-    summary row carrying the M2 / M3 / M5 outcomes and the caveats that keep the
-    smoke's numbers from being read as benchmark results. Deterministic: a rerun
-    is byte-identical.
+    summary row carrying every metric outcome, the shared linker's recall stats,
+    and the caveats that keep the smoke's numbers from being read as benchmark
+    results. Deterministic: a rerun is byte-identical.
 
     All three arms answer first; the judge then scores one shuffled,
     de-identified batch of every (arm, question) candidate, per design doc §6.1
-    guard 1.
+    guard 1. M1 is computed from those same blind verdicts.
     """
     records = load_pinned_ku_questions(data_directory)
     retriever = BM25Retriever()
@@ -701,9 +778,6 @@ def run_3arm_smoke(
     questions = [QAItem(question=r["question"], gold=r["answer"]) for r in records]
 
     runs = [run_three_arm_question(record, retriever) for record in records]
-    labeled_groups: list[list[str]] = [
-        group for run in runs for group in run.duplicate_groups
-    ]
 
     # Every question ran that arm against the same shared retriever, and run_arm
     # checked each store against it, so any question's record is the arm's record.
@@ -725,25 +799,39 @@ def run_3arm_smoke(
         for arm in ARM_STORES:
             rows.append({**run.rows[arm], "correct": scored[arm].verdicts[index]})
 
-    # The corpus slice's labeled duplicate set, pooled across questions (claim
-    # ids are question-scoped, so pooling cannot create cross-question pairs).
-    # Reported as a count because it is empty — see M2_SMOKE_CAVEAT.
-    corpus_labeled_pairs = m2_dedup.labeled_pairs_from_groups(labeled_groups)
-    m2, m3 = run_fixture_metrics(retriever)
+    # M2's labeled duplicate set over the corpus slice, pooled across questions.
+    # Pooling is what surfaces the cross-lineage pairs: lineages are
+    # question-scoped, so a body restated under two questions lands in two
+    # lineages — exactly the fragmentation artifact M2's 2026-07-19 annotation
+    # makes the §8 diagnosis check for first.
+    labeled = labeled_pairs.labeled_pairs_from_claims(
+        claim for run in runs for claim in run.linked_claims
+    )
+    linker_stats = LinkerStats.total(run.linker_stats for run in runs)
+
+    m1 = m1_qa.score_m1(scored, resamples=SMOKE_M1_RESAMPLES)
+    m2, m3, m4 = run_fixture_metrics(retriever)
     m5 = m5_roundtrip.gate_status(samples_root)
 
     rows.append(
         {
             "kind": "metrics",
+            "linker": linker_stats.as_record(),
+            "m1": m1.as_record(),
+            "m1_caveat": M1_SMOKE_CAVEAT,
             "m2_f1": {arm: score.f1 for arm, score in sorted(m2.items())},
-            "m2_corpus_labeled_pairs": len(corpus_labeled_pairs),
+            "m2_labeled_pairs": labeled.as_record(),
+            "m2_labeled_pairs_derivation": labeled.derivation,
             "m2_caveat": M2_SMOKE_CAVEAT,
             "m3_rate": {arm: score.rate for arm, score in sorted(m3.items())},
             "m3_caveat": M3_SMOKE_CAVEAT,
+            "m4": m4.as_record(),
+            "m4_caveat": M4_SMOKE_CAVEAT,
             "m5_verdict_agreements": m5.verdict_agreement.agreements,
             "m5_verdict_total": m5.verdict_agreement.total,
             "m5_byte_identical": m5.byte_equality.identical,
             "m5_byte_total": m5.byte_equality.total,
+            "m5_cross_implementation": _m5_cross_implementation(m5),
             "m5_gate_runnable": m5.runnable,
             "m5_gate_blocker": m5.blocker,
         }
@@ -812,13 +900,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"({len(SMOKE_KU_QUESTION_IDS)} questions x {len(ARM_STORES)} arms "
             f"= {len(arm_rows)} arm rows + 1 metrics row)"
         )
+        print(
+            f"  linker: {metrics['linker']['records']} records, "
+            f"{metrics['linker']['lineages']} lineages, "
+            f"{metrics['linker']['supersedes_edges']} update edges "
+            "(this bounds Arm C)"
+        )
+        print(
+            f"  M1 accuracy (caveated): {metrics['m1']['accuracy']}; "
+            f"gate verdict: {metrics['m1']['gate_verdict']}"
+        )
         print(f"  M2 F1 (caveated): {metrics['m2_f1']}")
+        print(f"  M2 labeled pairs: {metrics['m2_labeled_pairs']}")
         print(f"  M3 rate (fixture): {metrics['m3_rate']}")
+        print(
+            f"  M4 p95 ms (counting clock): {metrics['m4']['p95_ms']}; "
+            f"tripwire flags: {len(metrics['m4']['tripwire_flags'])}"
+        )
+        cross = metrics["m5_cross_implementation"]
+        cross_note = (
+            f", cross-impl {cross['identical']}/{cross['total']}"
+            if cross["total"] is not None
+            else ""
+        )
         print(
             f"  M5 verdict {metrics['m5_verdict_agreements']}/"
             f"{metrics['m5_verdict_total']} agree, byte-equal "
-            f"{metrics['m5_byte_identical']}/{metrics['m5_byte_total']}; "
-            f"pinned gate runnable: {metrics['m5_gate_runnable']}"
+            f"{metrics['m5_byte_identical']}/{metrics['m5_byte_total']}"
+            f"{cross_note}; pinned gate runnable: {metrics['m5_gate_runnable']}"
         )
         return 0
 
