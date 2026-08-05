@@ -1,8 +1,7 @@
 """M5 — cross-tool round-trip determinism for Aphelion packages.
 
 M5 asks whether an Aphelion package survives a round trip byte-for-byte. This
-module provides the two checks that are buildable today, and refuses to let the
-pinned gate be reported from either of them alone:
+module provides three checks, in increasing strength:
 
 1. :func:`roundtrip_agreement` — **verdict level, genuinely cross-tool.** Wraps
    ``scripts/external_reader.py``, a stdlib-only reader that never imports
@@ -14,16 +13,20 @@ pinned gate be reported from either of them alone:
    through the installed package; nothing here re-implements canonical
    serialization, so a serialization bug cannot be masked by a second copy of the
    same mistake.
+3. :func:`cross_implementation_byte_equality` — **byte level AND cross-tool: the
+   pinned gate.** SHA-256-compares the reference writer's archive against the
+   independent reader's ``canonical_archive_bytes`` for the same source package.
+   Two implementations, one logical input, byte-for-byte.
 
-**The pinned M5 gate is NOT satisfied by either.** ``preregister.json`` pins
-option (a) ``W-M5``: a *second, fully independent* canonical reader whose bytes
-are compared against the reference (design doc §7.4). Check 1 is cross-tool but
-only verdict-deep; check 2 is byte-deep but single-implementation. Together they
-are design-doc option **(b)**, which §7.4 records as explicitly *not* pinned —
-"M5 is blocked, not waived and not silently downgraded to (b)". Landing W-M5
-means expanding ``scripts/external_reader.py`` into a full canonical reader.
-:func:`gate_status` exists so a runner reports that blockage instead of quietly
-publishing an option-(b) number as if it were the gate.
+Checks 1 and 2 are design-doc option **(b)**, which §7.4 records as explicitly
+*not* pinned. ``preregister.json`` pins option (a) ``W-M5``: a second, fully
+independent canonical reader whose bytes are compared against the reference.
+**W-M5 has landed** — ``scripts/external_reader.py`` now implements canonical
+JSON, NFC, claim-hash recomputation and ustar framing from the specs, without
+importing ``aphelion`` or delegating to ``tarfile``/``json.dumps`` — so check 3
+runs and :func:`gate_status` reports the gate as runnable. It stays a status
+object rather than a bare pass/fail so a runner still cannot publish the
+option-(b) numbers as if they were the pinned gate.
 
 Pure stdlib plus the ``aphelion`` package itself. No model or network calls.
 """
@@ -254,14 +257,108 @@ def byte_equality(samples_root: Path, workdir: Path | None = None) -> ByteEquali
 
 
 # ---------------------------------------------------------------------------
-# Gate status — the pinned M5 gate cannot be reported from this module
+# The pinned gate — reference bytes vs an independent implementation's bytes
 # ---------------------------------------------------------------------------
 
-#: Why the pinned M5 gate cannot run yet. ``preregister.json`` pins option (a):
-#: a second, fully independent canonical reader (``W-M5``). Until that lands in
-#: ``scripts/external_reader.py``, the byte-level check here covers only the
-#: reference implementation, so the gate is blocked — design doc §7.4 forbids
-#: silently downgrading it to option (b).
+
+@dataclass(frozen=True)
+class CrossImplementationEquality:
+    """Two-implementation byte equality over a set of source packages.
+
+    ``unpackable`` records packages the *reference* refused to pack, with the
+    Aphelion error code that rejected them, so the denominator stays auditable
+    rather than silently shrinking. A package the reference rejects has no
+    reference bytes to compare against, so it is out of scope for this check —
+    it is covered by :func:`roundtrip_agreement` at the verdict layer.
+    """
+
+    total: int
+    identical: int
+    mismatches: tuple[str, ...]
+    unpackable: tuple[tuple[str, str], ...]
+
+    @property
+    def rate(self) -> float:
+        """Fraction of comparable packages whose two implementations agreed."""
+        return self.identical / self.total if self.total else 0.0
+
+    @property
+    def all_identical(self) -> bool:
+        return self.total > 0 and not self.mismatches
+
+
+def reader_has_canonical_api() -> bool:
+    """Whether ``external_reader.py`` exposes the W-M5 canonical byte surface."""
+    return hasattr(_reader(), "canonical_archive_bytes")
+
+
+def cross_implementation_digests(sample: Path, workdir: Path) -> tuple[str, str]:
+    """``(reference_digest, independent_digest)`` for one source package.
+
+    The reference side goes through ``aphelion.packer.pack``; the independent
+    side through the stdlib-only reader. Neither shares code with the other.
+    """
+    from aphelion.packer import pack
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    reference = Path(pack(sample, workdir / "reference.aphelion.tar"))
+    independent = _reader().canonical_archive_bytes(sample)
+    return package_digest(reference), hashlib.sha256(independent).hexdigest()
+
+
+def cross_implementation_byte_equality(
+    samples_root: Path, workdir: Path | None = None
+) -> CrossImplementationEquality:
+    """The pinned M5 gate over every package under ``samples_root``.
+
+    ``workdir`` defaults to a temporary directory removed on return, so the
+    check leaves nothing behind and never writes into ``samples/``.
+    """
+    if workdir is None:
+        with tempfile.TemporaryDirectory() as tmp:
+            return cross_implementation_byte_equality(samples_root, Path(tmp))
+
+    from aphelion.errors import AphelionError
+
+    identical = 0
+    mismatches: list[str] = []
+    unpackable: list[tuple[str, str]] = []
+    for index, sample in enumerate(_scored_samples(samples_root)):
+        try:
+            reference, independent = cross_implementation_digests(
+                sample, workdir / f"x{index:03d}"
+            )
+        except AphelionError as exc:
+            code = exc.code.value if hasattr(exc.code, "value") else exc.code
+            unpackable.append((sample.name, str(code)))
+            continue
+        except ValueError as exc:
+            # The independent reader refused a package the reference accepted
+            # (``CanonicalError`` derives from ``ValueError``). That is a gate
+            # failure to record, not an exception to escape into the runner.
+            mismatches.append(f"{sample.name} (independent reader: {exc})")
+            continue
+        if reference == independent:
+            identical += 1
+        else:
+            mismatches.append(sample.name)
+
+    return CrossImplementationEquality(
+        total=identical + len(mismatches),
+        identical=identical,
+        mismatches=tuple(mismatches),
+        unpackable=tuple(unpackable),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gate status
+# ---------------------------------------------------------------------------
+
+#: Why the pinned M5 gate would be unrunnable. ``preregister.json`` pins option
+#: (a): a second, fully independent canonical reader (``W-M5``). W-M5 has
+#: landed, so this now only fires if ``scripts/external_reader.py`` regresses to
+#: verdict-only — design doc §7.4 forbids silently downgrading M5 to option (b).
 GATE_BLOCKER = (
     "W-M5 not landed: scripts/external_reader.py reproduces the validator "
     "verdict only, not canonical bytes, so no second implementation exists to "
@@ -269,26 +366,51 @@ GATE_BLOCKER = (
     "records that M5 is blocked, not waived and not downgraded to option (b)."
 )
 
+#: Where the two implementations were found to disagree with the written spec.
+#: Both writers pad the archive to a 10240-byte record, which
+#: ``spec/canonical-serialization.md`` Rule 5 §10 ("exactly two zero-filled
+#: 512-byte blocks... No extra trailing bytes") does not describe. Surfaced by
+#: W-M5 and pending maintainer adjudication; it does not affect the gate, which
+#: compares two implementations against each other.
+SPEC_FINDINGS = (
+    "Rule 5 §10 (EOF blocks) does not describe what any tar writer emits: the "
+    "archive is padded to a 10240-byte record. Rule 5 §7 (device major/minor) "
+    "is satisfied by two different encodings of zero. Both were found by the "
+    "W-M5 second implementation; see scripts/external_reader.py.",
+)
+
 
 @dataclass(frozen=True)
 class GateStatus:
-    """Whether the pinned M5 gate is runnable, and the evidence gathered so far."""
+    """Whether the pinned M5 gate is runnable, and the evidence gathered."""
 
     runnable: bool
     blocker: str
     verdict_agreement: VerdictAgreement
     byte_equality: ByteEquality
+    cross_implementation: CrossImplementationEquality
+
+    @property
+    def passed(self) -> bool:
+        """True iff the pinned gate ran and every comparable package matched."""
+        return self.runnable and self.cross_implementation.all_identical
 
 
 def gate_status(samples_root: Path, workdir: Path | None = None) -> GateStatus:
-    """Collect both M5 checks and report the pinned gate as **not** runnable.
+    """Collect all three M5 checks and report the pinned gate's outcome.
 
     Returning a status object rather than a bare pass/fail keeps a runner from
     publishing the option-(b) numbers as if they were the pinned option-(a) gate.
     """
+    runnable = reader_has_canonical_api()
+    if runnable:
+        cross = cross_implementation_byte_equality(samples_root, workdir)
+    else:
+        cross = CrossImplementationEquality(0, 0, (), ())
     return GateStatus(
-        runnable=False,
-        blocker=GATE_BLOCKER,
+        runnable=runnable,
+        blocker="" if runnable else GATE_BLOCKER,
         verdict_agreement=roundtrip_agreement(samples_root),
         byte_equality=byte_equality(samples_root, workdir),
+        cross_implementation=cross,
     )

@@ -1,38 +1,479 @@
-"""Minimal independent Aphelion reader.
+"""Independent Aphelion reader — canonical bytes and lifecycle verdicts.
 
 Purpose
 -------
-This script is a *third-party* demonstration that Aphelion packages can be
-read and semantically classified (valid / invalid) without importing
-the ``aphelion`` reference validator or any Parallax code. It exists to
-prove the wire format is self-describing.
+This script is a *third-party* implementation of the Aphelion wire format,
+written against the published specs and importing neither the ``aphelion``
+reference implementation nor any Parallax code. It exists so the format's
+determinism claim can be tested the only way that means anything: two
+implementations, same logical input, compared byte for byte.
+
+It covers two layers:
+
+1. **Canonical serialization** (``canonical_archive_bytes`` and friends) —
+   reproduces the exact bytes of a packaged Aphelion archive per
+   ``spec/canonical-serialization.md``: canonical JSON (Rule 1), NFC (Rule 2),
+   ``claims[].hash`` recomputation (``spec/packaging.md`` Rule 3.a), and POSIX
+   ustar framing (Rule 5). This is work item **W-M5**; it is what the M5 gate
+   in ``benchmarks/longmemeval/metrics/m5_roundtrip.py`` compares against.
+2. **Lifecycle classification** (``emit_sample_json``) — enough state-machine
+   logic to reproduce the ``validator_verdict`` in each sample's
+   ``expected-normalized.json``. This layer is deliberately *not* a full
+   validator; ``spec/lifecycle-state-machine.md`` is authoritative.
 
 Contract
 --------
-- stdlib only: ``json`` / ``pathlib`` / ``sys`` / ``hashlib``.
-- Must NOT ``import aphelion`` or ``import parallax`` / ``import memory``.
-- Must run under Python 3.11+.
-- Exit codes:
-    0 — every sample's classification matches its expected verdict
-    1 — at least one mismatch (printed to stderr)
+- stdlib only: ``hashlib`` / ``json`` / ``pathlib`` / ``sys`` / ``unicodedata``.
+- Must NOT ``import aphelion`` / ``parallax`` / ``memory``.
+- Must NOT delegate the two layers under test. ``json`` is imported to *parse*
+  input, never to emit canonical bytes (no ``json.dumps``), and ``tarfile`` is
+  not imported at all — the reference writer is built on it, so reusing it
+  would collapse the two-implementation comparison into one implementation
+  compared with itself. Guarded by
+  ``tests/test_external_reader.py::test_reader_is_not_delegating_the_layers_it_must_reimplement``.
+- Must run under Python 3.10+.
+
+Known divergence from the written spec
+--------------------------------------
+``spec/canonical-serialization.md`` Rule 5 §10 states: "exactly two zero-filled
+512-byte blocks terminate the archive. No extra trailing bytes." No writer
+behaves that way. The reference implementation (Python ``tarfile``) — like GNU
+tar, BSD tar, and every other conventional implementation — pads the archive to
+a 20-block, 10240-byte record. An implementer following §10 literally produces
+a shorter archive and fails byte-equality on *every* package. This reader
+matches the observable format and exposes ``record_padding=False`` for the
+spec-literal reading, so the gap is measurable rather than hidden. Per the
+spec's own Determinism Checklist, that makes §10 a spec defect to be
+adjudicated, not a writer bug. Pinned by
+``tests/test_external_reader.py::test_spec_rule5_eof_padding_diverges_from_the_written_spec``.
 
 Usage
 -----
-    python scripts/external_reader.py samples/
+    python scripts/external_reader.py samples/            # verdict cross-check
+    python scripts/external_reader.py --canonical PKG     # archive SHA-256
 
-Scope
------
-This is NOT a full validator. It implements just enough lifecycle /
-schema logic to reproduce the ``validator_verdict`` field in each
-sample's ``expected-normalized.json``. See ``spec/lifecycle-state-machine.md``
-for the authoritative rules.
+Exit codes (verdict cross-check mode):
+    0 — every sample's classification matches its expected verdict
+    1 — at least one mismatch (printed to stderr)
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
+import unicodedata
 from pathlib import Path
+from typing import Any
+
+
+class CanonicalError(ValueError):
+    """Input cannot be expressed in Aphelion canonical form."""
+
+
+# =========================================================================== #
+# Rule 1 / Rule 2 — canonical JSON                                            #
+# =========================================================================== #
+
+# Rule 1 §4: the *only* escapes. Everything else at or above U+0020 is emitted
+# raw, including non-ASCII (no \uXXXX) and U+007F DEL.
+_JSON_ESCAPES = {
+    '"': '\\"',
+    "\\": "\\\\",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
+def _to_canonical_tree(value: Any) -> Any:
+    """NFC-normalize recursively and reject anything outside the canonical subset.
+
+    Rule 2 §2 requires NFC *before* key sorting, so normalization happens here
+    and ordering happens at encode time on the already-normalized keys.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # Rule 1 §5: shortest-round-trip float serialization is language
+        # dependent, so format-required numeric fields may not be free-form
+        # floats. No manifest or provenance field is float-typed.
+        raise CanonicalError(
+            "float values are forbidden in canonical JSON (Rule 1 §5); "
+            "use an integer or a fixed-decimal string"
+        )
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, (list, tuple)):
+        return [_to_canonical_tree(item) for item in value]
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise CanonicalError(
+                    f"object keys must be strings, got {type(key).__name__}"
+                )
+            normalized = unicodedata.normalize("NFC", key)
+            if normalized in out:
+                raise CanonicalError(
+                    f"object keys collide under NFC normalization: {normalized!r}"
+                )
+            out[normalized] = _to_canonical_tree(item)
+        return out
+    raise CanonicalError(f"unsupported type in canonical JSON: {type(value).__name__}")
+
+
+def _encode_string(value: str) -> str:
+    pieces = ['"']
+    for char in value:
+        escape = _JSON_ESCAPES.get(char)
+        if escape is not None:
+            pieces.append(escape)
+        elif char < "\x20":
+            pieces.append(f"\\u{ord(char):04x}")
+        else:
+            pieces.append(char)
+    pieces.append('"')
+    return "".join(pieces)
+
+
+def _encode(value: Any) -> str:
+    """Rule 1 §1/§3/§5: sorted keys, no spaces, integers only."""
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return _encode_string(value)
+    if isinstance(value, list):
+        return "[" + ",".join(_encode(item) for item in value) + "]"
+    if isinstance(value, dict):
+        # sorted() on str compares by Unicode codepoint, which is what Rule 1 §1
+        # asks for. Keys are already NFC at this point.
+        return (
+            "{"
+            + ",".join(f"{_encode_string(k)}:{_encode(value[k])}" for k in sorted(value))
+            + "}"
+        )
+    raise CanonicalError(f"unsupported type in canonical JSON: {type(value).__name__}")
+
+
+def canonical_json_bytes(obj: Any) -> bytes:
+    """Serialize ``obj`` to canonical-JSON bytes, terminated by one LF (Rule 1 §6)."""
+    text = _encode(_to_canonical_tree(obj))
+    try:
+        return text.encode("utf-8") + b"\n"
+    except UnicodeEncodeError as err:
+        # Rule 2 §3: unpaired surrogates are a syntax error.
+        raise CanonicalError(f"string is not encodable as UTF-8: {err}") from err
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise CanonicalError(f"duplicate JSON object key: {key!r}")
+        out[key] = value
+    return out
+
+
+def _reject_json_constant(constant: str) -> Any:
+    raise CanonicalError(f"NaN/Infinity is forbidden in canonical JSON: {constant}")
+
+
+def _parse_json(raw: bytes, where: str) -> Any:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as err:
+        raise CanonicalError(f"{where}: invalid UTF-8: {err}") from err
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except json.JSONDecodeError as err:
+        raise CanonicalError(f"{where}: {err}") from err
+
+
+# =========================================================================== #
+# Rule 5 — POSIX ustar framing                                                #
+# =========================================================================== #
+
+BLOCK_SIZE = 512
+#: Conventional tar blocking factor (20 blocks). See the module docstring's
+#: "Known divergence" note: Rule 5 §10 does not mention it, every writer emits
+#: it, and byte-equality is impossible without it.
+RECORD_SIZE = 10240
+
+_USTAR_MAGIC = b"ustar\x0000"  # magic "ustar\0" + version "00"
+_MODE_FILE = 0o644  # Rule 5 §6
+_MODE_DIR = 0o755
+_MAX_USTAR_NAME = 100  # Rule 5 §1
+
+
+class TarMember:
+    """One archive member. ``path`` is a POSIX path, NFC-normalized on write.
+
+    A plain class rather than a dataclass on purpose: this file must stay
+    loadable by any third-party harness, including the bare
+    ``spec_from_file_location`` → ``exec_module`` recipe that skips
+    ``sys.modules`` registration. ``dataclasses`` resolves string annotations
+    through ``sys.modules`` and raises under that recipe.
+    """
+
+    __slots__ = ("path", "data", "is_dir")
+
+    def __init__(self, path: str, data: bytes = b"", is_dir: bool = False) -> None:
+        self.path = path
+        self.data = data
+        self.is_dir = is_dir
+
+    def normalized_path(self) -> str:
+        return unicodedata.normalize("NFC", self.path)
+
+    def archive_name(self) -> str:
+        """The name as stored in the header.
+
+        Directory entries carry a trailing ``/`` — the conventional tar
+        encoding, and what distinguishes a directory member from a regular file
+        of the same name. Rule 5 §2 orders members by this full stored path.
+        """
+        name = self.normalized_path()
+        if self.is_dir and not name.endswith("/"):
+            name += "/"
+        return name
+
+    def __repr__(self) -> str:
+        return (
+            f"TarMember(path={self.path!r}, size={len(self.data)}, "
+            f"is_dir={self.is_dir})"
+        )
+
+
+def _octal_field(value: int, width: int) -> bytes:
+    """A ustar numeric field: ``width - 1`` zero-padded octal digits, then NUL."""
+    digits = width - 1
+    if value < 0 or value >= 8**digits:
+        raise CanonicalError(f"value {value} does not fit a {width}-byte ustar field")
+    return f"{value:0{digits}o}".encode("ascii") + b"\x00"
+
+
+def _ustar_header(member: TarMember) -> bytes:
+    """Build one 512-byte ustar header block per Rule 5 §1-§8."""
+    name = member.archive_name().encode("utf-8")
+    if len(name) > _MAX_USTAR_NAME:
+        # Rule 5 §1 forbids the ustar prefix+name split and mandates a pax
+        # extended header instead. The reference writer is pinned to
+        # tarfile.USTAR_FORMAT, which cannot emit pax and would fall back to the
+        # forbidden split — so there is no agreed encoding to reproduce here.
+        # Unreachable for conformant v2.0 packages: claim paths are
+        # claims/<uuid>.md (46 bytes) and every other member name is fixed.
+        raise CanonicalError(
+            f"member path needs a pax extended header (Rule 5 §1), "
+            f"which this format revision does not define: {member.path!r}"
+        )
+    size = 0 if member.is_dir else len(member.data)
+    prefix = (
+        name.ljust(100, b"\x00")
+        + _octal_field(_MODE_DIR if member.is_dir else _MODE_FILE, 8)
+        + _octal_field(0, 8)  # uid — Rule 5 §5
+        + _octal_field(0, 8)  # gid
+        + _octal_field(size, 12)
+        + _octal_field(0, 12)  # mtime — Rule 5 §3
+    )
+    suffix = (
+        (b"5" if member.is_dir else b"0")  # typeflag
+        + b"\x00" * 100  # linkname — Rule 5 §8
+        + _USTAR_MAGIC
+        + b"\x00" * 32  # uname — Rule 5 §5
+        + b"\x00" * 32  # gname
+        # Rule 5 §7 says device major/minor are 0. For non-device entries tar
+        # encodes that zero as an *empty* field (all NUL) rather than octal
+        # "0000000\0"; readers treat empty as 0. Both readings satisfy §7, only
+        # one reproduces the reference bytes.
+        + b"\x00" * 8  # devmajor
+        + b"\x00" * 8  # devminor
+        + b"\x00" * 155  # prefix — Rule 5 §1 forbids using it
+    )
+    # The checksum is computed with its own field read as eight spaces.
+    header = (prefix + b" " * 8 + suffix).ljust(BLOCK_SIZE, b"\x00")
+    checksum = sum(header)
+    return header[:148] + f"{checksum:06o}".encode("ascii") + b"\x00 " + header[156:]
+
+
+def canonical_tar_bytes(
+    members: list[TarMember], *, record_padding: bool = True
+) -> bytes:
+    """Pack ``members`` into canonical uncompressed tar bytes (Rule 5).
+
+    ``record_padding=False`` emits the literal Rule 5 §10 reading (two EOF
+    blocks, nothing after). It does not match any real writer; see the module
+    docstring.
+    """
+    seen: set[str] = set()
+    for member in members:
+        stored = member.archive_name()
+        if stored in seen:
+            raise CanonicalError(f"duplicate member path after NFC: {stored!r}")
+        seen.add(stored)
+        if member.is_dir and member.data:
+            raise CanonicalError(f"directory member must not carry data: {stored!r}")
+
+    chunks: list[bytes] = []
+    # Rule 5 §2: lexicographic by full path, compared as codepoints.
+    for member in sorted(members, key=lambda m: m.archive_name()):
+        chunks.append(_ustar_header(member))
+        if member.is_dir or not member.data:
+            continue
+        chunks.append(member.data)
+        remainder = len(member.data) % BLOCK_SIZE
+        if remainder:
+            chunks.append(b"\x00" * (BLOCK_SIZE - remainder))  # Rule 5 §9
+
+    chunks.append(b"\x00" * (BLOCK_SIZE * 2))  # Rule 5 §10
+    archive = b"".join(chunks)
+    if record_padding:
+        remainder = len(archive) % RECORD_SIZE
+        if remainder:
+            archive += b"\x00" * (RECORD_SIZE - remainder)
+    return archive
+
+
+# =========================================================================== #
+# Package-level canonical form                                                #
+# =========================================================================== #
+
+
+def _resolve_member(package: Path, relative: str) -> Path:
+    """Resolve a package-relative member path, refusing anything that escapes.
+
+    A manifest is untrusted input, and ``claims[].path`` decides which file gets
+    read and folded into the canonical bytes. The reference implementation is
+    shielded here by its validator, which pins claim paths to
+    ``claims/<uuid>.md`` before ``pack`` ever opens a file; this reader is asked
+    to canonicalize packages that validator has not necessarily seen, so it
+    enforces containment itself. ``spec/packaging.md`` Rule 5 forbids absolute
+    paths, ``..`` traversal and backslash separators for the same reason.
+
+    Scope boundary — symlinks are NOT resolved. A claim file that is a symlink
+    pointing outside the package is still read, because the reference writer
+    reads it too (``packer._read_bytes`` is a bare ``Path.read_bytes``, and the
+    project's symlink guard lives in ``canonical_tar.read_members``, i.e. at
+    archive *extraction*, not at pack time). Blocking it here would make this
+    reader diverge from the implementation it exists to be compared against, so
+    the M5 gate would report a format mismatch that is really a policy
+    difference. Closing this needs a decision on the *reference's* source-
+    directory threat model, which is above this file — raised as an open item
+    rather than papered over locally.
+    """
+    if not relative:
+        raise CanonicalError("member path must not be empty")
+    if "\\" in relative:
+        raise CanonicalError(f"member path must use '/' separators: {relative!r}")
+    parts = relative.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise CanonicalError(
+            f"member path must be a clean relative path: {relative!r}"
+        )
+    candidate = package / relative
+    try:
+        # Catches absolute and drive-qualified forms, which override the join.
+        candidate.relative_to(package)
+    except ValueError as err:
+        raise CanonicalError(
+            f"member path escapes the package directory: {relative!r}"
+        ) from err
+    return candidate
+
+
+def _read_member_bytes(package: Path, relative: str) -> bytes:
+    try:
+        return _resolve_member(package, relative).read_bytes()
+    except OSError as err:
+        raise CanonicalError(f"{relative}: {err}") from err
+
+
+def _manifest_with_recomputed_hashes(package: Path) -> tuple[dict, list[TarMember]]:
+    """Load the manifest, recompute every ``claims[].hash``, collect claim members.
+
+    ``spec/packaging.md`` Rule 3.a: the digest is taken over the complete claim
+    file bytes exactly as they enter the archive. A manifest's stored hash is
+    an assertion to be recomputed, never a value to copy through.
+    """
+    manifest = _to_canonical_tree(_parse_json(
+        _read_member_bytes(package, "manifest.json"), "manifest.json"
+    ))
+    if not isinstance(manifest, dict):
+        raise CanonicalError("manifest.json must be a JSON object")
+    claims = manifest.get("claims")
+    if not isinstance(claims, list):
+        raise CanonicalError("manifest 'claims' must be an array")
+
+    members: list[TarMember] = []
+    for index, entry in enumerate(claims):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise CanonicalError(f"claims[{index}] must carry a string 'path'")
+        relative = entry["path"]
+        blob = _read_member_bytes(package, relative)
+        entry["hash"] = hashlib.sha256(blob).hexdigest()
+        members.append(TarMember(path=relative, data=blob))
+    return manifest, members
+
+
+def canonical_manifest_bytes(package_dir: Path | str) -> bytes:
+    """Canonical ``manifest.json`` bytes, with claim hashes recomputed."""
+    manifest, _ = _manifest_with_recomputed_hashes(Path(package_dir))
+    return canonical_json_bytes(manifest)
+
+
+def canonical_provenance_bytes(package_dir: Path | str) -> bytes:
+    """Canonical ``provenance.jsonl`` bytes: one canonical JSON object per line."""
+    package = Path(package_dir)
+    raw = _read_member_bytes(package, "provenance.jsonl")
+    lines: list[bytes] = []
+    for lineno, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            continue
+        event = _parse_json(line, f"provenance.jsonl:{lineno}")
+        lines.append(canonical_json_bytes(event))
+    return b"".join(lines)
+
+
+def canonical_archive_bytes(
+    package_dir: Path | str, *, record_padding: bool = True
+) -> bytes:
+    """The canonical ``*.aphelion.tar`` bytes for a source package directory.
+
+    Members are ``manifest.json``, ``provenance.jsonl``, every claim file named
+    by the manifest, and ``NOTICE`` when present — the same set the reference
+    packer emits, ordered and framed per Rule 5.
+    """
+    package = Path(package_dir)
+    manifest, members = _manifest_with_recomputed_hashes(package)
+    members.append(TarMember("manifest.json", canonical_json_bytes(manifest)))
+    members.append(TarMember("provenance.jsonl", canonical_provenance_bytes(package)))
+    if (package / "NOTICE").exists():
+        members.append(TarMember("NOTICE", _read_member_bytes(package, "NOTICE")))
+    return canonical_tar_bytes(members, record_padding=record_padding)
+
+
+def canonical_archive_sha256(package_dir: Path | str) -> str:
+    """SHA-256 of :func:`canonical_archive_bytes`, as lowercase hex."""
+    return hashlib.sha256(canonical_archive_bytes(package_dir)).hexdigest()
+
+
+# =========================================================================== #
+# Lifecycle classification (verdict layer)                                    #
+# =========================================================================== #
 
 
 _LEGAL_TRANSITIONS = {
@@ -149,8 +590,8 @@ def emit_sample_json(sample: Path) -> dict:
     The shape deliberately mirrors the fields consumers actually test
     for — ``validator_verdict``, optional ``error_code``, and a
     minimal ``notes`` block capturing claim_ids / event_count /
-    final_states — without claiming to reproduce the full Aphelion
-    canonical output.
+    final_states. This is the verdict layer only; the canonical *bytes*
+    of a package come from :func:`canonical_archive_bytes`.
     """
     packages = _iter_packages(sample)
     if not packages:
@@ -253,12 +694,27 @@ def _forbid_validator_import() -> None:
             )
 
 
-if __name__ == "__main__":
-    _forbid_validator_import()
-    target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("samples")
+def _main(argv: list[str]) -> int:
+    if argv and argv[0] == "--canonical":
+        if len(argv) != 2:
+            print("usage: external_reader.py --canonical PACKAGE_DIR", file=sys.stderr)
+            return 2
+        try:
+            print(canonical_archive_sha256(Path(argv[1])))
+        except CanonicalError as err:
+            print(f"external_reader: {err}", file=sys.stderr)
+            return 1
+        return 0
+
+    target = Path(argv[0]) if argv else Path("samples")
     # Single-sample mode iff the target itself carries an
     # ``expected-normalized.json``; otherwise treat as samples-root.
     if (target / "expected-normalized.json").exists():
-        print(json.dumps(emit_sample_json(target), sort_keys=True, ensure_ascii=False))
-        raise SystemExit(0)
-    raise SystemExit(run(target))
+        sys.stdout.write(canonical_json_bytes(emit_sample_json(target)).decode("utf-8"))
+        return 0
+    return run(target)
+
+
+if __name__ == "__main__":
+    _forbid_validator_import()
+    raise SystemExit(_main(sys.argv[1:]))

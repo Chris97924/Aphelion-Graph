@@ -888,13 +888,50 @@ def test_m5_independent_verdict_reports_the_error_code_for_an_invalid_sample() -
 
 
 @pytest.mark.unit
-def test_m5_pinned_gate_is_reported_as_blocked() -> None:
-    """Option (b) numbers must never be published as the pinned option (a) gate."""
+def test_m5_pinned_gate_runs_now_that_w_m5_has_landed() -> None:
+    """The pinned option-(a) gate: two implementations, byte-identical archives.
+
+    Before W-M5 this asserted the inverse — ``runnable is False`` with a
+    ``W-M5``-shaped blocker — because ``scripts/external_reader.py`` reproduced
+    only the validator verdict. It now implements canonical serialization, so
+    the gate runs instead of reporting blockage.
+    """
     status = m5_roundtrip.gate_status(_SAMPLES_ROOT)
-    assert status.runnable is False
-    assert "W-M5" in status.blocker
+    assert status.runnable is True
+    assert status.blocker == ""
     assert status.verdict_agreement.all_agree is True
     assert status.byte_equality.all_identical is True
+
+    cross = status.cross_implementation
+    assert cross.mismatches == ()
+    assert cross.all_identical is True
+    assert cross.rate == 1.0
+    assert status.passed is True
+    # Samples the reference itself refuses to pack have no reference bytes to
+    # compare against; they are named, never silently dropped.
+    assert {name for name, _ in cross.unpackable} == {
+        "duplicate-reaffirm-collision",
+        "withdraw-then-illegal-reaffirm",
+    }
+    assert cross.total + len(cross.unpackable) == 8
+
+
+@pytest.mark.unit
+def test_m5_gate_reports_blockage_if_the_reader_regresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the canonical API disappears, the gate must go back to blocked.
+
+    The failure mode this guards is the dangerous one: a reader that quietly
+    loses its canonical layer while the runner keeps publishing an M5 number.
+    """
+    monkeypatch.setattr(m5_roundtrip, "reader_has_canonical_api", lambda: False)
+    status = m5_roundtrip.gate_status(_SAMPLES_ROOT)
+
+    assert status.runnable is False
+    assert "W-M5" in status.blocker
+    assert status.passed is False
+    assert status.cross_implementation.total == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -932,7 +969,10 @@ def test_3arm_smoke_emits_all_arms_and_a_metrics_row(tmp_path: Path) -> None:
     assert set(metrics["m3_rate"]) == {"A", "B", "C"}
     assert metrics["m5_verdict_total"] == 8
     assert metrics["m5_byte_identical"] == metrics["m5_byte_total"] == 6
-    assert metrics["m5_gate_runnable"] is False
+    # W-M5 landed, so the smoke reports a runnable gate with no blocker text.
+    # Before W-M5 these were False / a "W-M5 not landed" sentence.
+    assert metrics["m5_gate_runnable"] is True
+    assert metrics["m5_gate_blocker"] == ""
     # The smoke's own numbers must carry their caveats.
     assert "not an M2 result" in metrics["m2_caveat"]
     assert "not an M3 result" in metrics["m3_caveat"]
