@@ -283,17 +283,32 @@ def _octal_field(value: int, width: int) -> bytes:
 
 def _ustar_header(member: TarMember) -> bytes:
     """Build one 512-byte ustar header block per Rule 5 §1-§8."""
-    name = member.archive_name().encode("utf-8")
-    if len(name) > _MAX_USTAR_NAME:
-        # Rule 5 §1 forbids the ustar prefix+name split and mandates a pax
-        # extended header instead. The reference writer is pinned to
-        # tarfile.USTAR_FORMAT, which cannot emit pax and would fall back to the
-        # forbidden split — so there is no agreed encoding to reproduce here.
-        # Unreachable for conformant v2.0 packages: claim paths are
-        # claims/<uuid>.md (46 bytes) and every other member name is fixed.
+    stored = member.archive_name()
+    name = stored.encode("utf-8")
+    # Rule 5 §1 mandates a pax extended header for a member path that either
+    # exceeds 100 bytes OR carries any non-ASCII byte, and forbids the ustar
+    # prefix+name split. pax is finding F3, still OPEN: the reference writer is
+    # pinned to tarfile.USTAR_FORMAT, which cannot emit pax and would fall back
+    # to the forbidden split, so no agreed encoding exists to reproduce. Writing
+    # a plain ustar header regardless would mint a canonical digest for bytes no
+    # conformant implementation would produce — worse than refusing, because the
+    # digest looks authoritative. Both branches are unreachable for conformant
+    # v2.0 packages: claim paths are claims/<uuid>.md (46 ASCII bytes) and every
+    # other member name is a fixed ASCII literal.
+    if not stored.isascii():
         raise CanonicalError(
-            f"member path needs a pax extended header (Rule 5 §1), "
-            f"which this format revision does not define: {member.path!r}"
+            f"member path {stored!r} carries non-ASCII bytes and therefore "
+            "requires a pax extended header (Rule 5 §1); pax is unsupported in "
+            "this format revision (finding F3, OPEN), so there is no canonical "
+            "encoding for this member to reproduce"
+        )
+    if len(name) > _MAX_USTAR_NAME:
+        raise CanonicalError(
+            f"member path {stored!r} is {len(name)} bytes, past the "
+            f"{_MAX_USTAR_NAME}-byte ustar limit, and therefore requires a pax "
+            "extended header (Rule 5 §1); pax is unsupported in this format "
+            "revision (finding F3, OPEN), so there is no canonical encoding for "
+            "this member to reproduce"
         )
     size = 0 if member.is_dir else len(member.data)
     prefix = (

@@ -28,6 +28,14 @@ runs and :func:`gate_status` reports the gate as runnable. It stays a status
 object rather than a bare pass/fail so a runner still cannot publish the
 option-(b) numbers as if they were the pinned gate.
 
+**Runnable is not passed.** The gate is pinned at ``100/100``, and the committed
+samples afford six comparisons. A mechanism that runs and agrees on everything
+it can reach is a health signal, not the pre-registered result, so
+:attr:`GateStatus.passed` stays ``None`` until at least the pinned denominator
+has been compared and :meth:`GateStatus.gate_verdict` refuses outright below it.
+The denominator is parsed from ``preregister.json`` by :func:`pinned_gate`
+rather than written here, so an amended pin propagates instead of drifting.
+
 Pure stdlib plus the ``aphelion`` package itself. No model or network calls.
 """
 
@@ -36,11 +44,18 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
+
+from benchmarks.longmemeval.pipeline import (
+    PREREGISTER_PATH,
+    GatePinError,
+    preregistered_metric,
+)
 
 # benchmarks/longmemeval/metrics/m5_roundtrip.py -> repo root is three parents up.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -388,27 +403,142 @@ SPEC_FINDINGS = (
 )
 
 
+# "100/100 byte-identical canonical form" — the pinned §4 text. Parsed rather
+# than re-declared so an amended pin propagates instead of drifting.
+_GATE_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s+byte-identical", re.IGNORECASE)
+
+
+class InsufficientCoverageError(ValueError):
+    """A pinned verdict was demanded over fewer packages than the pin requires.
+
+    M5 is pinned at ``100/100``. Six committed samples agreeing is the mechanism
+    working, not the pre-registered result, and reporting it as a PASS is how a
+    plumbing number ends up quoted as a gate outcome. M1 refuses a verdict at
+    ``N != 78`` for the same reason (:class:`UnderpoweredSampleError`); this is
+    the coverage-shaped counterpart.
+    """
+
+
+@dataclass(frozen=True)
+class M5Gate:
+    """The pinned M5 gate, as read from ``preregister.json``."""
+
+    n: int
+    source: str
+
+    def passes(self, identical: int, total: int) -> bool:
+        """``100/100``: the denominator is met and every comparison agreed."""
+        return total >= self.n and identical == total
+
+
+def pinned_gate(path: Path = PREREGISTER_PATH) -> M5Gate:
+    """Parse M5's frozen gate out of the pre-registration.
+
+    Raises :class:`~benchmarks.longmemeval.pipeline.GatePinError` when the pinned
+    text is not the shape this metric enforces. Stopping beats guessing: a
+    fallback constant here would score a run against a gate the pre-registration
+    does not carry (design doc §6.1 guard 3).
+    """
+    record = preregistered_metric("M5", path)
+    gate_text = str(record.get("gate", ""))
+    match = _GATE_RE.match(gate_text)
+    if match is None:
+        raise GatePinError(
+            f"{path}: pinned M5 gate {gate_text!r} is not of the form "
+            "'<n>/<n> byte-identical ...'. This metric enforces that shape and "
+            "will not guess a denominator; re-read the pin (design doc §4) and "
+            "update the parser deliberately."
+        )
+    identical, total = (int(group) for group in match.groups())
+    if identical != total:
+        raise GatePinError(
+            f"{path}: pinned M5 gate {gate_text!r} asks for {identical} of "
+            f"{total} byte-identical. M5 is an absolute determinism contract — "
+            "any single mismatch is a spec hole, not a quality tradeoff (design "
+            "doc §8) — so a partial numerator is not a shape this metric can "
+            "enforce."
+        )
+    return M5Gate(n=total, source=gate_text)
+
+
 @dataclass(frozen=True)
 class GateStatus:
-    """Whether the pinned M5 gate is runnable, and the evidence gathered."""
+    """Whether the pinned M5 gate is runnable, and the evidence gathered.
+
+    Two separate questions live here, and conflating them is the failure this
+    shape exists to prevent:
+
+    * **Is the mechanism healthy?** ``runnable`` plus
+      ``cross_implementation.all_identical`` — the smoke-visible state.
+    * **Did the pinned gate PASS?** ``passed`` — which stays ``None`` until at
+      least ``gate.n`` packages have actually been compared.
+    """
 
     runnable: bool
     blocker: str
     verdict_agreement: VerdictAgreement
     byte_equality: ByteEquality
     cross_implementation: CrossImplementationEquality
+    gate: M5Gate
 
     @property
-    def passed(self) -> bool:
-        """True iff the pinned gate ran and every comparable package matched."""
-        return self.runnable and self.cross_implementation.all_identical
+    def n_scored(self) -> int:
+        """Packages actually compared across the two implementations."""
+        return self.cross_implementation.total
+
+    @property
+    def n_matches_pin(self) -> bool:
+        """True once the pinned denominator is met — the verdict's precondition."""
+        return self.n_scored >= self.gate.n
+
+    @property
+    def verdict_reason(self) -> str:
+        """Why there is no pinned verdict, or ``""`` when there is one."""
+        if not self.runnable:
+            return self.blocker
+        if not self.n_matches_pin:
+            return (
+                f"pinned M5 gate {self.gate.source!r} requires {self.gate.n} "
+                f"comparable packages; this run scored {self.n_scored}. The "
+                "mechanism's health is reported separately — the pinned verdict "
+                "is withheld, not failed, until the denominator is met."
+            )
+        return ""
+
+    def gate_verdict(self) -> bool:
+        """The pinned ``100/100`` verdict. Refuses below the pinned denominator."""
+        if not self.runnable or not self.n_matches_pin:
+            raise InsufficientCoverageError(self.verdict_reason)
+        return self.gate.passes(
+            self.cross_implementation.identical, self.cross_implementation.total
+        )
+
+    @property
+    def passed(self) -> bool | None:
+        """The pinned verdict, or ``None`` when it cannot honestly be given.
+
+        ``None`` rather than ``False``: "not enough packages compared yet" is a
+        different statement from "the two implementations disagreed", and only
+        the second is an M5 failure.
+        """
+        if not self.runnable or not self.n_matches_pin:
+            return None
+        return self.gate.passes(
+            self.cross_implementation.identical, self.cross_implementation.total
+        )
 
 
-def gate_status(samples_root: Path, workdir: Path | None = None) -> GateStatus:
-    """Collect all three M5 checks and report the pinned gate's outcome.
+def gate_status(
+    samples_root: Path,
+    workdir: Path | None = None,
+    preregister: Path = PREREGISTER_PATH,
+) -> GateStatus:
+    """Collect all three M5 checks and report the pinned gate's standing.
 
     Returning a status object rather than a bare pass/fail keeps a runner from
-    publishing the option-(b) numbers as if they were the pinned option-(a) gate.
+    publishing the option-(b) numbers as if they were the pinned option-(a)
+    gate, and now also from publishing a PASS off a denominator the
+    pre-registration does not pin.
     """
     runnable = reader_has_canonical_api()
     if runnable:
@@ -421,4 +551,5 @@ def gate_status(samples_root: Path, workdir: Path | None = None) -> GateStatus:
         verdict_agreement=roundtrip_agreement(samples_root),
         byte_equality=byte_equality(samples_root, workdir),
         cross_implementation=cross,
+        gate=pinned_gate(preregister),
     )

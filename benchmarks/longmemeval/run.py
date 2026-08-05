@@ -836,6 +836,12 @@ def run_3arm_smoke(
             "m5_cross_implementation": _m5_cross_implementation(m5),
             "m5_gate_runnable": m5.runnable,
             "m5_gate_blocker": m5.blocker,
+            # The pinned 100/100 verdict, or null when the denominator has not
+            # been met — mirroring M1's `gate_verdict: None` at N != 78. A
+            # runnable mechanism that agrees on every sample it can reach is not
+            # the pre-registered result, and the reason says so in numbers.
+            "m5_gate_verdict": getattr(m5, "passed", None),
+            "m5_gate_verdict_reason": getattr(m5, "verdict_reason", ""),
         }
     )
 

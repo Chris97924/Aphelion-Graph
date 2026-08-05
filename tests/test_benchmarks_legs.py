@@ -1107,6 +1107,13 @@ def test_3arm_smoke_row_reports_a_runnable_m5_gate_and_real_cross_counts(
     assert metrics["m5_gate_runnable"] is True
     assert metrics["m5_gate_blocker"] == ""
 
+    # Runnable is not passed. M5 is pinned at 100/100 and the smoke compares
+    # six, so the verdict is withheld — null, with a reason carrying both
+    # numbers. Reporting True here would publish a plumbing number as the gate.
+    assert metrics["m5_gate_verdict"] is None
+    assert "6" in metrics["m5_gate_verdict_reason"]
+    assert "100" in metrics["m5_gate_verdict_reason"]
+
 
 @requires_oracle
 @pytest.mark.integration

@@ -894,7 +894,9 @@ def test_m5_pinned_gate_runs_now_that_w_m5_has_landed() -> None:
     Before W-M5 this asserted the inverse — ``runnable is False`` with a
     ``W-M5``-shaped blocker — because ``scripts/external_reader.py`` reproduced
     only the validator verdict. It now implements canonical serialization, so
-    the gate runs instead of reporting blockage.
+    the gate's *mechanism* runs instead of reporting blockage. Whether the gate
+    PASSES is a separate question, pinned at N=100 — see
+    ``test_m5_pinned_gate_withholds_its_verdict_below_the_pinned_denominator``.
     """
     status = m5_roundtrip.gate_status(_SAMPLES_ROOT)
     assert status.runnable is True
@@ -906,7 +908,6 @@ def test_m5_pinned_gate_runs_now_that_w_m5_has_landed() -> None:
     assert cross.mismatches == ()
     assert cross.all_identical is True
     assert cross.rate == 1.0
-    assert status.passed is True
     # Samples the reference itself refuses to pack have no reference bytes to
     # compare against; they are named, never silently dropped.
     assert {name for name, _ in cross.unpackable} == {
@@ -914,6 +915,78 @@ def test_m5_pinned_gate_runs_now_that_w_m5_has_landed() -> None:
         "withdraw-then-illegal-reaffirm",
     }
     assert cross.total + len(cross.unpackable) == 8
+
+
+@pytest.mark.unit
+def test_m5_pinned_gate_withholds_its_verdict_below_the_pinned_denominator() -> None:
+    """A gate pinned at 100/100 may not report PASS off six packages.
+
+    ``preregister.json`` pins M5 at "100/100 byte-identical canonical form".
+    Every comparison the committed samples afford agreeing is a healthy
+    mechanism, not the pre-registered result — publishing ``passed=True`` at
+    N=6 is exactly how a plumbing number ends up quoted as a gate outcome. Same
+    principle M1 enforces by refusing a verdict at N != 78.
+    """
+    status = m5_roundtrip.gate_status(_SAMPLES_ROOT)
+
+    # Health of the mechanism: runnable, and everything comparable agreed.
+    assert status.runnable is True
+    assert status.cross_implementation.all_identical is True
+
+    # But the pinned verdict is withheld, and says why in numbers.
+    assert status.n_scored == 6
+    assert status.gate.n == 100
+    assert status.n_matches_pin is False
+    assert status.passed is None
+    assert "6" in status.verdict_reason
+    assert "100" in status.verdict_reason
+
+
+@pytest.mark.unit
+def test_m5_gate_verdict_refuses_rather_than_guessing_below_the_pin() -> None:
+    """Asking for the verdict outright raises instead of returning a soft True."""
+    status = m5_roundtrip.gate_status(_SAMPLES_ROOT)
+
+    with pytest.raises(m5_roundtrip.InsufficientCoverageError) as excinfo:
+        status.gate_verdict()
+    assert "100" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_m5_pinned_denominator_is_read_from_the_preregistration(
+    tmp_path: Path,
+) -> None:
+    """The 100 comes out of ``preregister.json``, not out of this codebase.
+
+    Hardcoding it would let an amended pin and the code enforcing it drift
+    apart, so an amended pin must propagate — proven by parsing an amended copy
+    rather than by reading the source.
+    """
+    live = m5_roundtrip.pinned_gate()
+    assert live.n == 100
+
+    original = json.loads(
+        (_BENCH_ROOT / "preregister.json").read_text(encoding="utf-8")
+    )
+    original["metrics"]["M5"]["gate"] = "42/42 byte-identical canonical form"
+    amended = tmp_path / "preregister.json"
+    amended.write_text(json.dumps(original), encoding="utf-8")
+
+    assert m5_roundtrip.pinned_gate(amended).n == 42
+
+
+@pytest.mark.unit
+def test_m5_refuses_an_unreadable_pin_rather_than_defaulting(tmp_path: Path) -> None:
+    """An unparseable pin stops the metric instead of falling back to a constant."""
+    from benchmarks.longmemeval.pipeline import GatePinError
+
+    record = json.loads((_BENCH_ROOT / "preregister.json").read_text(encoding="utf-8"))
+    record["metrics"]["M5"]["gate"] = "all of them, byte-identical"
+    broken = tmp_path / "preregister.json"
+    broken.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(GatePinError):
+        m5_roundtrip.pinned_gate(broken)
 
 
 @pytest.mark.unit
@@ -930,8 +1003,14 @@ def test_m5_gate_reports_blockage_if_the_reader_regresses(
 
     assert status.runnable is False
     assert "W-M5" in status.blocker
-    assert status.passed is False
+    # None, not False: "there is no second implementation to compare against" is
+    # not "the two implementations disagreed". Only the latter is an M5 failure.
+    assert status.passed is None
+    assert "W-M5" in status.verdict_reason
     assert status.cross_implementation.total == 0
+
+    with pytest.raises(m5_roundtrip.InsufficientCoverageError):
+        status.gate_verdict()
 
 
 # --------------------------------------------------------------------------- #

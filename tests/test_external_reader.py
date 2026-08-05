@@ -355,7 +355,6 @@ def test_reader_ustar_framing_matches_a_conventional_tar_writer(
         reader.TarMember("b-512", b"y" * 512),
         reader.TarMember("c-513", b"z" * 513),
         reader.TarMember("empty", b""),
-        reader.TarMember("café-nfc", "café body\n".encode("utf-8")),
     ]
 
     # tarfile stores directory members with a trailing "/" (TarInfo.get_info);
@@ -385,6 +384,52 @@ def test_reader_ustar_framing_matches_a_conventional_tar_writer(
                 tar.addfile(info, io.BytesIO(member.data))
 
     assert reader.canonical_tar_bytes(members) == buf.getvalue()
+
+
+def test_reader_refuses_non_ascii_member_names(reader: ModuleType) -> None:
+    """Rule 5 §1 mandates a pax header for ANY non-ASCII byte in a member path.
+
+    pax is F3-OPEN: the reference is pinned to ``tarfile.USTAR_FORMAT`` and
+    cannot emit it, so there is no agreed encoding for such a member. Writing a
+    plain ustar header anyway would mint a SHA-256 for bytes no conformant
+    implementation would produce — a digest that looks authoritative and is not.
+    The length check alone does not catch this: a short non-ASCII name passes
+    the 100-byte bound and still needs pax.
+    """
+    for name in ("café-nfc", "中文.md", "claims/naïve.md", "emoji-🎉"):
+        with pytest.raises(reader.CanonicalError) as excinfo:
+            reader.canonical_tar_bytes([reader.TarMember(name, b"payload\n")])
+        message = str(excinfo.value)
+        assert "pax" in message.lower(), message
+        assert repr(name) in message or name in message
+
+    # The refusal is about the *name*, not the payload: non-ASCII file contents
+    # are just bytes and stay perfectly legal.
+    assert reader.canonical_tar_bytes(
+        [reader.TarMember("ascii-name.md", "café 中文\n".encode("utf-8"))]
+    )
+
+
+def test_byte_equality_evidence_is_unaffected_by_the_non_ascii_refusal(
+    reader: ModuleType, corpus: list
+) -> None:
+    """Every member path in the evidence corpus is ASCII, so nothing regressed.
+
+    The non-ASCII refusal would be a silent evidence loss if any package the
+    byte-equality claim rests on carried such a path. Checked rather than
+    assumed, over both the committed samples and the generated corpus.
+    """
+    checked = 0
+    for package in [p.path for p in corpus] + sorted(
+        s for s in SAMPLES.iterdir() if s.is_dir()
+    ):
+        for path in sorted(package.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(package).as_posix()
+            assert relative.isascii(), f"{package.name}: non-ASCII member {relative!r}"
+            checked += 1
+    assert checked > 0
 
 
 def test_reader_rejects_malformed_member_sets(reader: ModuleType) -> None:
