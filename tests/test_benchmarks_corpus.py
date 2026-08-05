@@ -340,7 +340,7 @@ def test_real_build_split_is_deterministic(oracle_records: list[dict]) -> None:
 def test_on_disk_manifest_matches_fresh_build(real_manifest: dict) -> None:
     """A previously built split_manifest.json must reproduce byte-for-byte.
 
-    The manifest is a deterministic build artifact (not committed); when one is
+    The manifest is a committed, deterministic build artifact; whenever one is
     present on disk it must equal a fresh build, guarding against silent drift.
     """
     if not corpus.MANIFEST_PATH.is_file():
