@@ -247,6 +247,51 @@ class UnscoredArmError(ValueError):
     """
 
 
+class MissingArmError(ValueError):
+    """A metric was asked for a verdict without an arm its pinned gate names.
+
+    Every §4 gate is a *comparison* — ``C − B``, ``C ≤ 0.5 × A``, ``10× Arm A``.
+    Scoring one with an arm absent would either report a contrast against
+    nothing or silently fall back to a different arm, so the metric refuses.
+    """
+
+
+class GatePinError(ValueError):
+    """A pinned §4 gate could not be read as the shape its metric expects.
+
+    The §4 thresholds are frozen prose in ``preregister.json``; the metric
+    modules parse them there rather than re-declaring the numbers in Python, so
+    a pinned value and the code consuming it cannot drift apart. When the parse
+    fails the honest move is to stop: guessing the threshold, or falling back to
+    a constant in the source, would score a run against a gate the
+    pre-registration does not carry (design doc §6.1 guard 3).
+    """
+
+
+def preregistered_metric(metric: str, path: Path = PREREGISTER_PATH) -> dict[str, Any]:
+    """Return one metric's pinned record from ``preregister.json``.
+
+    Raises :class:`GatePinError` — not ``KeyError`` — when the metric is absent,
+    because a missing pin and an unreadable pin are the same failure from the
+    caller's side: the frozen gate this metric is supposed to enforce cannot be
+    read.
+    """
+    metrics = preregistered("metrics", path)
+    if not isinstance(metrics, dict) or metric not in metrics:
+        raise GatePinError(
+            f"{path} carries no pinned {metric!r} metric record. The §4 gate is "
+            "frozen in the pre-registration and this harness will not supply a "
+            "default for it."
+        )
+    record = metrics[metric]
+    if not isinstance(record, dict):
+        raise GatePinError(
+            f"{path}: pinned {metric!r} must be an object, got "
+            f"{type(record).__name__}"
+        )
+    return record
+
+
 @dataclass(frozen=True)
 class ModelPin:
     """Identity and decoding knobs of one pinned model.
