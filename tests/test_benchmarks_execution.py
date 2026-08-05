@@ -19,6 +19,7 @@ from __future__ import annotations
 import http.client
 import itertools
 import json
+import shutil
 import socket
 import urllib.request
 from pathlib import Path
@@ -888,13 +889,226 @@ def test_m5_independent_verdict_reports_the_error_code_for_an_invalid_sample() -
 
 
 @pytest.mark.unit
-def test_m5_pinned_gate_is_reported_as_blocked() -> None:
-    """Option (b) numbers must never be published as the pinned option (a) gate."""
+def test_m5_pinned_gate_runs_now_that_w_m5_has_landed() -> None:
+    """The pinned option-(a) gate: two implementations, byte-identical archives.
+
+    Before W-M5 this asserted the inverse — ``runnable is False`` with a
+    ``W-M5``-shaped blocker — because ``scripts/external_reader.py`` reproduced
+    only the validator verdict. It now implements canonical serialization, so
+    the gate's *mechanism* runs instead of reporting blockage. Whether the gate
+    PASSES is a separate question, pinned at N=100 — see
+    ``test_m5_pinned_gate_withholds_its_verdict_below_the_pinned_denominator``.
+    """
     status = m5_roundtrip.gate_status(_SAMPLES_ROOT)
-    assert status.runnable is False
-    assert "W-M5" in status.blocker
+    assert status.runnable is True
+    assert status.blocker == ""
     assert status.verdict_agreement.all_agree is True
     assert status.byte_equality.all_identical is True
+
+    cross = status.cross_implementation
+    assert cross.mismatches == ()
+    assert cross.all_identical is True
+    assert cross.rate == 1.0
+    # Two distinct out-of-scope reasons, and they are now told apart rather
+    # than lumped together. `withdraw-then-illegal-reaffirm` IS a package the
+    # reference refuses to pack; `duplicate-reaffirm-collision` is not a package
+    # at all (it nests package-a/package-b and carries no top-level manifest).
+    # Both are named, neither is silently dropped.
+    assert {name for name, _ in cross.unpackable} == {"withdraw-then-illegal-reaffirm"}
+    assert cross.non_packages == ("duplicate-reaffirm-collision",)
+    assert cross.total + len(cross.unpackable) + len(cross.non_packages) == 8
+
+    # The verdict layer keeps its own fixture-gated enumeration and still scores
+    # all eight, including the collision container the byte layer excludes.
+    assert status.verdict_agreement.total == 8
+
+
+@pytest.mark.unit
+def test_m5_pinned_gate_withholds_its_verdict_below_the_pinned_denominator() -> None:
+    """A gate pinned at 100/100 may not report PASS off six packages.
+
+    ``preregister.json`` pins M5 at "100/100 byte-identical canonical form".
+    Every comparison the committed samples afford agreeing is a healthy
+    mechanism, not the pre-registered result — publishing ``passed=True`` at
+    N=6 is exactly how a plumbing number ends up quoted as a gate outcome. Same
+    principle M1 enforces by refusing a verdict at N != 78.
+    """
+    status = m5_roundtrip.gate_status(_SAMPLES_ROOT)
+
+    # Health of the mechanism: runnable, and everything comparable agreed.
+    assert status.runnable is True
+    assert status.cross_implementation.all_identical is True
+
+    # But the pinned verdict is withheld, and says why in numbers.
+    assert status.n_scored == 6
+    assert status.gate.n == 100
+    assert status.n_matches_pin is False
+    assert status.passed is None
+    assert "6" in status.verdict_reason
+    assert "100" in status.verdict_reason
+
+
+@pytest.mark.unit
+def test_m5_gate_verdict_refuses_rather_than_guessing_below_the_pin() -> None:
+    """Asking for the verdict outright raises instead of returning a soft True."""
+    status = m5_roundtrip.gate_status(_SAMPLES_ROOT)
+
+    with pytest.raises(m5_roundtrip.InsufficientCoverageError) as excinfo:
+        status.gate_verdict()
+    assert "100" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_m5_pinned_denominator_is_read_from_the_preregistration(
+    tmp_path: Path,
+) -> None:
+    """The 100 comes out of ``preregister.json``, not out of this codebase.
+
+    Hardcoding it would let an amended pin and the code enforcing it drift
+    apart, so an amended pin must propagate — proven by parsing an amended copy
+    rather than by reading the source.
+    """
+    live = m5_roundtrip.pinned_gate()
+    assert live.n == 100
+
+    original = json.loads(
+        (_BENCH_ROOT / "preregister.json").read_text(encoding="utf-8")
+    )
+    original["metrics"]["M5"]["gate"] = "42/42 byte-identical canonical form"
+    amended = tmp_path / "preregister.json"
+    amended.write_text(json.dumps(original), encoding="utf-8")
+
+    assert m5_roundtrip.pinned_gate(amended).n == 42
+
+
+def _preregister_pinned_at(n: int, tmp_path: Path) -> Path:
+    """A copy of the pre-registration with M5's denominator amended to ``n``."""
+    record = json.loads((_BENCH_ROOT / "preregister.json").read_text(encoding="utf-8"))
+    record["metrics"]["M5"]["gate"] = f"{n}/{n} byte-identical canonical form"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    amended = tmp_path / "preregister.json"
+    amended.write_text(json.dumps(record), encoding="utf-8")
+    return amended
+
+
+@pytest.mark.unit
+def test_m5_byte_gate_enumerates_packages_not_verdict_fixtures(tmp_path: Path) -> None:
+    """Byte-gate eligibility is "is a package", not "has a verdict fixture".
+
+    A genuine byte-equality corpus carries manifests, not
+    ``expected-normalized.json`` — that fixture belongs to the verdict layer.
+    Gating the byte loop on it meant every package in such a corpus was silently
+    skipped.
+    """
+    from tests.canonical_corpus import build_corpus
+
+    root = tmp_path / "corpus"
+    packages = build_corpus(root)
+    assert not any(
+        (package.path / "expected-normalized.json").exists() for package in packages
+    ), "fixture-free corpus is the whole point of this test"
+
+    result = m5_roundtrip.cross_implementation_byte_equality(root)
+
+    assert result.total == len(packages)
+    assert result.identical == len(packages)
+    assert result.all_identical is True
+
+
+@pytest.mark.unit
+def test_m5_pinned_gate_is_satisfiable_by_a_real_byte_equality_corpus(
+    tmp_path: Path,
+) -> None:
+    """The refusal state must be escapable by the corpus meant to escape it.
+
+    Withholding the verdict below the pin is only honest if supplying the pinned
+    denominator actually produces a verdict. With the byte loop gated on verdict
+    fixtures it never could: a 100-package corpus scored zero and
+    ``gate_verdict()`` refused on input that satisfied the pin. Proven
+    end-to-end against an amended pin rather than by generating 100 packages.
+    """
+    from tests.canonical_corpus import build_corpus
+
+    root = tmp_path / "corpus"
+    packages = build_corpus(root)
+    amended = _preregister_pinned_at(len(packages), tmp_path)
+
+    status = m5_roundtrip.gate_status(root, preregister=amended)
+
+    assert status.runnable is True
+    assert status.n_scored == len(packages)
+    assert status.gate.n == len(packages)
+    assert status.n_matches_pin is True
+    assert status.verdict_reason == ""
+    assert status.passed is True
+    assert status.gate_verdict() is True
+
+    # One package short of the pin and the verdict is withheld again — the
+    # boundary holds in both directions.
+    strict = m5_roundtrip.gate_status(
+        root, preregister=_preregister_pinned_at(len(packages) + 1, tmp_path / "up")
+    )
+    assert strict.n_matches_pin is False
+    assert strict.passed is None
+
+
+@pytest.mark.unit
+def test_m5_byte_gate_accepts_a_manifest_bearing_dir_with_no_fixture(
+    tmp_path: Path,
+) -> None:
+    """The cheap structural form of the same rule."""
+    from tests.canonical_corpus import build_corpus
+
+    root = tmp_path / "one"
+    built = build_corpus(root)
+    keep = built[1].path.name
+    for package in built:
+        if package.path.name != keep:
+            shutil.rmtree(package.path)
+
+    package_dir = root / keep
+    assert (package_dir / "manifest.json").exists()
+    assert not (package_dir / "expected-normalized.json").exists()
+
+    assert m5_roundtrip.cross_implementation_byte_equality(root).total == 1
+
+
+@pytest.mark.unit
+def test_m5_refuses_an_unreadable_pin_rather_than_defaulting(tmp_path: Path) -> None:
+    """An unparseable pin stops the metric instead of falling back to a constant."""
+    from benchmarks.longmemeval.pipeline import GatePinError
+
+    record = json.loads((_BENCH_ROOT / "preregister.json").read_text(encoding="utf-8"))
+    record["metrics"]["M5"]["gate"] = "all of them, byte-identical"
+    broken = tmp_path / "preregister.json"
+    broken.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(GatePinError):
+        m5_roundtrip.pinned_gate(broken)
+
+
+@pytest.mark.unit
+def test_m5_gate_reports_blockage_if_the_reader_regresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the canonical API disappears, the gate must go back to blocked.
+
+    The failure mode this guards is the dangerous one: a reader that quietly
+    loses its canonical layer while the runner keeps publishing an M5 number.
+    """
+    monkeypatch.setattr(m5_roundtrip, "reader_has_canonical_api", lambda: False)
+    status = m5_roundtrip.gate_status(_SAMPLES_ROOT)
+
+    assert status.runnable is False
+    assert "W-M5" in status.blocker
+    # None, not False: "there is no second implementation to compare against" is
+    # not "the two implementations disagreed". Only the latter is an M5 failure.
+    assert status.passed is None
+    assert "W-M5" in status.verdict_reason
+    assert status.cross_implementation.total == 0
+
+    with pytest.raises(m5_roundtrip.InsufficientCoverageError):
+        status.gate_verdict()
 
 
 # --------------------------------------------------------------------------- #
@@ -932,7 +1146,10 @@ def test_3arm_smoke_emits_all_arms_and_a_metrics_row(tmp_path: Path) -> None:
     assert set(metrics["m3_rate"]) == {"A", "B", "C"}
     assert metrics["m5_verdict_total"] == 8
     assert metrics["m5_byte_identical"] == metrics["m5_byte_total"] == 6
-    assert metrics["m5_gate_runnable"] is False
+    # W-M5 landed, so the smoke reports a runnable gate with no blocker text.
+    # Before W-M5 these were False / a "W-M5 not landed" sentence.
+    assert metrics["m5_gate_runnable"] is True
+    assert metrics["m5_gate_blocker"] == ""
     # The smoke's own numbers must carry their caveats.
     assert "not an M2 result" in metrics["m2_caveat"]
     assert "not an M3 result" in metrics["m3_caveat"]

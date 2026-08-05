@@ -1066,13 +1066,14 @@ def test_m5_cross_implementation_is_surfaced_when_the_reader_reports_it() -> Non
 
 
 @pytest.mark.unit
-def test_m5_cross_implementation_is_null_before_the_second_reader_lands() -> None:
+def test_m5_cross_implementation_is_null_when_the_status_lacks_the_field() -> None:
     """Absent is null, never zero.
 
-    The second canonical reader lands on its own branch, so this tree's
-    ``GateStatus`` may carry no ``cross_implementation`` at all. Reporting ``0``
-    would claim the two-implementation cross-check ran and matched nothing, which
-    is the opposite of "there is no second implementation to check against yet".
+    Reporting ``0`` would claim the two-implementation cross-check ran and
+    matched nothing, which is the opposite of "there was nothing to check
+    against". This guarded the pre-merge tree, where ``GateStatus`` carried no
+    ``cross_implementation`` at all; the W-M5 reader has since landed here, so it
+    now guards any status object that reaches the row without the field.
     """
     status = SimpleNamespace(runnable=False, blocker="W-M5 not landed")
 
@@ -1084,15 +1085,34 @@ def test_m5_cross_implementation_is_null_before_the_second_reader_lands() -> Non
 
 @requires_oracle
 @pytest.mark.integration
-def test_3arm_smoke_row_carries_the_m5_cross_implementation_surface(
+def test_3arm_smoke_row_reports_a_runnable_m5_gate_and_real_cross_counts(
     tmp_path: Path,
 ) -> None:
-    rows = run_mod.run_3arm_smoke(tmp_path / "out.jsonl", data_directory=_DATA_DIR)
-    cross = rows[-1]["m5_cross_implementation"]
+    """With the W-M5 reader in this tree, the row carries the settled gate.
 
-    assert set(cross) == {"identical", "total"}
-    # The pinned gate's standing is reported independently of these counts.
-    assert rows[-1]["m5_gate_runnable"] is False
+    This assertion was written on the harness branch while the second canonical
+    reader was still landing separately, so it pinned the pre-merge state:
+    ``m5_gate_runnable is False`` and cross counts merely present. Both branches
+    are now in one tree, so it asserts what the merged harness actually emits.
+    """
+    rows = run_mod.run_3arm_smoke(tmp_path / "out.jsonl", data_directory=_DATA_DIR)
+    metrics = rows[-1]
+
+    # Real counts, not just the shape: every packable sample agreed across the
+    # two implementations. `is not None` would still pass if the cross-check
+    # silently stopped running.
+    assert metrics["m5_cross_implementation"] == {"identical": 6, "total": 6}
+
+    # The pinned option-(a) gate now runs, so there is no blocker to report.
+    assert metrics["m5_gate_runnable"] is True
+    assert metrics["m5_gate_blocker"] == ""
+
+    # Runnable is not passed. M5 is pinned at 100/100 and the smoke compares
+    # six, so the verdict is withheld — null, with a reason carrying both
+    # numbers. Reporting True here would publish a plumbing number as the gate.
+    assert metrics["m5_gate_verdict"] is None
+    assert "6" in metrics["m5_gate_verdict_reason"]
+    assert "100" in metrics["m5_gate_verdict_reason"]
 
 
 @requires_oracle

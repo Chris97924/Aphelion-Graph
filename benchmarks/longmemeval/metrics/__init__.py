@@ -20,10 +20,11 @@ it straight from an arm's store or from the blind scoring phase:
   reason the models are: wall time is not reproducible.
 * :mod:`~benchmarks.longmemeval.metrics.m5_roundtrip` — round-trip determinism:
   a verdict-level cross-tool check against the independent
-  ``scripts/external_reader.py``, plus byte-level pack/unpack/re-pack equality
-  through the ``aphelion`` package's public API. The *pinned* M5 gate needs the
-  ``W-M5`` second canonical reader and stays blocked until it lands — see that
-  module's ``gate_status``.
+  ``scripts/external_reader.py``, byte-level pack/unpack/re-pack equality
+  through the ``aphelion`` package's public API, and — since ``W-M5`` landed —
+  the *pinned* gate itself: the reference writer's archive bytes
+  SHA-256-compared against the independent reader's. See that module's
+  ``gate_status``.
 
 Every §4 threshold these modules enforce is parsed out of ``preregister.json``
 rather than re-declared in Python, so a frozen gate and the code enforcing it

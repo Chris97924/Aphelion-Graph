@@ -1,8 +1,16 @@
 # Aphelion Canonical Serialization Spec
 
-**Version:** 1.0
+**Version:** 1.1
 **Status:** Normative
-**Date:** 2026-04-21
+**Date:** 2026-08-05
+
+> **1.1 (2026-08-05)** — Rule 5 §10 and §7 corrected to describe what conformant
+> tar writers actually emit. Both gaps were found by building a second,
+> independent implementation (work item `W-M5`) and byte-comparing it against the
+> reference: §10 as written ("No extra trailing bytes") matched no tar writer in
+> existence, and §7 admitted two byte-different encodings of zero. **No producer
+> or consumer behavior changes** — the reference implementation already emitted
+> the now-documented form; it is the document that was wrong.
 
 ## Purpose
 
@@ -81,10 +89,10 @@ When packaging into `*.aphelion.tar`:
 4. **atime / ctime**: MUST NOT be emitted (ustar doesn't; pax headers MUST omit).
 5. **uid / gid**: MUST be `0`. **uname / gname**: MUST be empty strings.
 6. **mode**: regular files `0644`, directories `0755`. No other bits. No setuid/setgid/sticky.
-7. **Device major/minor**: `0`.
+7. **Device major/minor**: `0`. This format permits only regular files and directories; for such non-device entries both fields MUST be written as an **empty field — 8 NUL bytes each** — not as octal `0000000\0`. Both encodings denote zero, but they differ byte-for-byte and shift the header checksum, so the choice is normative rather than cosmetic.
 8. **Link name**: empty for regular files.
 9. **Padding**: tar 512-byte block padding MUST be zero bytes.
-10. **EOF**: exactly two zero-filled 512-byte blocks terminate the archive. No extra trailing bytes.
+10. **EOF and record padding**: the archive body MUST be terminated by exactly two zero-filled 512-byte blocks. The archive MUST then be zero-padded up to the next multiple of the **record size, 10240 bytes** (the conventional blocking factor of 20 × 512-byte blocks); when the EOF blocks already land on a record boundary, no further padding is added. Every padding byte MUST be `0x00`, and no non-zero byte may appear after the EOF blocks. Consequently every conformant archive is a whole number of 10240-byte records, and the smallest is exactly 10240 bytes. This is what POSIX `tar` at its default blocking factor, GNU tar, BSD tar and Python's `tarfile` all emit; an implementation that stops after the two EOF blocks produces a shorter archive that is **not** byte-identical to a conformant one.
 
 ---
 

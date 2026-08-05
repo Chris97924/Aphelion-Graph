@@ -737,14 +737,16 @@ def run_fixture_metrics(
 def _m5_cross_implementation(status: object) -> dict[str, Any]:
     """The W-M5 two-implementation counts, when this tree's reader reports them.
 
-    Read with :func:`getattr` rather than attribute access because the second
-    canonical reader (design doc §7.4 option (a)) lands on its own branch: until
-    it merges, ``GateStatus`` carries no ``cross_implementation`` field at all,
-    and this row must not crash or drop the rest of the metrics on its absence.
+    The second canonical reader (design doc §7.4 option (a)) has landed, so a
+    ``GateStatus`` built here does carry ``cross_implementation``. The
+    :func:`getattr` read is kept rather than switched to attribute access: it
+    costs nothing and means a status object assembled without the field — an
+    older record being re-rendered, a partial stub in a test — degrades to a
+    reported null instead of taking the whole metrics row down with it.
 
-    ``None`` therefore means "this tree has no independent reader yet", which is a
-    different statement from ``0``: zero would claim the cross-check ran and
-    matched nothing. The pinned gate's own standing stays where it already is —
+    ``None`` means "no cross-check result to report", which is a different
+    statement from ``0``: zero would claim the cross-check ran and matched
+    nothing. The pinned gate's own standing stays where it already is —
     ``m5_gate_runnable`` / ``m5_gate_blocker``, read straight off the status.
     """
     cross = getattr(status, "cross_implementation", None)
@@ -834,6 +836,12 @@ def run_3arm_smoke(
             "m5_cross_implementation": _m5_cross_implementation(m5),
             "m5_gate_runnable": m5.runnable,
             "m5_gate_blocker": m5.blocker,
+            # The pinned 100/100 verdict, or null when the denominator has not
+            # been met — mirroring M1's `gate_verdict: None` at N != 78. A
+            # runnable mechanism that agrees on every sample it can reach is not
+            # the pre-registered result, and the reason says so in numbers.
+            "m5_gate_verdict": getattr(m5, "passed", None),
+            "m5_gate_verdict_reason": getattr(m5, "verdict_reason", ""),
         }
     )
 

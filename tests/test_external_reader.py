@@ -1,25 +1,70 @@
 """Contract tests for ``scripts/external_reader.py``.
 
-These tests guard two properties:
+These tests guard three properties:
 
   1. The reader classifies every sample under ``samples/`` with the
      same verdict as its ``expected-normalized.json``.
   2. The reader has zero dependencies on the ``aphelion`` or ``parallax``
      packages — it is a stdlib-only demonstration that the wire format
      is self-describing.
+  3. **W-M5**: the reader reproduces the canonical serialization *bytes*
+     (``spec/canonical-serialization.md``), SHA-256-identical to the
+     reference writer, over a corpus wide enough to be evidence. This is
+     the two-implementation half of the M5 gate — see
+     ``benchmarks/longmemeval/metrics/m5_roundtrip.py``.
+
+Tests may import ``aphelion`` to produce the reference bytes; the reader
+under test may not.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
+import importlib.util
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+from tests.canonical_corpus import (
+    CORPUS_SIZE,
+    WRONG_BUT_WELL_FORMED_HASH,
+    build_corpus,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
 READER = ROOT / "scripts" / "external_reader.py"
 SAMPLES = ROOT / "samples"
+
+# The M5 gate is stated over 100 packages; the design doc's execution drive
+# requires the in-repo evidence corpus to be at least this wide.
+MIN_CORPUS_PACKAGES = 20
+
+
+def load_reader() -> ModuleType:
+    """Import ``scripts/external_reader.py`` by path, as a fresh module."""
+    spec = importlib.util.spec_from_file_location("_external_reader_under_test", READER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def reader() -> ModuleType:
+    return load_reader()
+
+
+@pytest.fixture(scope="module")
+def corpus(tmp_path_factory: pytest.TempPathFactory) -> list:
+    """The deterministic W-M5 evidence corpus, materialized once per module."""
+    root = tmp_path_factory.mktemp("wm5-corpus")
+    return build_corpus(root)
 
 
 def test_reader_exists_and_is_stdlib_only() -> None:
@@ -113,3 +158,533 @@ def test_reader_rejects_illegal_lifecycle_sample() -> None:
     verdict, code, _ = mod._classify_package(SAMPLES / "withdraw-then-illegal-reaffirm")
     assert verdict == "invalid"
     assert code == "ERR-SEM-LIFECYCLE-ILLEGAL"
+
+
+# --------------------------------------------------------------------------- #
+# W-M5 — canonical byte reproduction                                           #
+# --------------------------------------------------------------------------- #
+
+
+def canonical_json_for(obj: dict) -> bytes:
+    """Minimal JSON bytes for hand-built fixtures (stdlib is fine in tests)."""
+    import json as _json
+
+    return _json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
+
+
+def _reference_archive_bytes(source: Path, workdir: Path) -> bytes:
+    """The reference implementation's canonical archive for ``source``."""
+    from aphelion.packer import pack
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    return Path(pack(source, workdir / "reference.aphelion.tar")).read_bytes()
+
+
+def test_corpus_is_wide_enough_to_be_evidence(corpus: list) -> None:
+    """The M5 evidence corpus must clear the drive's minimum package count."""
+    assert CORPUS_SIZE == len(corpus)
+    assert len(corpus) >= MIN_CORPUS_PACKAGES
+    assert len({package.name for package in corpus}) == len(corpus)
+
+
+def test_reader_reproduces_reference_canonical_bytes_over_the_corpus(
+    reader: ModuleType, corpus: list, tmp_path: Path
+) -> None:
+    """W-M5's core claim: two implementations, byte-identical archives.
+
+    Every package is compared by SHA-256 over the full archive, so any drift in
+    JSON escaping, key order, NFC, hash recomputation, tar header fields,
+    member order or block padding fails here.
+    """
+    mismatches: list[str] = []
+    for index, package in enumerate(corpus):
+        expected = _reference_archive_bytes(package.path, tmp_path / f"r{index:03d}")
+        actual = reader.canonical_archive_bytes(package.path)
+        if hashlib.sha256(actual).hexdigest() != hashlib.sha256(expected).hexdigest():
+            mismatches.append(
+                f"{package.name}: {len(actual)}B independent vs {len(expected)}B reference"
+            )
+
+    assert not mismatches, "\n".join(
+        [f"{len(mismatches)}/{len(corpus)} packages diverged:", *mismatches]
+    )
+
+
+def test_reader_reproduces_reference_canonical_bytes_for_committed_samples(
+    reader: ModuleType, tmp_path: Path
+) -> None:
+    """The same equality holds over the committed ``samples/`` fixtures.
+
+    Samples the reference refuses to pack (the illegal-lifecycle stream and the
+    nested collision fixture) are named rather than silently skipped, so the
+    denominator stays auditable.
+    """
+    from aphelion.errors import AphelionError
+
+    compared = 0
+    rejected: list[str] = []
+    mismatches: list[str] = []
+    for index, sample in enumerate(sorted(SAMPLES.iterdir())):
+        if not sample.is_dir():
+            continue
+        try:
+            expected = _reference_archive_bytes(sample, tmp_path / f"s{index:03d}")
+        except AphelionError:
+            rejected.append(sample.name)
+            continue
+        compared += 1
+        if reader.canonical_archive_bytes(sample) != expected:
+            mismatches.append(sample.name)
+
+    assert not mismatches
+    assert compared == 6
+    assert set(rejected) == {
+        "duplicate-reaffirm-collision",
+        "withdraw-then-illegal-reaffirm",
+    }
+
+
+def test_reader_manifest_and_provenance_bytes_match_the_reference(
+    reader: ModuleType, corpus: list
+) -> None:
+    """Member-level equality, so a failure localizes to a specific member."""
+    from aphelion.canonical_json import dumps, loads, normalize
+
+    for package in corpus:
+        manifest = normalize(loads((package.path / "manifest.json").read_bytes()))
+        for entry in manifest["claims"]:
+            blob = (package.path / entry["path"]).read_bytes()
+            entry["hash"] = hashlib.sha256(blob).hexdigest()
+        assert reader.canonical_manifest_bytes(package.path) == dumps(manifest), (
+            f"{package.name}: manifest.json bytes diverge"
+        )
+
+        events = [
+            loads(line)
+            for line in (package.path / "provenance.jsonl").read_bytes().splitlines()
+            if line.strip()
+        ]
+        expected = b"".join(dumps(normalize(event)) for event in events)
+        assert reader.canonical_provenance_bytes(package.path) == expected, (
+            f"{package.name}: provenance.jsonl bytes diverge"
+        )
+
+
+def test_reader_recomputes_claim_hashes_rather_than_trusting_the_manifest(
+    reader: ModuleType, corpus: list
+) -> None:
+    """The wrong-digest fixtures must not survive into the canonical manifest."""
+    stressed = [p for p in corpus if p.name.startswith("wrong-source-hash")]
+    assert stressed, "corpus lost its hash-recomputation fixtures"
+
+    for package in stressed:
+        source = (package.path / "manifest.json").read_bytes()
+        assert WRONG_BUT_WELL_FORMED_HASH.encode() in source
+        canonical = reader.canonical_manifest_bytes(package.path)
+        assert WRONG_BUT_WELL_FORMED_HASH.encode() not in canonical
+
+
+def test_reader_canonical_json_follows_rule_1(reader: ModuleType) -> None:
+    """The worked example in ``spec/canonical-serialization.md`` Rule 1."""
+    assert reader.canonical_json_bytes({"b": 2, "a": "café"}) == (
+        b'{"a":"caf\xc3\xa9","b":2}\n'
+    )
+    # The digest published in Rule 1's worked example, written in halves so it
+    # does not read as an opaque 64-char credential to secret scanners.
+    worked_example_digest = (
+        "d2995dc401d3e4b85320775178dbf4cf" "f5393f8ba3b6f63c489ea7acde97f682"
+    )
+    assert (
+        hashlib.sha256(reader.canonical_json_bytes({"b": 2, "a": "café"})).hexdigest()
+        == worked_example_digest
+    )
+    # Rule 1 §4: minimal escapes only; non-ASCII raw; C0 as lowercase \u00XX.
+    assert reader.canonical_json_bytes({"k": '"\\\n\t\x01'}) == (
+        b'{"k":"\\"\\\\\\n\\t\\u0001"}\n'
+    )
+    # Rule 1 §1: keys sort by codepoint, not case-folded.
+    assert reader.canonical_json_bytes({"a": 1, "Z": 2, "_": 3}) == (
+        b'{"Z":2,"_":3,"a":1}\n'
+    )
+    # Rule 1 §5: free-form floats are rejected outright.
+    with pytest.raises(reader.CanonicalError):
+        reader.canonical_json_bytes({"confidence": 0.9})
+
+
+def test_reader_normalizes_to_nfc_before_sorting(reader: ModuleType) -> None:
+    """Rule 2 §2: NFC is applied before codepoint ordering."""
+    import unicodedata
+
+    nfd = unicodedata.normalize("NFD", "é")
+    assert nfd != "é"
+    assert reader.canonical_json_bytes({nfd: 1}) == '{"é":1}\n'.encode("utf-8")
+
+
+def test_reader_rejects_member_paths_that_would_need_a_pax_header(
+    reader: ModuleType,
+) -> None:
+    """Rule 5 §1 forbids the ustar ``prefix``+``name`` split.
+
+    Paths longer than 100 bytes would require a pax extended header, which the
+    reference writer cannot emit (it is pinned to ``tarfile.USTAR_FORMAT``, which
+    silently falls back to the spec-forbidden prefix split). Rather than guess,
+    the independent reader refuses. Unreachable for conformant v2.0 packages —
+    ``claims/<uuid>.md`` is 46 bytes and every other member name is fixed.
+    """
+    with pytest.raises(reader.CanonicalError):
+        reader.canonical_tar_bytes([reader.TarMember("x" * 101, b"")])
+
+
+def test_reader_ustar_framing_matches_a_conventional_tar_writer(
+    reader: ModuleType,
+) -> None:
+    """The hand-rolled ustar layer, checked against stdlib ``tarfile`` directly.
+
+    ``canonical_archive_bytes`` emits only regular files (so does the reference
+    packer), which would leave the Rule 5 §6 directory branch and the block
+    padding edges unvalidated by the archive-level comparison. ``tarfile`` is
+    fair game *here* — the independence constraint is on the reader, not on the
+    test measuring it.
+    """
+    import io
+    import tarfile
+
+    members = [
+        reader.TarMember("dir", is_dir=True),
+        reader.TarMember("dir/file.txt", b"payload\n"),
+        reader.TarMember("a-511", b"x" * 511),
+        reader.TarMember("b-512", b"y" * 512),
+        reader.TarMember("c-513", b"z" * 513),
+        reader.TarMember("empty", b""),
+    ]
+
+    # tarfile stores directory members with a trailing "/" (TarInfo.get_info);
+    # computed here rather than read off the reader, so the ordering the test
+    # asserts is derived independently.
+    def stored_name(member) -> str:
+        return member.path + "/" if member.is_dir else member.path
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for member in sorted(members, key=stored_name):
+            info = tarfile.TarInfo(name=member.path)
+            info.mtime = 0
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            if member.is_dir:
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                info.size = 0
+                tar.addfile(info)
+            else:
+                info.type = tarfile.REGTYPE
+                info.mode = 0o644
+                info.size = len(member.data)
+                tar.addfile(info, io.BytesIO(member.data))
+
+    assert reader.canonical_tar_bytes(members) == buf.getvalue()
+
+
+def test_reader_refuses_to_digest_a_schema_invalid_package(
+    reader: ModuleType, tmp_path: Path
+) -> None:
+    """Canonical JSON is not the same thing as a valid Aphelion package.
+
+    ``{"claims": []}`` parses as canonical JSON and satisfies the one structural
+    check the byte path made (claims is an array), but it carries no
+    ``format_version``, no ``package_id``, none of the required manifest fields.
+    The reference calls ``validate_package()`` before writing and rejects it, so
+    emitting a digest here mints an authoritative-looking canonical hash for a
+    package the reference would never produce.
+    """
+    from aphelion.errors import AphelionError
+    from aphelion.packer import pack
+
+    package = tmp_path / "canonical-json-but-not-a-package"
+    package.mkdir()
+    (package / "manifest.json").write_bytes(b'{"claims":[]}\n')
+    (package / "provenance.jsonl").write_bytes(b"")
+
+    # The reference refuses it — that is the behaviour to agree with.
+    with pytest.raises(AphelionError):
+        pack(package, tmp_path / "reference.aphelion.tar")
+
+    with pytest.raises(reader.CanonicalError) as excinfo:
+        reader.canonical_archive_sha256(package)
+    assert "ERR-SYN" in str(excinfo.value)
+
+    # Every canonical entry point, not just the digest wrapper.
+    with pytest.raises(reader.CanonicalError):
+        reader.canonical_archive_bytes(package)
+
+
+def test_reader_and_reference_agree_on_which_packages_to_refuse(
+    reader: ModuleType, tmp_path: Path
+) -> None:
+    """Two-implementation agreement has to cover the refusals, not just the bytes.
+
+    An independent reader that reproduces the reference byte-for-byte on valid
+    input but happily digests input the reference rejects is only half an
+    implementation — and the half that is missing is the one that would catch a
+    bad package.
+    """
+    from aphelion.errors import AphelionError
+
+    for name in ("withdraw-then-illegal-reaffirm", "duplicate-reaffirm-collision"):
+        sample = SAMPLES / name
+        with pytest.raises(AphelionError):
+            _reference_archive_bytes(sample, tmp_path / name)
+        with pytest.raises(reader.CanonicalError):
+            reader.canonical_archive_bytes(sample)
+        with pytest.raises(reader.CanonicalError):
+            reader.canonical_archive_sha256(sample)
+
+
+def test_reader_refuses_non_ascii_member_names(reader: ModuleType) -> None:
+    """Rule 5 §1 mandates a pax header for ANY non-ASCII byte in a member path.
+
+    pax is F3-OPEN: the reference is pinned to ``tarfile.USTAR_FORMAT`` and
+    cannot emit it, so there is no agreed encoding for such a member. Writing a
+    plain ustar header anyway would mint a SHA-256 for bytes no conformant
+    implementation would produce — a digest that looks authoritative and is not.
+    The length check alone does not catch this: a short non-ASCII name passes
+    the 100-byte bound and still needs pax.
+    """
+    for name in ("café-nfc", "中文.md", "claims/naïve.md", "emoji-🎉"):
+        with pytest.raises(reader.CanonicalError) as excinfo:
+            reader.canonical_tar_bytes([reader.TarMember(name, b"payload\n")])
+        message = str(excinfo.value)
+        assert "pax" in message.lower(), message
+        assert repr(name) in message or name in message
+
+    # The refusal is about the *name*, not the payload: non-ASCII file contents
+    # are just bytes and stay perfectly legal.
+    assert reader.canonical_tar_bytes(
+        [reader.TarMember("ascii-name.md", "café 中文\n".encode("utf-8"))]
+    )
+
+
+def test_byte_equality_evidence_is_unaffected_by_the_non_ascii_refusal(
+    reader: ModuleType, corpus: list
+) -> None:
+    """Every member path in the evidence corpus is ASCII, so nothing regressed.
+
+    The non-ASCII refusal would be a silent evidence loss if any package the
+    byte-equality claim rests on carried such a path. Checked rather than
+    assumed, over both the committed samples and the generated corpus.
+    """
+    checked = 0
+    for package in [p.path for p in corpus] + sorted(
+        s for s in SAMPLES.iterdir() if s.is_dir()
+    ):
+        for path in sorted(package.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(package).as_posix()
+            assert relative.isascii(), f"{package.name}: non-ASCII member {relative!r}"
+            checked += 1
+    assert checked > 0
+
+
+def test_reader_rejects_malformed_member_sets(reader: ModuleType) -> None:
+    """Rule 5 §2 needs unique paths; §6 has no data-carrying directory."""
+    with pytest.raises(reader.CanonicalError):
+        reader.canonical_tar_bytes(
+            [reader.TarMember("dup", b"a"), reader.TarMember("dup", b"b")]
+        )
+    with pytest.raises(reader.CanonicalError):
+        reader.canonical_tar_bytes([reader.TarMember("d", b"payload", is_dir=True)])
+
+
+def test_reader_rejects_input_outside_the_canonical_subset(
+    reader: ModuleType, tmp_path: Path
+) -> None:
+    """Malformed packages fail loudly rather than emitting plausible bytes."""
+    package = tmp_path / "broken"
+    (package / "claims").mkdir(parents=True)
+    (package / "provenance.jsonl").write_bytes(b"")
+
+    # Duplicate object keys are legal JSON grammar but not canonical input.
+    (package / "manifest.json").write_bytes(b'{"claims":[],"a":1,"a":2}\n')
+    with pytest.raises(reader.CanonicalError):
+        reader.canonical_archive_bytes(package)
+
+    # NaN is rejected unconditionally (Rule 1 §5).
+    (package / "manifest.json").write_bytes(b'{"claims":[],"x":NaN}\n')
+    with pytest.raises(reader.CanonicalError):
+        reader.canonical_archive_bytes(package)
+
+    # A manifest claim whose file is absent has no bytes to hash.
+    (package / "manifest.json").write_bytes(
+        b'{"claims":[{"path":"claims/gone.md"}]}\n'
+    )
+    with pytest.raises(reader.CanonicalError):
+        reader.canonical_archive_bytes(package)
+
+
+def test_reader_refuses_manifest_paths_that_escape_the_package(
+    reader: ModuleType, tmp_path: Path
+) -> None:
+    """``claims[].path`` is attacker-controlled; it must not read outside.
+
+    Without containment, canonicalizing a hostile package would fold arbitrary
+    local file bytes into the archive (and its digest) — an exfiltration
+    primitive for anyone who canonicalizes untrusted input and publishes the
+    result. ``spec/packaging.md`` Rule 5 forbids these path forms outright.
+    """
+    import json as _json
+
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_bytes(b"do-not-exfiltrate\n")
+
+    # Start from a genuinely valid package, so the only thing under test is the
+    # path — a stub manifest would now be refused by schema validation instead,
+    # and the containment guard would never be reached.
+    package = tmp_path / "hostile"
+    build_corpus(tmp_path / "src")
+    shutil.copytree(tmp_path / "src" / "single-claim", package)
+    manifest_path = package / "manifest.json"
+    pristine = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert reader.canonical_archive_bytes(package), "fixture must start valid"
+
+    escapes = [
+        "../outside.txt",
+        "claims/../../outside.txt",
+        "/etc/passwd",
+        "claims\\..\\..\\outside.txt",
+        str(outside_file),  # absolute, drive-qualified on Windows
+        outside_file.as_posix(),  # absolute with forward slashes
+    ]
+    for path in escapes:
+        hostile = _json.loads(_json.dumps(pristine))
+        hostile["claims"][0]["path"] = path
+        manifest_path.write_text(_json.dumps(hostile), encoding="utf-8")
+        with pytest.raises(reader.CanonicalError):
+            reader.canonical_archive_bytes(package)
+
+    # Restoring the legitimate path makes it work again, so the refusals above
+    # are attributable to the path and nothing else.
+    manifest_path.write_text(_json.dumps(pristine), encoding="utf-8")
+    assert reader.canonical_archive_bytes(package)
+
+
+def test_reader_is_not_delegating_the_layers_it_must_reimplement() -> None:
+    """Independence has teeth only if the reader implements the format itself.
+
+    ``tarfile`` and ``json.dumps`` are the two stdlib calls that would let the
+    reader reuse the very code paths the reference writer uses, collapsing the
+    two-implementation gate into one implementation compared with itself.
+    ``json`` is still imported for *parsing* — reading input is not the contract
+    under test; emitting canonical bytes is.
+    """
+    tree = ast.parse(READER.read_text(encoding="utf-8"))
+
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module.split(".", 1)[0])
+    assert "tarfile" not in imported, "the ustar writer must be hand-rolled"
+
+    dumps_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "dumps"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "json"
+    ]
+    assert not dumps_calls, "the canonical JSON encoder must be hand-rolled"
+
+
+def test_reader_cli_emits_the_canonical_digest(tmp_path: Path) -> None:
+    """``--canonical`` prints the archive SHA-256 the reference would produce."""
+    sample = SAMPLES / "architecture-claim"
+    proc = subprocess.run(
+        [sys.executable, str(READER), "--canonical", str(sample)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    expected = hashlib.sha256(
+        _reference_archive_bytes(sample, tmp_path / "cli")
+    ).hexdigest()
+    assert proc.stdout.strip() == expected
+
+    # A package it cannot canonicalize exits non-zero rather than printing a
+    # digest of something it guessed at.
+    broken = subprocess.run(
+        [sys.executable, str(READER), "--canonical", str(tmp_path / "nope")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert broken.returncode == 1
+    assert broken.stdout.strip() == ""
+
+
+def test_spec_rule5_eof_padding_matches_record_padding(
+    reader: ModuleType, tmp_path: Path
+) -> None:
+    """Rule 5 §10, as amended in spec v1.1, matches what both writers emit.
+
+    History: W-M5 found that §10 as originally written ("exactly two zero-filled
+    512-byte blocks terminate the archive. No extra trailing bytes") described
+    no tar writer in existence — the reference, via Python ``tarfile``, pads out
+    to a 10240-byte record like GNU and BSD tar. An implementer following the
+    old §10 literally failed byte-equality on every package. Chris adjudicated
+    on 2026-08-05 in favour of amending the spec, since both implementations
+    already agreed and only the document was wrong. This test now asserts the
+    three things §10 makes testable.
+    """
+    archive = reader.canonical_archive_bytes(SAMPLES / "architecture-claim")
+    reference = _reference_archive_bytes(SAMPLES / "architecture-claim", tmp_path)
+    assert archive == reference
+
+    # §10: a whole number of 10240-byte records, and never smaller than one.
+    assert reader.RECORD_SIZE == 10240
+    assert len(archive) % reader.RECORD_SIZE == 0
+    assert len(archive) >= reader.RECORD_SIZE
+
+    # §10: nothing but zero bytes after the two EOF blocks. `record_padding`
+    # stays available so the pre-1.1 reading is still expressible and the
+    # difference between the two remains measurable.
+    without_padding = reader.canonical_archive_bytes(
+        SAMPLES / "architecture-claim", record_padding=False
+    )
+    assert len(without_padding) < len(archive)
+    assert archive.startswith(without_padding)
+    assert set(archive[len(without_padding):]) == {0}
+    # The unpadded form still ends in the two mandatory EOF blocks.
+    assert without_padding.endswith(b"\x00" * (reader.BLOCK_SIZE * 2))
+
+
+def test_spec_v1_1_documents_what_the_writers_emit(reader: ModuleType) -> None:
+    """The amended §10/§7 text must keep matching the code, not drift from it.
+
+    A spec amended to describe reality is only useful while it still does, so
+    the two normative constants the amendment introduced are asserted against
+    the implementation rather than left as prose.
+    """
+    spec = (ROOT / "spec" / "canonical-serialization.md").read_text(encoding="utf-8")
+    assert "**Version:** 1.1" in spec
+
+    # Scoped to the normative Rule 5 lines — the changelog quotes the old §10
+    # wording on purpose, and that history should not trip this check.
+    lines = spec.splitlines()
+    rule_10 = next(line for line in lines if line.startswith("10. **EOF"))
+    rule_7 = next(line for line in lines if line.startswith("7. **Device"))
+
+    assert str(reader.RECORD_SIZE) in rule_10, "§10 must name the record size"
+    assert "No extra trailing bytes" not in rule_10, "pre-1.1 §10 claim must be gone"
+    assert "NUL" in rule_7, "§7 must pin the empty-field encoding of zero"
+
+    # §7: device major/minor are 8 NUL bytes, not octal zero. Read the field
+    # straight out of a real header (offsets 329..345).
+    header = reader.canonical_tar_bytes([reader.TarMember("f", b"x")])[:512]
+    assert header[329:345] == b"\x00" * 16
+    assert b"0000000\x00" not in header[329:345]
