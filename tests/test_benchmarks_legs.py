@@ -973,6 +973,89 @@ def test_3arm_smoke_reports_the_m2_lineage_attribution(tmp_path: Path) -> None:
     assert set(metrics["m2_labeled_pairs"]) == {"total", "within_lineage", "cross_lineage"}
 
 
+def _inverted_order_record() -> dict:
+    """A question whose session ids sort OPPOSITE to their occurrence dates."""
+    return {
+        "question_id": "qinv",
+        "question": "what is my 5k personal best",
+        "answer": "22:00",
+        "answer_session_ids": ["a_new", "z_old"],
+        "haystack_session_ids": ["a_new", "z_old"],
+        "haystack_dates": ["2023/06/01 (Thu) 00:58", "2023/05/01 (Mon) 10:00"],
+        "haystack_sessions": [
+            [{"role": "user", "content": "my 5k personal best is 22:00"}],
+            [{"role": "user", "content": "my 5k personal best is 24:30"}],
+        ],
+    }
+
+
+@pytest.mark.unit
+def test_evidence_sessions_are_fed_in_occurrence_order() -> None:
+    """Session-id order is not time order, and the linker chains on feed order.
+
+    ``a_new`` is dated a month after ``z_old`` but sorts before it, so feeding by
+    id would let the OLDER value supersede the newer one.
+    """
+    sessions = run_mod._evidence_sessions(_inverted_order_record())
+
+    assert [s.metadata["session_id"] for s in sessions] == ["z_old", "a_new"]
+    assert [s.metadata["occurred_at"] for s in sessions] == [
+        "2023-05-01T10:00:00Z",
+        "2023-06-01T00:58:00Z",
+    ]
+
+
+@pytest.mark.unit
+def test_arm_c_surfaces_the_newer_value_when_ids_sort_against_time() -> None:
+    """The end-to-end consequence: M1/M3 for this question would otherwise invert."""
+    record = _inverted_order_record()
+    link = linker.SharedLinker(record["question_id"])
+    store = AphelionStore(
+        BM25Retriever(), extractor=link, query_time=run_mod.SMOKE_QUERY_TIME
+    )
+    store.ingest(run_mod._evidence_sessions(record))
+
+    surfaced = [claim.text for claim in store.retrieve(record["question"])]
+
+    assert any("22:00" in text for text in surfaced), "the later-dated value is current"
+    assert not any("24:30" in text for text in surfaced), "the older value is stale"
+
+
+@pytest.mark.unit
+def test_undated_evidence_sessions_sort_first_and_deterministically() -> None:
+    """An unknown instant is treated as oldest, and ties still yield one order.
+
+    Determinism is load-bearing: every arm re-runs the shared linker over this
+    same sequence, and the arms only see byte-identical claims if the sequence is
+    identical each time.
+    """
+    record = _inverted_order_record()
+    record["answer_session_ids"] = ["a_new", "z_old", "m_undated", "b_undated"]
+    record["haystack_session_ids"] = ["a_new", "z_old", "m_undated", "b_undated"]
+    record["haystack_dates"] = [
+        "2023/06/01 (Thu) 00:58",
+        "2023/05/01 (Mon) 10:00",
+        "not-a-date",
+        "",
+    ]
+    record["haystack_sessions"].extend(
+        [
+            [{"role": "user", "content": "undated m"}],
+            [{"role": "user", "content": "undated b"}],
+        ]
+    )
+
+    order = [s.metadata["session_id"] for s in run_mod._evidence_sessions(record)]
+
+    assert order == ["b_undated", "m_undated", "z_old", "a_new"]
+    assert order == [
+        s.metadata["session_id"] for s in run_mod._evidence_sessions(record)
+    ], "repeated builds must yield the identical sequence"
+    for session in run_mod._evidence_sessions(record):
+        if session.metadata["session_id"].endswith("undated"):
+            assert "occurred_at" not in session.metadata
+
+
 @pytest.mark.unit
 def test_m5_cross_implementation_is_surfaced_when_the_reader_reports_it() -> None:
     """Once the W-M5 second canonical reader lands, its counts reach the row."""

@@ -261,11 +261,40 @@ def load_pinned_ku_questions(data_directory: Path | None = None) -> list[dict]:
     return [by_id[qid] for qid in SMOKE_KU_QUESTION_IDS]
 
 
+def _session_order_key(session_id: str, occurred_at: str | None) -> tuple[int, str, str]:
+    """Order evidence sessions by when they happened, then by id.
+
+    The linker builds its ``supersedes`` chain in **ingestion** order, so feeding
+    sessions in session-id order is a correctness bug, not a cosmetic one: a
+    later-dated session whose id happens to sort earlier would be ingested first
+    and then marked as *superseded by* the older one. Arm C's R4 pass would
+    resolve the subject to the stale value, inverting M1 and M3 for that
+    question — the very contamination Arm C exists to prevent.
+
+    Instants are the 20-char ``YYYY-MM-DDTHH:MM:SSZ`` form, which orders
+    lexicographically exactly as it orders chronologically, so no date parsing is
+    needed here.
+
+    Undated sessions sort **first** — treated as the oldest, not the newest.
+    Their instant is genuinely unknown, so either placement is an assumption;
+    this is the conservative one, because it lets a claim whose date *is* known
+    supersede one whose date is not, rather than the reverse.
+
+    The session id is the final tie-breaker so equal instants still yield one
+    total order. That determinism is load-bearing: every arm re-runs the one
+    shared linker over this same sequence, and the three arms only see
+    byte-identical claims if the sequence is identical on every pass.
+    """
+    return (0 if occurred_at is None else 1, occurred_at or "", session_id)
+
+
 def _evidence_sessions(record: dict) -> list[Session]:
     """Build one :class:`Session` per evidence session of a question.
 
     Only the sessions named in ``answer_session_ids`` (the "oracle evidence
-    sessions") are used, visited in sorted id order for determinism. Each turn is
+    sessions") are used, visited in **occurrence order** — see
+    :func:`_session_order_key` for why feeding them in id order silently inverts
+    Arm C's supersedes chain. Each turn is
     rendered as a single ``"role: text"`` line with its content whitespace-collapsed
     so newline splitting in :func:`stub_extractor` yields exactly one claim per
     turn; blank turns are dropped.
@@ -284,8 +313,12 @@ def _evidence_sessions(record: dict) -> list[Session]:
         zip(record["haystack_session_ids"], record.get("haystack_dates", []))
     )
 
+    instants = {
+        sid: parse_corpus_instant(dates_by_session_id.get(sid)) for sid in evidence_ids
+    }
+
     sessions: list[Session] = []
-    for sid in sorted(evidence_ids):
+    for sid in sorted(evidence_ids, key=lambda s: _session_order_key(s, instants[s])):
         turns = by_session_id.get(sid)
         if turns is None:
             continue
@@ -296,7 +329,7 @@ def _evidence_sessions(record: dict) -> list[Session]:
                 continue
             lines.append(f"{turn.get('role', '?')}: {content}")
         metadata: dict[str, Any] = {"question_id": qid, "session_id": sid}
-        occurred_at = parse_corpus_instant(dates_by_session_id.get(sid))
+        occurred_at = instants[sid]
         if occurred_at is not None:
             metadata["occurred_at"] = occurred_at
         sessions.append(
