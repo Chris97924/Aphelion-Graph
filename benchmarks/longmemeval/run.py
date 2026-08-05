@@ -701,6 +701,28 @@ def run_fixture_metrics(
     return m2, m3, m4
 
 
+def _m5_cross_implementation(status: object) -> dict[str, Any]:
+    """The W-M5 two-implementation counts, when this tree's reader reports them.
+
+    Read with :func:`getattr` rather than attribute access because the second
+    canonical reader (design doc §7.4 option (a)) lands on its own branch: until
+    it merges, ``GateStatus`` carries no ``cross_implementation`` field at all,
+    and this row must not crash or drop the rest of the metrics on its absence.
+
+    ``None`` therefore means "this tree has no independent reader yet", which is a
+    different statement from ``0``: zero would claim the cross-check ran and
+    matched nothing. The pinned gate's own standing stays where it already is —
+    ``m5_gate_runnable`` / ``m5_gate_blocker``, read straight off the status.
+    """
+    cross = getattr(status, "cross_implementation", None)
+    if cross is None:
+        return {"identical": None, "total": None}
+    return {
+        "identical": getattr(cross, "identical", None),
+        "total": getattr(cross, "total", None),
+    }
+
+
 def run_3arm_smoke(
     out_path: Path = DEFAULT_3ARM_OUTPUT,
     data_directory: Path | None = None,
@@ -776,6 +798,7 @@ def run_3arm_smoke(
             "m5_verdict_total": m5.verdict_agreement.total,
             "m5_byte_identical": m5.byte_equality.identical,
             "m5_byte_total": m5.byte_equality.total,
+            "m5_cross_implementation": _m5_cross_implementation(m5),
             "m5_gate_runnable": m5.runnable,
             "m5_gate_blocker": m5.blocker,
         }
@@ -861,11 +884,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"  M4 p95 ms (counting clock): {metrics['m4']['p95_ms']}; "
             f"tripwire flags: {len(metrics['m4']['tripwire_flags'])}"
         )
+        cross = metrics["m5_cross_implementation"]
+        cross_note = (
+            f", cross-impl {cross['identical']}/{cross['total']}"
+            if cross["total"] is not None
+            else ""
+        )
         print(
             f"  M5 verdict {metrics['m5_verdict_agreements']}/"
             f"{metrics['m5_verdict_total']} agree, byte-equal "
-            f"{metrics['m5_byte_identical']}/{metrics['m5_byte_total']}; "
-            f"pinned gate runnable: {metrics['m5_gate_runnable']}"
+            f"{metrics['m5_byte_identical']}/{metrics['m5_byte_total']}"
+            f"{cross_note}; pinned gate runnable: {metrics['m5_gate_runnable']}"
         )
         return 0
 

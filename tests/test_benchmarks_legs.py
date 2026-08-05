@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -857,6 +858,45 @@ def test_3arm_smoke_reports_the_m2_lineage_attribution(tmp_path: Path) -> None:
     metrics = rows[-1]
 
     assert set(metrics["m2_labeled_pairs"]) == {"total", "within_lineage", "cross_lineage"}
+
+
+@pytest.mark.unit
+def test_m5_cross_implementation_is_surfaced_when_the_reader_reports_it() -> None:
+    """Once the W-M5 second canonical reader lands, its counts reach the row."""
+    status = SimpleNamespace(
+        cross_implementation=SimpleNamespace(identical=6, total=6),
+    )
+    assert run_mod._m5_cross_implementation(status) == {"identical": 6, "total": 6}
+
+
+@pytest.mark.unit
+def test_m5_cross_implementation_is_null_before_the_second_reader_lands() -> None:
+    """Absent is null, never zero.
+
+    The second canonical reader lands on its own branch, so this tree's
+    ``GateStatus`` may carry no ``cross_implementation`` at all. Reporting ``0``
+    would claim the two-implementation cross-check ran and matched nothing, which
+    is the opposite of "there is no second implementation to check against yet".
+    """
+    status = SimpleNamespace(runnable=False, blocker="W-M5 not landed")
+
+    assert run_mod._m5_cross_implementation(status) == {
+        "identical": None,
+        "total": None,
+    }
+
+
+@requires_oracle
+@pytest.mark.integration
+def test_3arm_smoke_row_carries_the_m5_cross_implementation_surface(
+    tmp_path: Path,
+) -> None:
+    rows = run_mod.run_3arm_smoke(tmp_path / "out.jsonl", data_directory=_DATA_DIR)
+    cross = rows[-1]["m5_cross_implementation"]
+
+    assert set(cross) == {"identical", "total"}
+    # The pinned gate's standing is reported independently of these counts.
+    assert rows[-1]["m5_gate_runnable"] is False
 
 
 @requires_oracle
