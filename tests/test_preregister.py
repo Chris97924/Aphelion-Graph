@@ -45,8 +45,22 @@ EXPECTED: dict = {
                 "closes the four pinned-number defects found by the 2026-08-03 "
                 "threshold audit: (1) M3 denominator corrected 78 -> 72; (2) M1 "
                 "+3pp recorded as a decision rule, not a significance test; (3) "
-                "M3 INCONCLUSIVE floor at 12 contaminated Arm A questions; (4) "
-                "AG breach response split into Tier 1 (+5pp) and Tier 2 (>= +10pp)"
+                "M3 INCONCLUSIVE rule decided by an exact two-sided sign test on "
+                "the paired A-only/C-only contamination discordances; (4) AG "
+                "breach response split into Tier 1 (+5pp net, inspecting every "
+                "discordant question) and Tier 2 (>= +10pp)"
+            ),
+            "revision_r1": (
+                "revised in review on 2026-08-14, same pre-run window, before "
+                "merge (codex gate r1 on PR #23). P1: M3's INCONCLUSIVE decision "
+                "moves from a marginal A>=12 floor to an exact two-sided sign "
+                "test on the paired A-only/C-only discordances - see "
+                "metrics.M3.superseded_inconclusive_floor for the counterexample "
+                "that motivated it. P2: AG Tier 1 moves from diffing 'the single "
+                "differing question' to enumerating every discordant question, "
+                "because a +5pp NET advantage does not imply a single "
+                "discordance. Both superseded rules were never exercised (no arm "
+                "has run) and neither revision moves a gate ratio or threshold"
             ),
             "gates_moved": (
                 "none - M1 +3pp, M2 A+0.10 / epsilon=0.02, M3 C <= 0.5 * A, M4 "
@@ -105,14 +119,45 @@ EXPECTED: dict = {
                 "correction to the denominator; the C <= 0.5 * A ratio is "
                 "unchanged"
             ),
-            "inconclusive_floor": 12,
-            "inconclusive_rule": (
-                "if Arm A contaminates fewer than 12 of the 72 questions, M3 is "
-                "reported INCONCLUSIVE (neither pass nor fail): even a perfect "
-                "halving cannot clear exact-binomial noise below that count, so "
-                "M3 does not fire the design doc S8 event-state-machine "
-                "demotion branch and does not count toward the S8 All-pass row "
-                "(amended 2026-08-14)"
+            "inconclusive_test": {
+                "method": (
+                    "exact two-sided sign test on the paired per-question "
+                    "contamination discordances"
+                ),
+                "b": "questions contaminated in Arm A but not in Arm C (A-only)",
+                "c": "questions contaminated in Arm C but not in Arm A (C-only)",
+                "concordant_excluded": (
+                    "questions contaminated in both arms or in neither carry no "
+                    "information about which arm is better and are not evidence"
+                ),
+                "statistic": (
+                    "n = b + c; p = min(1, 2 * P(X <= min(b, c))) for "
+                    "X ~ Binomial(n, 0.5)"
+                ),
+                "alpha": 0.05,
+                "rule": (
+                    "p >= 0.05 -> M3 is INCONCLUSIVE (neither pass nor fail): "
+                    "the design doc S8 event-state-machine demotion branch must "
+                    "not fire and M3 does not count toward the S8 All-pass row. "
+                    "p < 0.05 -> read the pinned C <= 0.5 * A ratio for "
+                    "pass/fail. The ratio itself is untouched; this rule only "
+                    "decides whether reading it is warranted"
+                ),
+                "reporting": (
+                    "report b, c, n, the exact two-sided p and the raw per-arm "
+                    "contaminated counts on every run, pass or fail"
+                ),
+            },
+            "superseded_inconclusive_floor": (
+                "this amendment's first draft keyed readability to a marginal "
+                "floor (Arm A contaminating fewer than 12 of 72). That measured "
+                "the wrong quantity: readability depends on the paired "
+                "A-only/C-only discordances, not on A's raw count. "
+                "Counterexample - A=12, C=7 with all seven of C's contaminated "
+                "questions also contaminated in A gives b=5, c=0, n=5, p=0.0625, "
+                "statistically unreadable, yet the floor would have admitted it "
+                "and fired the S8 demotion. Superseded within the same pre-run "
+                "amendment window and never exercised (no arm has run)"
             ),
         },
         "M4": {
@@ -133,9 +178,17 @@ EXPECTED: dict = {
             "breach_response": {
                 "tier1_pp": 5.0,
                 "tier1": (
-                    "one-question breach: log it and diff that single question's "
-                    "Arm B vs Arm C retrieved context, recording the finding in "
-                    "the results. A bounded check, not an audit"
+                    "one-question NET breach: enumerate every discordant "
+                    "adversarial question - both B-only wins and C-only wins - "
+                    "and diff each one's Arm B vs Arm C retrieved context, "
+                    "recording all findings in the results. A net +5pp does not "
+                    "imply exactly one differing question (three C-only wins "
+                    "against two B-only wins nets the same +5pp), so there is no "
+                    "unique question to diff and an arbitrary pick could miss "
+                    "the one carrying arm leakage while still licensing M1/M3 to "
+                    "be trusted. At N=20 the discordance set is small by "
+                    "construction, so full enumeration stays a bounded check, "
+                    "not an audit"
                 ),
                 "tier2_pp": 10.0,
                 "tier2": (
