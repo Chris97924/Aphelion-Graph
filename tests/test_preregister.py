@@ -6,6 +6,14 @@ asserts the machine-readable pre-registration carries EXACTLY the pinned values
 (a full-dict assertion over every key -- deliberately not spot-checks) and that
 the recorded design-doc SHA-256 matches the doc bytes on disk, so the frozen
 document and its pinned values cannot silently drift apart.
+
+Amended 2026-08-14 under the design doc's §6.3 pre-registration window (still
+legal: no arm has run). M3's denominator is corrected 78 -> 72 (the 6 abstention
+``_abs`` knowledge-update variants carry no old->new update, so no stale-value
+label can exist for them), and M1/M3/AG gain the pre-registered interpretation
+and breach-response text the pinned table had left to be filled in after results
+were seen. No gate ratio or threshold moved; ``split.knowledge_update`` stays 78
+and M1 still gates at N=78.
 """
 
 from __future__ import annotations
@@ -26,6 +34,48 @@ EXPECTED: dict = {
     "status": "pinned",
     "pinned_date": "2026-07-19",
     "design_doc": "docs/benchmark/longmemeval-3arm-design.md",
+    "amendments": [
+        {
+            "date": "2026-08-14",
+            "authority": (
+                "design doc S6.3 pre-registration amendment window - legal "
+                "because no arm has run"
+            ),
+            "summary": (
+                "closes the four pinned-number defects found by the 2026-08-03 "
+                "threshold audit: (1) M3 denominator corrected 78 -> 72; (2) M1 "
+                "+3pp recorded as a decision rule, not a significance test; (3) "
+                "M3 INCONCLUSIVE rule decided by an exact two-sided sign test on "
+                "the paired A-only/C-only contamination discordances; (4) AG "
+                "breach response split into Tier 1 (+5pp net, inspecting every "
+                "discordant question) and Tier 2 (>= +10pp)"
+            ),
+            "revision_r1": (
+                "revised in review on 2026-08-14, same pre-run window, before "
+                "merge (codex gate r1 on PR #23). P1: M3's INCONCLUSIVE decision "
+                "moves from a marginal A>=12 floor to an exact two-sided sign "
+                "test on the paired A-only/C-only discordances - see "
+                "metrics.M3.superseded_inconclusive_floor for the counterexample "
+                "that motivated it. P2: AG Tier 1 moves from diffing 'the single "
+                "differing question' to enumerating every discordant question, "
+                "because a +5pp NET advantage does not imply a single "
+                "discordance. Both superseded rules were never exercised (no arm "
+                "has run) and neither revision moves a gate ratio or threshold"
+            ),
+            "gates_moved": (
+                "none - M1 +3pp, M2 A+0.10 / epsilon=0.02, M3 C <= 0.5 * A, M4 "
+                "no-gate, M5 100/100 and AG +3pp are all unchanged. Defect 1 "
+                "corrects a denominator that contradicted its own stated "
+                "justification; defects 2-4 add interpretation and response "
+                "depth the pinned text left to be filled in after seeing results"
+            ),
+            "scope_note": (
+                "split.knowledge_update stays 78: all 78 KU questions remain in "
+                "the split and M1 still gates at N=78. Only M3's scoring "
+                "denominator is 72"
+            ),
+        }
+    ],
     "split": {
         "knowledge_update": 78,
         "knowledge_update_basis": "all",
@@ -43,6 +93,13 @@ EXPECTED: dict = {
             "gate": "C-B >= +3pp on knowledge-update",
             "N": 78,
             "reporting": "directional, bootstrapped CI, C-A secondary",
+            "interpretation": (
+                "decision rule, not a significance test: at N=78 the smallest "
+                "paired difference reaching p<0.05 is 6 net discordant questions "
+                "(7.7pp), so the bootstrapped CI is reported for honesty and "
+                "does not overturn the gate in either direction (amended "
+                "2026-08-14, design doc S4 M1 row)"
+            ),
         },
         "M2": {
             "gate": "C.F1 > A.F1 + 0.10 AND C.F1 >= B.F1 - epsilon",
@@ -50,8 +107,58 @@ EXPECTED: dict = {
         },
         "M3": {
             "gate": "C <= 0.5 * A",
-            "N": 78,
-            "denominator": "knowledge-update",
+            "N": 72,
+            "denominator": (
+                "knowledge-update, excluding the 6 abstention (_abs) variants"
+            ),
+            "denominator_amendment": (
+                "corrected 78 -> 72 on 2026-08-14 (design doc S4 M3 row): the 6 "
+                "KU _abs variants (031748ae_abs, 0ddfec37_abs, 2133c1b5_abs, "
+                "2698e78f_abs, 6aeb4375_abs, f685340e_abs) encode no old->new "
+                "update, so no stale-value label can exist for them. Factual "
+                "correction to the denominator; the C <= 0.5 * A ratio is "
+                "unchanged"
+            ),
+            "inconclusive_test": {
+                "method": (
+                    "exact two-sided sign test on the paired per-question "
+                    "contamination discordances"
+                ),
+                "b": "questions contaminated in Arm A but not in Arm C (A-only)",
+                "c": "questions contaminated in Arm C but not in Arm A (C-only)",
+                "concordant_excluded": (
+                    "questions contaminated in both arms or in neither carry no "
+                    "information about which arm is better and are not evidence"
+                ),
+                "statistic": (
+                    "n = b + c; p = min(1, 2 * P(X <= min(b, c))) for "
+                    "X ~ Binomial(n, 0.5)"
+                ),
+                "alpha": 0.05,
+                "rule": (
+                    "p >= 0.05 -> M3 is INCONCLUSIVE (neither pass nor fail): "
+                    "the design doc S8 event-state-machine demotion branch must "
+                    "not fire and M3 does not count toward the S8 All-pass row. "
+                    "p < 0.05 -> read the pinned C <= 0.5 * A ratio for "
+                    "pass/fail. The ratio itself is untouched; this rule only "
+                    "decides whether reading it is warranted"
+                ),
+                "reporting": (
+                    "report b, c, n, the exact two-sided p and the raw per-arm "
+                    "contaminated counts on every run, pass or fail"
+                ),
+            },
+            "superseded_inconclusive_floor": (
+                "this amendment's first draft keyed readability to a marginal "
+                "floor (Arm A contaminating fewer than 12 of 72). That measured "
+                "the wrong quantity: readability depends on the paired "
+                "A-only/C-only discordances, not on A's raw count. "
+                "Counterexample - A=12, C=7 with all seven of C's contaminated "
+                "questions also contaminated in A gives b=5, c=0, n=5, p=0.0625, "
+                "statistically unreadable, yet the floor would have admitted it "
+                "and fired the S8 demotion. Superseded within the same pre-run "
+                "amendment window and never exercised (no arm has run)"
+            ),
         },
         "M4": {
             "gate": "none (sanity-only)",
@@ -68,6 +175,35 @@ EXPECTED: dict = {
             "gate": "C-B <= +3pp on adversarial set",
             "N": 20,
             "gating": "non-gating diagnostic tripwire",
+            "breach_response": {
+                "tier1_pp": 5.0,
+                "tier1": (
+                    "one-question NET breach: enumerate every discordant "
+                    "adversarial question - both B-only wins and C-only wins - "
+                    "and diff each one's Arm B vs Arm C retrieved context, "
+                    "recording all findings in the results. A net +5pp does not "
+                    "imply exactly one differing question (three C-only wins "
+                    "against two B-only wins nets the same +5pp), so there is no "
+                    "unique question to diff and an arbitrary pick could miss "
+                    "the one carrying arm leakage while still licensing M1/M3 to "
+                    "be trusted. At N=20 the discordance set is small by "
+                    "construction, so full enumeration stays a bounded check, "
+                    "not an audit"
+                ),
+                "tier2_pp": 10.0,
+                "tier2": (
+                    "two-or-more-question breach: the full leakage "
+                    "investigation, completed before M1/M3 are trusted (design "
+                    "doc S6 guard 4)"
+                ),
+                "rationale": (
+                    "at N=20 one question is 5pp, so the smallest non-zero C-B "
+                    "already breaches the +3pp tripwire; under a true null it "
+                    "fires ~25-36% of the time. The +3pp tripwire is unchanged - "
+                    "only the depth of the mandated response is pinned (amended "
+                    "2026-08-14)"
+                ),
+            },
         },
     },
     "answering_model": "gpt-oss:120b @ GB10 ollama 192.168.1.134:11434",
