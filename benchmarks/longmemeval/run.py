@@ -52,13 +52,22 @@ A second entry point, ``--smoke-3arm``, extends this to **arms A + B + C** and
 Both smokes are deterministic and byte-identical across runs, and neither opens a
 socket. Every metric number the 3-arm smoke emits is *plumbing evidence* and
 carries a caveat saying so: the real M1 needs the pinned answering and judge
-models, and the real M4 needs a real clock, so both remain part of the
-GB10-gated execution run.
+models, and the real M4 needs a real clock.
+
+That real run is the third entry point, ``--real``, implemented in
+:mod:`benchmarks.longmemeval.real_run`: the full frozen split, the models
+``preregister.json`` pins, durable per-question rows so an hours-long run can be
+resumed, and the same two-phase blind scoring the smokes exercise. ``--preflight``
+checks those models are reachable while generating nothing, because the first
+real generation from a pinned arm closes design doc §6.3's pre-registration
+amendment window.
 
 Run them with::
 
     python -m benchmarks.longmemeval.run --smoke
     python -m benchmarks.longmemeval.run --smoke-3arm
+    python -m benchmarks.longmemeval.run --preflight
+    python -m benchmarks.longmemeval.run --real --haystack s --split all
 """
 
 from __future__ import annotations
@@ -854,10 +863,146 @@ def run_3arm_smoke(
 # ---------------------------------------------------------------------------
 
 
+def _add_real_run_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the real-model run's flags.
+
+    :mod:`benchmarks.longmemeval.real_run` is imported here rather than at module
+    scope because it imports *this* module (for the session ordering rule, which
+    must have exactly one definition). Deferring the import to call time keeps the
+    dependency one-directional whichever module a caller reaches first.
+    """
+    from benchmarks.longmemeval import real_run
+
+    parser.add_argument(
+        "--real",
+        action="store_true",
+        help=(
+            "run the pinned real-model benchmark: every arm answers, then one "
+            "blind judge batch, then the metrics (resumable; writes to --out-dir)"
+        ),
+    )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "check every pinned stage is reachable and generate nothing "
+            "(the first real generation closes the §6.3 amendment window)"
+        ),
+    )
+    parser.add_argument(
+        "--haystack",
+        choices=real_run.HAYSTACK_CHOICES,
+        default=None,
+        help=(
+            "which corpus the extractor ingests (design doc §3.4): 's' is the "
+            "distractor-heavy primary retrieval corpus, 'oracle' is evidence "
+            "sessions only. Required with --real - there is no default, because "
+            "the choice decides what the benchmark measures"
+        ),
+    )
+    parser.add_argument(
+        "--split",
+        choices=real_run.SPLIT_CHOICES,
+        default=real_run.SPLIT_ALL,
+        help="which frozen split to run (default: all)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="answer only the first N questions of the split, in canonical order",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=real_run.DEFAULT_OUT_DIR,
+        help=f"durable run directory (default: {real_run.DEFAULT_OUT_DIR})",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=real_run.DEFAULT_TOP_K,
+        help=(
+            "retrieved claims handed to the answering model "
+            f"(default: {real_run.DEFAULT_TOP_K}; recorded in the run manifest)"
+        ),
+    )
+    parser.add_argument(
+        "--m3-labels",
+        type=Path,
+        default=None,
+        help=(
+            "JSON file of {question_id: [old value, ...]} stale-value labels. "
+            "Without it M3 is reported as not computed, with the reason: the "
+            "corpus ships no such labels and this harness will not derive them "
+            "from the edges Arm C acts on"
+        ),
+    )
+
+
+def _run_preflight() -> int:
+    """Report whether every pinned stage is reachable. Generates nothing."""
+    from benchmarks.longmemeval import real_run
+
+    report = real_run.preflight()
+    for stage in ("answering", "extractor", "judge"):
+        print(f"  {stage}: {json.dumps(report[stage], sort_keys=True)}")
+    print(f"preflight ready: {report['ready']}")
+    for error in report["errors"]:
+        print(f"  error: {error}")
+    return 0 if report["ready"] else 1
+
+
+def _run_real(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Execute the pinned real-model run and print its headline numbers."""
+    from benchmarks.longmemeval import real_run
+
+    if args.haystack is None:
+        parser.error(
+            "--real requires --haystack: design doc §3.4 makes 's' the corpus the "
+            "extractor ingests and 'oracle' the evidence-only source, and running "
+            "the wrong one silently measures a different benchmark"
+        )
+
+    config = real_run.RealRunConfig(
+        out_dir=args.out_dir,
+        split=args.split,
+        limit=args.limit,
+        haystack=args.haystack,
+        data_dir=args.data_dir,
+        top_k=args.top_k,
+        m3_labels=args.m3_labels,
+    )
+    metrics = real_run.execute(config, progress=print)
+
+    print(f"real run: wrote {args.out_dir / real_run.METRICS_NAME}")
+    print(f"  counts: {metrics['counts']}")
+    print(f"  linker: {metrics['linker']} (this bounds Arm C)")
+    if metrics["m1"]:
+        print(
+            f"  M1 accuracy: {metrics['m1']['accuracy']}; "
+            f"C-B: {metrics['m1']['primary']['delta_pp']}pp; "
+            f"gate verdict: {metrics['m1']['gate_verdict']}"
+        )
+    print(f"  M2 F1: {metrics['m2']['f1']}")
+    print(f"  M3: {metrics['m3'] or metrics.get('m3_reason')}")
+    print(f"  M4 p95 ms: {metrics['m4']['p95_ms']}")
+    print(f"  M5 gate verdict: {metrics['m5']['gate_verdict']}")
+    if metrics["ag"]:
+        print(
+            f"  AG C-B: {metrics['ag']['delta_pp']}pp; "
+            f"response tier: {metrics['ag']['response_tier']}"
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m benchmarks.longmemeval.run",
-        description="LongMemEval 3-arm benchmark orchestrator (prep scope: smoke only).",
+        description=(
+            "LongMemEval 3-arm benchmark orchestrator: offline smokes, plus the "
+            "pinned real-model execution run."
+        ),
     )
     parser.add_argument(
         "--smoke",
@@ -891,12 +1036,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"(default: ${corpus.DATA_DIR_ENV} or {corpus.DEFAULT_DATA_DIR})"
         ),
     )
+    _add_real_run_arguments(parser)
     args = parser.parse_args(argv)
 
-    if args.smoke and args.smoke_3arm:
-        parser.error("pass either --smoke or --smoke-3arm, not both")
-    if not (args.smoke or args.smoke_3arm):
-        parser.error("nothing to do: pass --smoke or --smoke-3arm")
+    modes = [args.smoke, args.smoke_3arm, args.real, args.preflight]
+    if sum(bool(mode) for mode in modes) > 1:
+        parser.error(
+            "pass exactly one of --smoke, --smoke-3arm, --real or --preflight"
+        )
+    if not any(modes):
+        parser.error(
+            "nothing to do: pass --smoke, --smoke-3arm, --preflight or --real"
+        )
+
+    if args.preflight:
+        return _run_preflight()
+    if args.real:
+        return _run_real(parser, args)
 
     if args.smoke_3arm:
         out = args.out or DEFAULT_3ARM_OUTPUT
