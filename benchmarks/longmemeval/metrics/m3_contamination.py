@@ -1,4 +1,4 @@
-"""M3 — knowledge-update contamination rate.
+r"""M3 — knowledge-update contamination rate.
 
 A knowledge-update question has a value that changed over time: an *old*
 (superseded) value and a *current* one. A memory layer is "contaminated" for a
@@ -11,12 +11,25 @@ The metric is a rate over questions::
                          / (# questions)
 
 A question counts as contaminated when *any* of its retrieved context strings
-contains *any* of that question's labeled old values, by case-sensitive substring
-match. Substring matching is deliberately simple and mechanical for this skeleton;
-token-boundary / normalization refinements are left to the execution drive. The
-denominator is the knowledge-update set the caller passes in (``preregister.json``
-M3 pins N=78 with the knowledge-update denominator); this module scores exactly
-the questions it is given.
+contains *any* of that question's labeled old values, matched at **token
+boundaries** and **case-sensitively** — the rule pinned on 2026-08-15
+(``preregister.json`` ``metrics.M3.matching``)::
+
+    (?<!\w) re.escape(value) (?!\w)
+
+Raw substring matching was the skeleton's rule and is now pinned out, because it
+is not conservative — it is *systematically wrong* on this label set. 23 of the
+70 labels are four characters or shorter ("4", "20", "two"), so a raw substring
+test fires on "42", "2024" and "14:30". That inflates both arms roughly equally,
+and M3's gate is the **ratio** ``C <= 0.5 * A``: adding the same false-positive
+mass to both numerator and denominator of the comparison pushes the ratio toward
+1 and therefore biases the pinned gate toward FAIL. A token-boundary test is the
+narrowest rule that removes it without normalising the corpus text.
+
+The denominator is the question set the caller passes in; this module scores
+exactly the questions it is given (``preregister.json`` pins N=66 — the
+knowledge-update pool minus the 6 abstention variants and the 6 questions whose
+evidence carries no old->new update at all).
 
 The gate that consumes this (M3) is ``C <= 0.5 * A``. This module only computes
 the rate; the gate comparison lives with the execution drive.
@@ -26,6 +39,7 @@ Pure stdlib. No model or network calls.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -44,18 +58,36 @@ class ContaminationScore:
     contaminated_ids: tuple[str, ...]
 
 
+def old_value_pattern(value: str) -> re.Pattern[str]:
+    """The pinned token-boundary matcher for one labeled old value.
+
+    ``(?<!\\w) ... (?!\\w)``, case-sensitive, over the value escaped literally.
+    Lookarounds rather than ``\\b`` because many labels begin or end with a
+    non-word character — ``"$350"``, ``"3-2"``, ``"7:00 pm"`` — and ``\\b`` is
+    defined between a word and a non-word character, so it would silently fail to
+    anchor exactly the values most in need of anchoring.
+    """
+    return re.compile(rf"(?<!\w){re.escape(value)}(?!\w)")
+
+
 def context_is_contaminated(
     contexts: Iterable[str], old_values: Iterable[str]
 ) -> bool:
-    """True iff any context string contains any (non-empty) old value.
+    """True iff any context surfaces any (non-empty) old value at token boundaries.
 
-    Case-sensitive substring match. Empty old-value strings are ignored so a
-    blank label can never mark every question contaminated.
+    Case-sensitive, per the pinned rule (see the module docstring). Empty
+    old-value strings are ignored so a blank label can never mark every question
+    contaminated — the labels file deliberately keeps a key for every question,
+    including the ones with no old value at all.
     """
-    olds = [value for value in old_values if value]
-    if not olds:
+    patterns = [old_value_pattern(value) for value in old_values if value]
+    if not patterns:
         return False
-    return any(any(old in context for old in olds) for context in contexts)
+    return any(
+        pattern.search(context) is not None
+        for context in contexts
+        for pattern in patterns
+    )
 
 
 def contamination_rate(

@@ -1620,26 +1620,72 @@ def m3_gate_verdict(
     }
 
 
-def m3_denominator_ids(
-    split_manifest: Mapping[str, Any], path: Path = PREREGISTER_PATH
-) -> tuple[list[str], int]:
-    """The knowledge-update ids M3 is defined over, and the pinned denominator.
+@dataclass(frozen=True)
+class M3Denominator:
+    """M3's two question sets, which are deliberately not the same set.
 
-    Derived structurally — the KU pool minus its abstention (``_abs``) variants —
-    rather than by transcribing the six ids out of the pin's prose, because the
-    pin states the *rule* ("the 6 KU ``_abs`` variants ... encode no old→new
-    update, so no stale-value label can exist for them") and a transcribed list
-    would silently rot if the split ever moved. The pinned ``N`` is returned
-    alongside so callers can report whether the derivation actually lands on it.
+    ``label_ids`` is the **structural** knowledge-update pool minus its
+    abstention variants — the keyset the labels file must cover exactly, so that
+    a question carrying no old value is visible as an empty list rather than
+    absent. ``scored_ids`` is the **pinned denominator**: those same questions
+    minus the ones the labeling pass found carry no old→new update at all.
+
+    Keeping them apart is the point. Validating the label file against the wider
+    set keeps the exclusion auditable in the data; scoring against the narrower
+    one keeps 6 structurally uncontaminable questions from deflating both arms
+    equally and biasing the pinned ``C <= 0.5 * A`` ratio toward FAIL.
+    """
+
+    label_ids: tuple[str, ...]
+    no_update_ids: tuple[str, ...]
+    scored_ids: tuple[str, ...]
+    pinned_n: int
+
+    @property
+    def matches_pin(self) -> bool:
+        """True when the derivation lands on the pre-registered denominator."""
+        return len(self.scored_ids) == self.pinned_n
+
+
+def m3_denominator(
+    split_manifest: Mapping[str, Any], path: Path = PREREGISTER_PATH
+) -> M3Denominator:
+    """Derive M3's label keyset and its pinned scoring denominator.
+
+    The ``_abs`` exclusion is derived **structurally** from the rule the pin
+    states ("the 6 KU ``_abs`` variants ... encode no old→new update"), never by
+    transcribing ids, because a transcribed list would silently rot if the split
+    moved. The no-update exclusion cannot be derived that way — it is an
+    empirical finding about six specific transcripts — so it is *read* from the
+    pre-registration's own ``no_update_exclusions`` list and never hardcoded
+    here.
     """
     # The pin is read FIRST and strictly. Deriving the ids first would let a
     # label-set mismatch raise before an unreadable ``N`` was ever noticed, so
     # the louder error would mask the one that says the pre-registration itself
     # cannot be read.
-    pinned_n = _pinned_int(preregistered_metric("M3", path), "N", "M3", path)
+    record = preregistered_metric("M3", path)
+    pinned_n = _pinned_int(record, "N", "M3", path)
+    excluded = record.get("no_update_exclusions")
+    if not isinstance(excluded, list) or not all(
+        isinstance(qid, str) for qid in excluded
+    ):
+        raise GatePinError(
+            f"{path}: pinned M3 'no_update_exclusions' must be a list of question "
+            f"ids, got {excluded!r}. The questions carrying no old->new update are "
+            "an empirical finding recorded in the pre-registration; this harness "
+            "will not re-derive or default them."
+        )
+
     ku = [str(qid) for qid in split_manifest.get("question_ids", {}).get("ku", [])]
-    ids = sorted(qid for qid in ku if not qid.endswith("_abs"))
-    return ids, pinned_n
+    label_ids = tuple(sorted(qid for qid in ku if not qid.endswith("_abs")))
+    no_update = tuple(sorted(excluded))
+    return M3Denominator(
+        label_ids=label_ids,
+        no_update_ids=no_update,
+        scored_ids=tuple(qid for qid in label_ids if qid not in set(no_update)),
+        pinned_n=pinned_n,
+    )
 
 
 class M3LabelError(ValueError):
@@ -1975,28 +2021,36 @@ def compute_metrics(
     # -- M3 ---------------------------------------------------------------
     labels = load_m3_labels(cfg.m3_labels)
     if labels:
-        expected_ids, pinned_n = m3_denominator_ids(split_manifest, path)
-        validate_m3_labels(labels, expected_ids)
+        denominator = m3_denominator(split_manifest, path)
+        validate_m3_labels(labels, denominator.label_ids)
+        # Scored over the pinned denominator, NOT over every labeled key: the
+        # 6 no-update questions carry no stale value any arm could surface, so
+        # including them would add the same uncontaminable mass to every arm and
+        # push the C <= 0.5 * A ratio toward 1.
+        scored_ids = set(denominator.scored_ids)
         contexts: dict[str, dict[str, list[str]]] = {arm: {} for arm in ARM_STORES}
         for row in answer_rows:
-            if row["question_id"] in labels:
+            if row["question_id"] in scored_ids:
                 contexts[row["arm"]][row["question_id"]] = row["retrieved_texts"]
         scores = {
             arm: m3_contamination.contamination_rate(per_arm, labels)
             for arm, per_arm in sorted(contexts.items())
         }
         contaminated = {arm: set(score.contaminated_ids) for arm, score in scores.items()}
-        labelled_ids = sorted(set(labels) & set(question_ids))
-        readability = m3_readability(contaminated, labelled_ids, path)
+        scored_here = sorted(scored_ids & set(question_ids))
+        readability = m3_readability(contaminated, scored_here, path)
         rate = {arm: score.rate for arm, score in scores.items()}
         metrics["m3"] = {
             "rate": rate,
             "contaminated": {arm: score.contaminated for arm, score in scores.items()},
             "total": {arm: score.total for arm, score in scores.items()},
             "readability": readability,
-            "gate": m3_gate_verdict(rate, readability, len(labelled_ids), path),
-            "denominator_ids": len(expected_ids),
-            "denominator_matches_pin": len(expected_ids) == pinned_n,
+            "gate": m3_gate_verdict(rate, readability, len(scored_here), path),
+            "label_keyset_ids": len(denominator.label_ids),
+            "denominator_ids": len(denominator.scored_ids),
+            "denominator_matches_pin": denominator.matches_pin,
+            "no_update_excluded": list(denominator.no_update_ids),
+            "matching": preregistered_metric("M3", path).get("matching"),
             "labels_source": str(cfg.m3_labels),
             "labels_sha256": file_digest(cfg.m3_labels),
         }

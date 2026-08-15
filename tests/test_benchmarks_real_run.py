@@ -21,6 +21,7 @@ Three groups:
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import math
@@ -38,6 +39,7 @@ import pytest
 
 from benchmarks.longmemeval import clients, corpus, real_run
 from benchmarks.longmemeval.arms import ARM_STORES
+from benchmarks.longmemeval.metrics import m3_contamination
 from benchmarks.longmemeval.pipeline import (
     Claim,
     GatePinError,
@@ -1586,8 +1588,15 @@ def test_the_m2_gate_is_read_from_the_pin_with_both_arms_reported() -> None:
 @pytest.mark.unit
 def test_the_m3_gate_is_not_read_when_the_sign_test_says_unreadable() -> None:
     """p >= alpha is INCONCLUSIVE: it must not fire §8's demotion branch."""
+    # The pinned denominator, read rather than hardcoded: it has moved twice
+    # already (78 -> 72 -> 66) and a literal here would silently start
+    # exercising the UNDERPOWERED branch instead of the one under test.
+    pinned_n = json.loads(real_run.PREREGISTER_PATH.read_text(encoding="utf-8"))[
+        "metrics"
+    ]["M3"]["N"]
+
     unreadable = real_run.m3_gate_verdict(
-        {"A": 0.5, "C": 0.0}, {"inconclusive": True}, 72
+        {"A": 0.5, "C": 0.0}, {"inconclusive": True}, pinned_n
     )
     assert unreadable["status"] == "INCONCLUSIVE"
     assert unreadable["verdict"] is None
@@ -1595,17 +1604,24 @@ def test_the_m3_gate_is_not_read_when_the_sign_test_says_unreadable() -> None:
     assert unreadable["counts_toward_all_pass"] is False
 
     passing = real_run.m3_gate_verdict(
-        {"A": 0.50, "C": 0.20}, {"inconclusive": False}, 72
+        {"A": 0.50, "C": 0.20}, {"inconclusive": False}, pinned_n
     )
     assert passing["ratio"] == 0.5
     assert passing["verdict"] is True
     assert passing["counts_toward_all_pass"] is True
 
     failing = real_run.m3_gate_verdict(
-        {"A": 0.50, "C": 0.40}, {"inconclusive": False}, 72
+        {"A": 0.50, "C": 0.40}, {"inconclusive": False}, pinned_n
     )
     assert failing["verdict"] is False
     assert failing["fires_s8_demotion"] is True
+
+    # Away from the pinned denominator no verdict is read at all.
+    underpowered = real_run.m3_gate_verdict(
+        {"A": 0.50, "C": 0.20}, {"inconclusive": False}, pinned_n - 1
+    )
+    assert underpowered["status"] == "UNDERPOWERED"
+    assert underpowered["verdict"] is None
 
 
 @pytest.mark.unit
@@ -1632,19 +1648,165 @@ def test_m3_labels_must_be_exactly_the_pinned_denominator() -> None:
 def test_the_m3_denominator_excludes_abstention_variants() -> None:
     """The 6 _abs variants encode no old->new update, so no label can exist."""
     manifest = {"question_ids": {"ku": ["a", "b_abs", "c", "d_abs"]}}
-    ids, pinned_n = real_run.m3_denominator_ids(manifest)
-    assert ids == ["a", "c"]
-    assert pinned_n == json.loads(
+    denominator = real_run.m3_denominator(manifest)
+    assert denominator.label_ids == ("a", "c")
+    assert denominator.pinned_n == json.loads(
         real_run.PREREGISTER_PATH.read_text(encoding="utf-8")
     )["metrics"]["M3"]["N"]
 
 
 @pytest.mark.unit
-def test_the_real_split_manifest_derives_the_pinned_72() -> None:
-    """The structural rule must land on the pin's own number on the real split."""
-    ids, pinned_n = real_run.m3_denominator_ids(real_run.load_split())
-    assert len(ids) == pinned_n == 72
-    assert not any(qid.endswith("_abs") for qid in ids)
+def test_the_real_split_manifest_derives_both_exclusion_layers() -> None:
+    """Structural (_abs) and empirical (no-update) exclusions are distinct sets.
+
+    The label keyset stays at the structural 72 so a question carrying no old
+    value is visible as an empty list; the scored denominator is the pinned 66.
+    """
+    denominator = real_run.m3_denominator(real_run.load_split())
+
+    assert len(denominator.label_ids) == 72
+    assert not any(qid.endswith("_abs") for qid in denominator.label_ids)
+
+    assert len(denominator.no_update_ids) == 6
+    assert set(denominator.no_update_ids) <= set(denominator.label_ids)
+
+    assert len(denominator.scored_ids) == denominator.pinned_n == 66
+    assert denominator.matches_pin is True
+    assert set(denominator.scored_ids).isdisjoint(denominator.no_update_ids)
+
+
+@pytest.mark.unit
+def test_the_no_update_exclusions_are_read_from_the_pin_not_hardcoded() -> None:
+    """They are an empirical finding about six transcripts, not a derivable rule."""
+    pinned = json.loads(real_run.PREREGISTER_PATH.read_text(encoding="utf-8"))
+    recorded = pinned["metrics"]["M3"]["no_update_exclusions"]
+    assert list(real_run.m3_denominator(real_run.load_split()).no_update_ids) == (
+        sorted(recorded)
+    )
+
+
+@pytest.mark.unit
+def test_a_missing_no_update_exclusion_list_is_a_gate_pin_error(
+    tmp_path: Path,
+) -> None:
+    def drop_list(record: dict) -> None:
+        del record["metrics"]["M3"]["no_update_exclusions"]
+
+    path = _preregister_with(tmp_path, drop_list)
+    with pytest.raises(GatePinError, match="no_update_exclusions"):
+        real_run.m3_denominator({"question_ids": {"ku": ["a"]}}, path)
+
+
+# --------------------------------------------------------------------------- #
+# M3 labels: the committed file, and the pinned token-boundary matching rule   #
+# --------------------------------------------------------------------------- #
+
+_LABELS_PATH = _REPO_ROOT / "benchmarks" / "longmemeval" / "m3_labels.json"
+
+
+@pytest.mark.unit
+def test_the_committed_labels_match_their_recorded_sha256() -> None:
+    """The pin and the file it names must not drift apart.
+
+    Hashed over CRLF-normalized bytes, the same convention design_doc_sha256
+    uses, so the pin holds on a Windows CRLF checkout and a Linux LF one alike.
+    """
+    pinned = json.loads(real_run.PREREGISTER_PATH.read_text(encoding="utf-8"))
+    m3 = pinned["metrics"]["M3"]
+
+    assert (_REPO_ROOT / m3["labels_file"]).resolve() == _LABELS_PATH.resolve()
+    normalized = _LABELS_PATH.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(normalized).hexdigest() == m3["labels_sha256"]
+
+
+@pytest.mark.unit
+def test_the_committed_labels_have_the_pinned_shape() -> None:
+    """72 keys, 66 non-empty, 70 values, and the 6 empties are the pinned ones."""
+    labels = json.loads(_LABELS_PATH.read_text(encoding="utf-8"))
+    pinned = json.loads(real_run.PREREGISTER_PATH.read_text(encoding="utf-8"))
+    denominator = real_run.m3_denominator(real_run.load_split())
+
+    assert set(labels) == set(denominator.label_ids)
+    assert len(labels) == 72
+    assert sum(len(values) for values in labels.values()) == 70
+
+    empty = sorted(qid for qid, values in labels.items() if not values)
+    assert empty == sorted(pinned["metrics"]["M3"]["no_update_exclusions"])
+    assert len(set(labels) - set(empty)) == 66
+
+    # Every label is a non-empty string; a blank would match nothing and a
+    # non-string would crash the matcher mid-run.
+    for values in labels.values():
+        assert all(isinstance(v, str) and v.strip() for v in values)
+
+
+@pytest.mark.unit
+def test_the_committed_labels_validate_against_the_structural_keyset() -> None:
+    """The file is exactly M3's label keyset - no missing, no extra."""
+    labels = json.loads(_LABELS_PATH.read_text(encoding="utf-8"))
+    real_run.validate_m3_labels(
+        labels, real_run.m3_denominator(real_run.load_split()).label_ids
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("value", "context", "expected"),
+    [
+        # The defect the rule exists to close: 23 of 70 labels are <= 4 chars.
+        ("4", "I caught 42 bass that day", False),
+        ("4", "back in 2024 I started", False),
+        ("4", "we met at 14:30 sharp", False),
+        ("4", "I caught 4 bass that day", True),
+        ("20", "it cost 200 dollars", False),
+        ("20", "I did 20 reps", True),
+        ("two", "we went twofold on it", False),
+        ("two", "I have two of them", True),
+        # Labels that begin or end with a non-word character - exactly the ones
+        # \b could not anchor.
+        ("$350", "I paid $350 for it", True),
+        ("$350", "it was 1$3500", False),
+        ("3-2", "we won 3-2 last night", True),
+        ("3-2", "the range was 13-24 units", False),
+        ("7:00 pm", "dinner at 7:00 pm tonight", True),
+        # Case sensitivity is pinned.
+        ("Hawaii", "we flew to Hawaii", True),
+        ("Hawaii", "we flew to hawaii", False),
+    ],
+)
+def test_the_pinned_token_boundary_matching_rule(
+    value: str, context: str, expected: bool
+) -> None:
+    assert m3_contamination.context_is_contaminated([context], [value]) is expected
+
+
+@pytest.mark.unit
+def test_a_multi_value_question_is_contaminated_by_any_of_its_values() -> None:
+    """3 of the 66 labeled questions carry more than one superseded value."""
+    values = ["300 stars", "400 stars", "125 stars"]
+    assert m3_contamination.context_is_contaminated(["I had 125 stars"], values)
+    assert m3_contamination.context_is_contaminated(
+        ["nothing here", "then 400 stars"], values
+    )
+    assert not m3_contamination.context_is_contaminated(["I had 1250 stars"], values)
+
+
+@pytest.mark.unit
+def test_a_question_with_no_labels_can_never_be_contaminated() -> None:
+    """The 6 no-update questions keep a key with an empty list."""
+    assert not m3_contamination.context_is_contaminated(["anything at all"], [])
+    assert not m3_contamination.context_is_contaminated(["anything"], ["", "  "])
+
+
+@pytest.mark.unit
+def test_every_committed_label_matches_itself_under_the_pinned_rule() -> None:
+    """A label that cannot match its own text would be silently unscoreable."""
+    labels = json.loads(_LABELS_PATH.read_text(encoding="utf-8"))
+    for qid, values in sorted(labels.items()):
+        for value in values:
+            assert m3_contamination.context_is_contaminated([value], [value]), (
+                f"{qid}: label {value!r} does not match itself"
+            )
 
 
 @pytest.mark.unit
@@ -2166,7 +2328,7 @@ def test_a_boolean_denominator_is_rejected_despite_being_an_int(
 
     path = _preregister_with(tmp_path, set_n)
     with pytest.raises(GatePinError, match="'N'"):
-        real_run.m3_denominator_ids({"question_ids": {"ku": ["a"]}}, path)
+        real_run.m3_denominator({"question_ids": {"ku": ["a"]}}, path)
 
 
 @pytest.mark.unit
@@ -2180,7 +2342,7 @@ def test_an_unreadable_denominator_is_not_masked_by_a_label_mismatch(
 
     path = _preregister_with(tmp_path, break_n)
     with pytest.raises(GatePinError):
-        real_run.m3_denominator_ids({"question_ids": {"ku": ["a", "b_abs"]}}, path)
+        real_run.m3_denominator({"question_ids": {"ku": ["a", "b_abs"]}}, path)
 
 
 @pytest.mark.unit
