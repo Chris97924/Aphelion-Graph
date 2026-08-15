@@ -166,6 +166,24 @@ class CorruptRowError(ValueError):
     """
 
 
+# The extraction cache's row format. Bumped whenever the PROMPT that produced a
+# cached extraction changes, because a replayed claim set is only sound if it
+# could have been produced by the prompt this code would send today. Version 2
+# adds vocabulary priming: a session's prompt now depends on the subject slugs
+# its predecessors minted, so version-1 rows are not replayable.
+EXTRACTION_CACHE_FORMAT = 2
+
+
+class ExtractionCacheVersionError(ValueError):
+    """A durable extraction cache was written by a different extraction protocol.
+
+    Refused rather than migrated. The claims themselves are still valid text, but
+    they were produced by prompts this harness no longer sends; replaying them
+    beside newly-primed sessions would mix two protocols inside one question, and
+    the resulting linkage would belong to neither.
+    """
+
+
 class MissingAnswerError(ValueError):
     """The judging phase reached a candidate no arm had answered.
 
@@ -472,21 +490,45 @@ class ExtractionCache:
 
     def __init__(self, path: Path) -> None:
         self._writer = JsonlWriter(path)
-        self._records: dict[str, list[dict]] = {
-            row["session_id"]: list(row["claims"]) for row in read_jsonl(path)
-        }
+        self._records: dict[tuple[str, str], list[dict]] = {}
+        for row in read_jsonl(path):
+            if row.get("format") != EXTRACTION_CACHE_FORMAT:
+                raise ExtractionCacheVersionError(
+                    f"{path} holds extraction rows in format "
+                    f"{row.get('format')!r}, but this harness writes and reads "
+                    f"format {EXTRACTION_CACHE_FORMAT}. Rows written before "
+                    "vocabulary priming were produced by UNPRIMED prompts: the "
+                    "same session now receives a prompt carrying the subject "
+                    "slugs its predecessors minted, so replaying the old claims "
+                    "would mix two extraction protocols inside one question. "
+                    "Discard this cache (delete the file, or start a new "
+                    "--out-dir) and let the sessions be re-extracted."
+                )
+            self._records[(row["question_id"], row["session_id"])] = list(row["claims"])
 
     def __len__(self) -> int:
         return len(self._records)
 
-    def get(self, session_id: str) -> list[dict] | None:
-        records = self._records.get(session_id)
+    def get(self, question_id: str, session_id: str) -> list[dict] | None:
+        records = self._records.get((question_id, session_id))
         return [dict(record) for record in records] if records is not None else None
 
-    def put(self, session_id: str, records: Sequence[Mapping[str, str]]) -> None:
+    def put(
+        self,
+        question_id: str,
+        session_id: str,
+        records: Sequence[Mapping[str, str]],
+    ) -> None:
         stored = [dict(record) for record in records]
-        self._records[session_id] = stored
-        self._writer.append({"session_id": session_id, "claims": stored})
+        self._records[(question_id, session_id)] = stored
+        self._writer.append(
+            {
+                "format": EXTRACTION_CACHE_FORMAT,
+                "question_id": question_id,
+                "session_id": session_id,
+                "claims": stored,
+            }
+        )
 
 
 @dataclass
@@ -504,20 +546,56 @@ class RealExtractor:
     client: Any
     linker: SharedLinker
     cache: ExtractionCache
+    question_id: str
     calls: int = 0
+    # Session ids in first-seen (pinned occurrence) order, and their claims. The
+    # priming vocabulary for a session is derived from these rather than
+    # accumulated as the run goes, so it is a pure function of the pinned order
+    # and not of how many arm passes have happened to reach this point.
+    _order: list[str] = field(default_factory=list)
+    _claims_by_session: dict[str, list[dict]] = field(default_factory=dict)
+
+    def vocabulary_before(self, session_id: str) -> list[tuple[str, str]]:
+        """Subject slugs minted by this question's EARLIER sessions, with values.
+
+        Ordered by when each slug was first minted, carrying the most recent
+        value seen for it. Derived from the sessions preceding ``session_id`` in
+        pinned order — never from "everything seen so far" — because every arm
+        replays the same sessions through this one shared extractor, and a
+        vocabulary that grew with the replays would prime a session differently
+        on the second pass than on the first.
+        """
+        vocabulary: dict[str, str] = {}
+        for earlier in self._order:
+            if earlier == session_id:
+                break
+            for record in self._claims_by_session.get(earlier, ()):
+                vocabulary[record["subject"]] = record["value"]
+        return list(vocabulary.items())
 
     def __call__(self, session: Session, *, pin: ModelPin) -> list[Claim]:
-        records = self.cache.get(session.id)
+        if session.id not in self._order:
+            self._order.append(session.id)
+
+        records = self.cache.get(self.question_id, session.id)
         if records is None:
             completion = self.client.chat(
-                clients.extract_structured_messages(session.text)
+                clients.extract_structured_messages(
+                    session.text, self.vocabulary_before(session.id)
+                )
             )
             records = [
                 {"text": claim.text, "subject": claim.subject, "value": claim.value}
                 for claim in clients.extracted_claims(completion)
             ]
-            self.cache.put(session.id, records)
+            self.cache.put(self.question_id, session.id, records)
             self.calls += 1
+
+        # Recorded whether the claims came from the model or from the memo: the
+        # vocabulary a later session is primed with has to be identical either
+        # way, which is what makes a resumed run send the prompts the original
+        # run sent.
+        self._claims_by_session[session.id] = records
 
         # The claim sentences are what retrieval and answering see, exactly as
         # before; the subject/value pair travels beside them so the shared linker
@@ -1143,7 +1221,12 @@ def answer_questions(
         # over the same sessions and the extraction memo makes those sessions'
         # claim bodies fixed.
         linker = SharedLinker(spec.question_id)
-        extractor = RealExtractor(client=extract_client, linker=linker, cache=cache)
+        extractor = RealExtractor(
+            client=extract_client,
+            linker=linker,
+            cache=cache,
+            question_id=spec.question_id,
+        )
         config = build_config(
             extractor_call=extractor,
             answering_pin=pins["answering"],
@@ -2070,9 +2153,14 @@ def resolve_m3_labels(
             acknowledged=cfg.m3_labels_deviation_ack,
         )
 
-    resolved = Path(
-        cfg.m3_labels if cfg.m3_labels is not None else REPO_ROOT / pinned_file
-    )
+    if cfg.m3_labels is not None:
+        # The operator override may point anywhere: naming a file outside the
+        # repository is its entire purpose, and it is already gated by the
+        # deviation acknowledgement below.
+        resolved = Path(cfg.m3_labels)
+    else:
+        resolved = _resolve_pinned_labels(pinned_file, path)
+
     if not resolved.is_file():
         raise M3LabelError(
             f"the pinned M3 labels file {pinned_file!r} was not found at "
@@ -2100,6 +2188,32 @@ def resolve_m3_labels(
             "--m3-labels-deviation-ack to record the deviation in the results."
         )
     return replace(source, matches_preregistered=matches)
+
+
+def _resolve_pinned_labels(pinned_file: str, path: Path) -> Path:
+    """Resolve the pinned labels path, requiring it to stay inside the repository.
+
+    ``labels_file`` is documented and recorded as repo-relative, so a value that
+    escapes the repository is a garbled pin. Checking it here is pin hygiene of
+    the same kind applied to the judge command and the endpoint scheme: it puts
+    the error on the pre-registration, where the defect is, instead of letting the
+    run open some unrelated file and then report a confusing digest mismatch
+    against it.
+
+    This is not a sandbox and does not pretend to be one — ``preregister.json`` is
+    git-tracked source, so anyone able to write it can write this module — but a
+    pin that says "repo-relative" should mean it.
+    """
+    root = REPO_ROOT.resolve()
+    candidate = (root / pinned_file).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise M3LabelError(
+            f"{path}: pinned M3 'labels_file' {pinned_file!r} resolves to "
+            f"{candidate}, which is outside the repository. The label pin is "
+            "recorded as a repo-relative path; a value that escapes the "
+            "repository is a malformed pin, not a location."
+        )
+    return candidate
 
 
 def _snapshot_labels(

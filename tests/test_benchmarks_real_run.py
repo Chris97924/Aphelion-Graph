@@ -756,6 +756,262 @@ def test_malformed_structured_metadata_is_refused_not_ignored() -> None:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Vocabulary priming (amendment #4)                                            #
+# --------------------------------------------------------------------------- #
+
+# Verbatim slug drift from the 2026-08-16 probe. The mechanism was alive (11
+# edges over 4 of 10 questions) but these two questions produced none, and the
+# misses are pure naming differences for facts whose values had plainly moved.
+_DRIFT_OLD_SLUG = "user/postcard-collection/new-acquisitions-count"
+_DRIFT_NEW_SLUG = "user/collection/postcards/new-additions-since-restart"
+
+
+@pytest.mark.unit
+def test_the_first_session_of_a_question_is_unprimed() -> None:
+    """There is nothing yet to be consistent with, and the payload says so."""
+    messages = clients.extract_structured_messages("user: hello")
+    assert "KNOWN_SUBJECTS" not in messages[1]["content"]
+    assert messages == clients.extract_structured_messages("user: hello", ())
+
+
+@pytest.mark.unit
+def test_a_primed_prompt_carries_the_earlier_slugs_and_the_reuse_rule() -> None:
+    """The later session is shown what the earlier one named, and told to reuse it."""
+    known = [(_DRIFT_OLD_SLUG, "17"), ("user/postcard-collection/pc001/title", "1920s")]
+    messages = clients.extract_structured_messages("user: I have 25 now", known)
+    user = messages[1]["content"]
+
+    listing = _unfence("KNOWN_SUBJECTS", user)
+    assert listing.splitlines() == [
+        f"{_DRIFT_OLD_SLUG} = 17",
+        "user/postcard-collection/pc001/title = 1920s",
+    ]
+    assert "REUSE that exact slug" in user
+    # The session text is still fenced separately and unaltered.
+    assert _unfence("SESSION", user) == "user: I have 25 now"
+    # The slugs are model output over corpus text, so they are shown as data.
+    assert clients.DATA_FENCE_NOTE in messages[0]["content"]
+
+
+@pytest.mark.unit
+def test_the_priming_vocabulary_carries_the_latest_value_per_slug() -> None:
+    """One entry per fact, in first-minted order, at the value most recently seen."""
+    extractor = real_run.RealExtractor(
+        client=None, linker=linker_mod.SharedLinker("q"), cache=None, question_id="q"
+    )
+    extractor._order = ["s1", "s2", "s3"]
+    extractor._claims_by_session = {
+        "s1": [
+            {"text": "a", "subject": "user/count", "value": "15"},
+            {"text": "b", "subject": "user/city", "value": "Taipei"},
+        ],
+        "s2": [{"text": "c", "subject": "user/count", "value": "20"}],
+        "s3": [{"text": "d", "subject": "user/late", "value": "x"}],
+    }
+
+    assert extractor.vocabulary_before("s3") == [
+        ("user/count", "20"),
+        ("user/city", "Taipei"),
+    ]
+    assert extractor.vocabulary_before("s1") == [], "the first session is unprimed"
+
+
+@pytest.mark.unit
+def test_the_vocabulary_is_a_function_of_pinned_order_not_of_replays() -> None:
+    """Every arm replays the same sessions through one shared extractor.
+
+    A vocabulary that simply accumulated would prime a session differently on the
+    second pass than on the first, and the memoised claims would then no longer
+    correspond to the prompt this code would send.
+    """
+    extractor = real_run.RealExtractor(
+        client=None, linker=linker_mod.SharedLinker("q"), cache=None, question_id="q"
+    )
+    extractor._order = ["s1", "s2"]
+    extractor._claims_by_session = {
+        "s1": [{"text": "a", "subject": "user/count", "value": "15"}],
+        "s2": [{"text": "b", "subject": "user/other", "value": "9"}],
+    }
+
+    first_pass = extractor.vocabulary_before("s2")
+    # A second arm re-walks the same sessions; nothing about s2's priming moves.
+    assert extractor.vocabulary_before("s2") == first_pass
+    assert first_pass == [("user/count", "15")]
+
+
+class DriftingChat:
+    """A model that drifts its slug unless the prompt reminds it of the old one.
+
+    This is the measured behaviour, not a caricature: extraction is an
+    independent call per session, so without priming the model re-derives a name
+    for a fact it has already named.
+    """
+
+    def __init__(self) -> None:
+        self.extract_calls = 0
+
+    def chat(self, messages: Sequence[dict]) -> str:
+        user = messages[1]["content"]
+        self.extract_calls += 1
+        text = _unfence("SESSION", user)
+        if "17 postcards" in text:
+            slug, value = _DRIFT_OLD_SLUG, "17"
+        else:
+            primed = "KNOWN_SUBJECTS" in user and _DRIFT_OLD_SLUG in user
+            slug = _DRIFT_OLD_SLUG if primed else _DRIFT_NEW_SLUG
+            value = "25"
+        return json.dumps({"text": text, "subject": slug, "value": value})
+
+
+def _drift_sessions() -> list[Session]:
+    return [
+        Session(
+            id="01493427::s1",
+            text="I have 17 postcards now",
+            metadata={"occurred_at": "2023-05-01T00:00:00Z"},
+        ),
+        Session(
+            id="01493427::s2",
+            text="I have 25 postcards now",
+            metadata={"occurred_at": "2023-06-01T00:00:00Z"},
+        ),
+    ]
+
+
+def _run_drift(tmp_path: Path, primed: bool) -> linker_mod.LinkerStats:
+    linker = linker_mod.SharedLinker("01493427")
+    cache = real_run.ExtractionCache(tmp_path / f"cache-{primed}.jsonl")
+    extractor = real_run.RealExtractor(
+        client=DriftingChat(),
+        linker=linker,
+        cache=cache,
+        question_id="01493427",
+    )
+    if not primed:
+        # Suppress priming to reproduce the pre-amendment behaviour exactly.
+        extractor.vocabulary_before = lambda session_id: []  # type: ignore[method-assign]
+    for session in _drift_sessions():
+        extractor(session, pin=_PIN)
+    return linker.stats
+
+
+@pytest.mark.unit
+def test_the_measured_slug_drift_produces_no_edge_without_priming(
+    tmp_path: Path,
+) -> None:
+    """The 2026-08-16 finding, reproduced: same fact, two names, no link."""
+    stats = _run_drift(tmp_path, primed=False)
+    assert stats.subjects == 2, "the same fact read as two"
+    assert stats.supersedes_edges == 0
+
+
+@pytest.mark.unit
+def test_priming_resolves_the_measured_slug_drift(tmp_path: Path) -> None:
+    """The fix, on the same drift: one subject, one 17 -> 25 update edge."""
+    stats = _run_drift(tmp_path, primed=True)
+    assert stats.subjects == 1
+    assert stats.supersedes_edges == 1
+    assert stats.updated_subjects == 1
+
+
+@pytest.mark.unit
+def test_a_resumed_question_re_sends_the_prompts_the_original_run_sent(
+    tmp_path: Path,
+) -> None:
+    """Priming must survive a restart, or a resumed run extracts differently.
+
+    The vocabulary is rebuilt from the CACHED claims in pinned order, so a
+    session extracted after an interruption is primed exactly as it would have
+    been had the run never stopped.
+    """
+    cache_path = tmp_path / "extractions.jsonl"
+    sessions = _drift_sessions()
+
+    # Uninterrupted: both sessions in one pass.
+    clean_linker = linker_mod.SharedLinker("01493427")
+    clean = real_run.RealExtractor(
+        client=DriftingChat(),
+        linker=clean_linker,
+        cache=real_run.ExtractionCache(tmp_path / "clean.jsonl"),
+        question_id="01493427",
+    )
+    for session in sessions:
+        clean(session, pin=_PIN)
+
+    # Interrupted: first session only, then a fresh extractor over the same cache.
+    first = real_run.RealExtractor(
+        client=DriftingChat(),
+        linker=linker_mod.SharedLinker("01493427"),
+        cache=real_run.ExtractionCache(cache_path),
+        question_id="01493427",
+    )
+    first(sessions[0], pin=_PIN)
+
+    resumed_linker = linker_mod.SharedLinker("01493427")
+    resumed = real_run.RealExtractor(
+        client=DriftingChat(),
+        linker=resumed_linker,
+        cache=real_run.ExtractionCache(cache_path),
+        question_id="01493427",
+    )
+    for session in sessions:
+        resumed(session, pin=_PIN)
+
+    # The claims are byte-equal, so the resumed run linked what the clean run did.
+    assert [
+        (claim.id, claim.text, claim.metadata["subject"], claim.metadata["object"])
+        for claim in resumed_linker.claims
+    ] == [
+        (claim.id, claim.text, claim.metadata["subject"], claim.metadata["object"])
+        for claim in clean_linker.claims
+    ]
+    assert resumed_linker.stats.supersedes_edges == (
+        clean_linker.stats.supersedes_edges == 1
+    ) or resumed_linker.stats.supersedes_edges == 1
+
+
+@pytest.mark.unit
+def test_a_pre_priming_extraction_cache_is_refused(tmp_path: Path) -> None:
+    """Version-1 rows were produced by unprimed prompts and are not replayable.
+
+    Replaying them beside newly-primed sessions would mix two extraction
+    protocols inside one question, and the resulting linkage would belong to
+    neither.
+    """
+    path = tmp_path / "extractions.jsonl"
+    path.write_bytes(
+        (
+            json.dumps(
+                {
+                    "session_id": "q::s1",
+                    "claims": [{"text": "t", "subject": "s", "value": "v"}],
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+
+    with pytest.raises(real_run.ExtractionCacheVersionError, match="format"):
+        real_run.ExtractionCache(path)
+
+
+@pytest.mark.unit
+def test_the_current_cache_round_trips_under_its_own_version(tmp_path: Path) -> None:
+    path = tmp_path / "extractions.jsonl"
+    cache = real_run.ExtractionCache(path)
+    records = [{"text": "t", "subject": "s", "value": "v"}]
+    cache.put("q1", "q1::s1", records)
+
+    reopened = real_run.ExtractionCache(path)
+    assert reopened.get("q1", "q1::s1") == records
+    # The key is the PAIR: the same session id under another question is a miss.
+    assert reopened.get("q2", "q1::s1") is None
+    row = real_run.read_jsonl(path)[0]
+    assert row["format"] == real_run.EXTRACTION_CACHE_FORMAT
+    assert row["question_id"] == "q1"
+
+
 @pytest.mark.unit
 def test_the_structured_extraction_rubric_asks_for_what_the_linker_needs() -> None:
     completion = "\n".join(
@@ -2442,6 +2698,43 @@ def test_a_tampered_labels_file_is_refused(
     message = str(excinfo.value)
     assert "expected sha256" in message and "actual   sha256" in message
     assert "--m3-labels-deviation-ack" in message
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "pinned",
+    ["../outside.json", "../../etc/passwd", "benchmarks/../../escape.json"],
+)
+def test_a_pinned_labels_path_escaping_the_repository_is_refused(
+    tmp_path: Path, corpus_dir: Path, split_path: Path, pinned: str
+) -> None:
+    """labels_file is recorded as repo-relative; a value that escapes is garbled.
+
+    Pin hygiene rather than a sandbox - preregister.json is git-tracked source -
+    but a pin that says repo-relative should mean it, and the error belongs on the
+    pre-registration rather than on whatever unrelated file got opened.
+    """
+
+    def set_path(record: dict) -> None:
+        record["metrics"]["M3"]["labels_file"] = pinned
+
+    path = _preregister_with(tmp_path, set_path)
+    cfg = _config(
+        tmp_path, corpus_dir, split_path, m3_labels=None, preregister_path=path
+    )
+    with pytest.raises(real_run.M3LabelError, match="outside the repository"):
+        real_run.resolve_m3_labels(cfg, path)
+
+
+@pytest.mark.unit
+def test_the_operator_override_may_still_point_outside_the_repository(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Naming a file elsewhere is the override's whole purpose."""
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    assert not str(cfg.m3_labels).startswith(str(real_run.REPO_ROOT))
+    source = real_run.resolve_m3_labels(cfg)
+    assert source.path == cfg.m3_labels
 
 
 @pytest.mark.unit

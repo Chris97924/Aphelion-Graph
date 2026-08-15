@@ -292,7 +292,108 @@ EXPECTED: dict = {   'benchmark': 'longmemeval-3arm',
                                         'mechanical stub extractor, which supplies '
                                         'no subject, so the linker takes its '
                                         'existing free-text fallback path and '
-                                        'their output stays byte-identical'}],
+                                        'their output stays byte-identical'},
+                      {   'date': '2026-08-16',
+                          'authority': 'design doc S6.3 pre-registration amendment '
+                                       'window - legal because no arm has run',
+                          'summary': 'vocabulary-primed extraction: within a '
+                                     'question, every session after the first is '
+                                     'shown the subject slugs its predecessors '
+                                     'minted and instructed to reuse them verbatim '
+                                     'for the same fact. Fixes cross-session slug '
+                                     'drift, the residual cause of missing update '
+                                     'edges after the 2026-08-15 '
+                                     'structured-extraction amendment',
+                          'gates_moved': 'none - M1 +3pp, M2 A+0.10 / '
+                                         'epsilon=0.02, M3 C <= 0.5 * A with N=66 '
+                                         'and alpha=0.05, M4 no-gate, M5 100/100 '
+                                         'and AG +3pp are unchanged, as are the '
+                                         'seed 20260717, temperature 0 and the '
+                                         'model pins. This amendment changes only '
+                                         'what the shared extract stage is TOLD, '
+                                         'not what any metric measures or what any '
+                                         'arm may do with the result',
+                          'evidence_trail': 'extraction-only probe, 2026-08-16, '
+                                            'over 10 knowledge-update questions on '
+                                            'the post-amendment-3 stack. The '
+                                            'mechanism was ALIVE - 11 supersedes '
+                                            'edges across 4 of the 10 questions - '
+                                            'but 6 questions produced none, and '
+                                            'every miss was a naming difference '
+                                            'rather than a missing fact. Verbatim: '
+                                            'question 01493427 named the same fact '
+                                            "'user/postcard-collection/new-acquisitions-count' "
+                                            '(value 17) in one session and '
+                                            "'user/collection/postcards/new-additions-since-restart' "
+                                            '(value 25) in the next; question '
+                                            '0ddfec37 named it '
+                                            "'user/autographed-baseball-collection/count' "
+                                            '(15) and then '
+                                            "'user/collection/autographed-baseballs/recent-additions' "
+                                            '(20). No arm was run, no benchmark '
+                                            'metric was computed and no gate '
+                                            'outcome was knowable from the probe, '
+                                            'which is why acting on it remains '
+                                            'inside the S6.3 window',
+                          'mechanism': 'sessions already run in pinned occurrence '
+                                       'order within a question. After each '
+                                       "session's extraction the question's "
+                                       'subject vocabulary is accumulated (slug '
+                                       'plus the latest value seen, in '
+                                       'first-minted order) and every SUBSEQUENT '
+                                       "session's prompt carries it as a fenced "
+                                       'KNOWN_SUBJECTS block with the instruction '
+                                       'to reuse a listed slug '
+                                       'character-for-character when a claim '
+                                       'concerns the same fact, and to mint a new '
+                                       'slug only for a fact not listed. The first '
+                                       'session of a question is unprimed - there '
+                                       'is nothing yet to be consistent with',
+                          'fairness_and_determinism': 'the vocabulary is scoped to '
+                                                      'one question and derived '
+                                                      'from the sessions PRECEDING '
+                                                      'the one being extracted in '
+                                                      'pinned order, so it is a '
+                                                      'pure function of the frozen '
+                                                      'session sequence rather '
+                                                      'than of how many arm passes '
+                                                      'have reached that point. '
+                                                      'One shared extraction still '
+                                                      'feeds all three arms '
+                                                      'identically, so the memory '
+                                                      'layer remains the only '
+                                                      'independent variable. A '
+                                                      'resumed run rebuilds the '
+                                                      'vocabulary from the cached '
+                                                      'claims in the same pinned '
+                                                      'order and therefore sends '
+                                                      'the prompts the original '
+                                                      'run sent',
+                          'cost_note': 'extraction is cached per (question, '
+                                       'session) because a primed prompt depends '
+                                       'on the question it sits in. Session reuse '
+                                       'across questions is negligible - 10,417 '
+                                       '(question, session) pairs against 9,454 '
+                                       'unique sessions, 1.1x - so the '
+                                       'per-question scoping costs roughly 10% '
+                                       'more extraction calls than a session-only '
+                                       'cache would. Priced and accepted by the '
+                                       'maintainer',
+                          'cache_note': 'the durable extraction cache carries a '
+                                        'format version and refuses rows written '
+                                        'before priming. Those claims were '
+                                        'produced by unprimed prompts; replaying '
+                                        'them beside newly-primed sessions would '
+                                        'mix two extraction protocols inside one '
+                                        'question and the resulting linkage would '
+                                        'belong to neither. A pre-priming cache '
+                                        'must be discarded, not migrated',
+                          'scope_note': 'the offline smokes bind the mechanical '
+                                        'stub extractor, which neither reads nor '
+                                        'supplies a vocabulary, so their output '
+                                        'stays byte-identical. No pin, '
+                                        'denominator, threshold or arm behaviour '
+                                        'moves'}],
     'split': {   'knowledge_update': 78,
                  'knowledge_update_basis': 'all',
                  'multi_session': 122,
