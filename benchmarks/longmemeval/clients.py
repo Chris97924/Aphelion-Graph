@@ -224,17 +224,142 @@ def parse_cli_pin(value: str, *, temperature: float, seed: int) -> CliPin:
     )
 
 
-def answering_pin(path: Path = PREREGISTER_PATH) -> ModelPin:
-    """The pinned answering model (design doc §5.2)."""
-    temperature, seed = _pin_knobs(path)
-    return parse_server_pin(
-        str(preregistered("answering_model", path)),
-        temperature=temperature,
-        seed=seed,
+# The two chat dialects a pinned server may speak. Named for the protocol, not
+# for any vendor or serving framework: which product terminates the socket is the
+# operator's business, and putting its name in this module is exactly what the
+# no-hardcoded-model guard exists to prevent.
+API_NATIVE_CHAT = "native-chat"
+API_CHAT_COMPLETIONS = "chat-completions"
+API_CHOICES = (API_NATIVE_CHAT, API_CHAT_COMPLETIONS)
+
+
+@dataclass(frozen=True)
+class ChatPin:
+    """A pinned chat model plus the serving details a run must reproduce.
+
+    :class:`~benchmarks.longmemeval.pipeline.ModelPin` carries the four fields the
+    harness's fairness checks compare — model, endpoint, temperature, seed — and
+    is deliberately not extended here (``pipeline.py`` is the frozen injection
+    surface). Everything else a generation depends on rides alongside: which chat
+    dialect the endpoint speaks, the upstream weights the served name resolves to,
+    and any template switches without which the server answers differently.
+
+    ``template_kwargs`` is load-bearing rather than cosmetic. A server whose chat
+    template defaults to emitting a reasoning preamble will spend the whole
+    completion budget on it and return empty content, so a run that omitted the
+    switch would not merely differ — it would produce nothing at all.
+    """
+
+    pin: ModelPin
+    api: str
+    upstream_model: str | None = None
+    template_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    max_model_len: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.api not in API_CHOICES:
+            raise PinParseError(
+                f"pinned api {self.api!r} is not one of {API_CHOICES}"
+            )
+
+    def as_record(self) -> dict[str, Any]:
+        """The serving configuration a run records beyond the bare model pin."""
+        return {
+            **self.pin.as_record(),
+            "api": self.api,
+            "upstream_model": self.upstream_model,
+            "template_kwargs": dict(self.template_kwargs),
+            "max_model_len": self.max_model_len,
+        }
+
+
+def parse_chat_pin(value: Any, *, temperature: float, seed: int) -> ChatPin:
+    """Read a pinned chat model in either the prose or the structured shape.
+
+    The pre-registration's original pins were a sentence — ``"<model> @ <where>
+    <host:port>"`` — which carries a model and an endpoint and nothing else. That
+    was sufficient while the endpoint's dialect and template behaviour were
+    implicit. A server that needs a template switch to answer at all cannot be
+    pinned in a sentence without inventing a syntax for it, so the structured
+    object is read too, and the shape selects both the parser and the client.
+    """
+    if isinstance(value, str):
+        return ChatPin(
+            pin=parse_server_pin(value, temperature=temperature, seed=seed),
+            api=API_NATIVE_CHAT,
+        )
+    if not isinstance(value, dict):
+        raise PinParseError(
+            f"a pinned chat model must be a string or an object, got "
+            f"{type(value).__name__}"
+        )
+
+    model = value.get("model")
+    endpoint = value.get("endpoint")
+    if not isinstance(model, str) or not model.strip():
+        raise PinParseError(f"pinned model must be a non-empty string, got {model!r}")
+    if not isinstance(endpoint, str) or not endpoint.startswith(ALLOWED_SCHEMES):
+        raise PinParseError(
+            f"pinned endpoint {endpoint!r} must be a URL whose scheme is one of "
+            f"{ALLOWED_SCHEMES}"
+        )
+
+    # ``api`` and ``template_kwargs`` are required rather than defaulted. A pin
+    # that omitted the template switch would be accepted here and then fail much
+    # later as an empty completion — after the answering stage had already been
+    # entered — and the operator would be debugging the model rather than the
+    # pin. An endpoint that genuinely needs no switch says so with an empty
+    # object, which is a statement; a missing key is not.
+    for required in ("api", "template_kwargs"):
+        if required not in value:
+            raise PinParseError(
+                f"pinned chat model {model!r} carries no {required!r}. A structured "
+                "pin states its dialect and its template switches explicitly: "
+                "defaulting them would let a pin run under settings the "
+                "pre-registration never recorded, and a missing template switch "
+                "surfaces only as an empty completion much later."
+            )
+
+    template_kwargs = value["template_kwargs"]
+    if not isinstance(template_kwargs, dict):
+        raise PinParseError(
+            f"pinned template_kwargs must be an object, got {template_kwargs!r}"
+        )
+    upstream = value.get("upstream_model")
+    if upstream is not None and not isinstance(upstream, str):
+        raise PinParseError(f"pinned upstream_model must be a string, got {upstream!r}")
+
+    max_model_len = value.get("max_model_len")
+    if max_model_len is not None and (
+        isinstance(max_model_len, bool) or not isinstance(max_model_len, int)
+    ):
+        raise PinParseError(
+            f"pinned max_model_len must be an int, got {max_model_len!r}"
+        )
+
+    return ChatPin(
+        pin=ModelPin(
+            model=model.strip(),
+            endpoint=endpoint.rstrip("/"),
+            temperature=temperature,
+            seed=seed,
+        ),
+        api=str(value["api"]),
+        upstream_model=upstream,
+        template_kwargs=dict(template_kwargs),
+        max_model_len=max_model_len,
     )
 
 
-def extractor_pin(path: Path = PREREGISTER_PATH) -> ModelPin:
+def answering_pin(path: Path = PREREGISTER_PATH) -> ChatPin:
+    """The pinned answering model and its serving configuration (design doc §5.2)."""
+    temperature, seed = _pin_knobs(path)
+    return parse_chat_pin(
+        preregistered("answering_model", path), temperature=temperature, seed=seed
+    )
+
+
+def extractor_pin(path: Path = PREREGISTER_PATH) -> ChatPin:
     """The pinned extractor model (design doc §5.2).
 
     Read separately from :func:`answering_pin` even though the pre-registration
@@ -243,10 +368,8 @@ def extractor_pin(path: Path = PREREGISTER_PATH) -> ModelPin:
     model, and a run must record what each stage actually ran.
     """
     temperature, seed = _pin_knobs(path)
-    return parse_server_pin(
-        str(preregistered("extractor_model", path)),
-        temperature=temperature,
-        seed=seed,
+    return parse_chat_pin(
+        preregistered("extractor_model", path), temperature=temperature, seed=seed
     )
 
 
@@ -487,6 +610,132 @@ class LocalChatClient:
         }
 
 
+# The chat-completions dialect's paths, served under the pinned endpoint's own
+# ``/v1`` prefix (the pin carries it, so nothing here assumes one).
+COMPLETIONS_PATH = "/chat/completions"
+MODELS_PATH = "/models"
+
+
+@dataclass(frozen=True)
+class ChatCompletionsClient:
+    """Chat completions over the widely-implemented ``/chat/completions`` dialect.
+
+    Sibling of :class:`LocalChatClient`, differing only in the wire shape: the
+    request carries ``temperature``/``seed`` at the top level rather than inside
+    an ``options`` object, the completion arrives at
+    ``choices[0].message.content``, and the pinned template switches ride in
+    ``chat_template_kwargs``.
+
+    That last field is why this client exists rather than being a URL change. A
+    server whose chat template defaults to emitting a reasoning preamble spends
+    the completion budget on it and returns ``content: null`` — not a degraded
+    answer, no answer — so the switch has to be part of the pin and part of every
+    request built from it.
+    """
+
+    chat_pin: ChatPin
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    attempts: int = DEFAULT_ATTEMPTS
+    transport: Transport = _urlopen_transport
+    get_transport: Transport = _urlget_transport
+
+    @property
+    def pin(self) -> ModelPin:
+        return self.chat_pin.pin
+
+    def _url(self, path: str) -> str:
+        return self.pin.endpoint.rstrip("/") + path
+
+    def _request(self, transport: Transport, url: str, payload: bytes) -> Any:
+        return LocalChatClient(
+            pin=self.pin,
+            timeout_seconds=self.timeout_seconds,
+            attempts=self.attempts,
+            transport=self.transport,
+            get_transport=self.get_transport,
+        )._request(transport, url, payload)
+
+    def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
+        """Return the assistant's content, refusing an empty or absent one."""
+        body: dict[str, Any] = {
+            "model": self.pin.model,
+            "messages": list(messages),
+            "stream": False,
+            "temperature": self.pin.temperature,
+            "seed": self.pin.seed,
+        }
+        if self.chat_pin.template_kwargs:
+            body["chat_template_kwargs"] = dict(self.chat_pin.template_kwargs)
+
+        payload = json.dumps(body).encode("utf-8")
+        response = self._request(
+            self.transport, self._url(COMPLETIONS_PATH), payload
+        )
+        if not isinstance(response, dict):
+            raise LocalModelResponseError(
+                f"expected a JSON object from {COMPLETIONS_PATH}, got "
+                f"{type(response).__name__}"
+            )
+        if response.get("error"):
+            raise LocalModelResponseError(
+                f"{COMPLETIONS_PATH} reported: {response['error']!r}"
+            )
+
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise LocalModelResponseError(
+                f"{COMPLETIONS_PATH} returned no choices (keys: {sorted(response)})"
+            )
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str) or not content.strip():
+            raise LocalModelResponseError(
+                f"{COMPLETIONS_PATH} returned no usable content for model "
+                f"{self.pin.model!r} (got {content!r}). On a model whose template "
+                "emits a reasoning preamble this is the signature of that preamble "
+                "consuming the whole completion budget: check that the pinned "
+                "template_kwargs reached the request. Nothing is substituted for a "
+                "missing answer."
+            )
+        return content
+
+    def available_models(self) -> list[str]:
+        """Every model the endpoint advertises, sorted."""
+        body = self._request(self.get_transport, self._url(MODELS_PATH), b"")
+        if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+            raise LocalModelResponseError(
+                f"expected {{'data': [...]}} from {MODELS_PATH}, got "
+                f"{type(body).__name__}"
+            )
+        return sorted(
+            entry["id"]
+            for entry in body["data"]
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        )
+
+    def preflight(self) -> dict[str, Any]:
+        """Check the pinned model is served — without generating anything."""
+        available = self.available_models()
+        return {
+            "endpoint": self.pin.endpoint,
+            "model": self.pin.model,
+            "api": self.chat_pin.api,
+            "upstream_model": self.chat_pin.upstream_model,
+            "template_kwargs": dict(self.chat_pin.template_kwargs),
+            "model_present": any(
+                model_matches(self.pin.model, name) for name in available
+            ),
+            "available_models": available,
+        }
+
+
+def client_for(chat_pin: ChatPin, **kwargs: Any) -> Any:
+    """Build the client the pin's dialect calls for."""
+    if chat_pin.api == API_CHAT_COMPLETIONS:
+        return ChatCompletionsClient(chat_pin=chat_pin, **kwargs)
+    return LocalChatClient(pin=chat_pin.pin, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Answering and extraction prompts
 # ---------------------------------------------------------------------------
@@ -591,6 +840,124 @@ def extract_messages(text: str) -> list[dict[str, str]]:
     """The chat payload for one extraction call."""
     return [
         {"role": "system", "content": f"{EXTRACT_SYSTEM_PROMPT}\n\n{DATA_FENCE_NOTE}"},
+        {"role": "user", "content": fenced("SESSION", text)},
+    ]
+
+
+EXTRACT_STRUCTURED_SYSTEM_PROMPT = (
+    "You extract atomic memory claims from one conversation session. Output one "
+    "JSON object per line and nothing else - no prose, no numbering, no bullets, "
+    "no surrounding array. Each object has exactly three string fields:\n"
+    '- "text": one self-contained claim sentence. It must stand alone without '
+    "the conversation: resolve pronouns, keep concrete values (numbers, dates, "
+    "times, names) verbatim, and keep the speaker explicit.\n"
+    '- "subject": a stable slug naming the FACT the claim is about, as an '
+    "entity/attribute path such as user/ticket-to-ride/highest-score. Use "
+    "lowercase, hyphens inside words, slashes between levels. Whenever two "
+    "claims are about the SAME fact - even in different sessions, even worded "
+    "completely differently - they MUST carry the identical subject slug. This "
+    "is what lets a later value be recognised as an update of an earlier one.\n"
+    '- "value": the current value of that fact as stated, e.g. "132 points". '
+    "Keep it short and verbatim; do not normalise units or spell out numbers. "
+    "When a claim states something with no distinct value, repeat the essential "
+    "predicate as the value.\n"
+    "One line per claim, in the order the facts appear."
+)
+
+
+# The pinned claim shape. Exactly these three fields — no more, no fewer.
+CLAIM_FIELDS: tuple[str, ...] = ("text", "subject", "value")
+
+# A standalone code-fence delimiter: three backticks, optionally a language tag,
+# and nothing else on the line. Only these are scaffolding.
+_FENCE_DELIMITER_RE = re.compile(r"```[A-Za-z0-9_+-]*")
+
+
+class ExtractionFormatError(ValueError):
+    """The extractor returned a line that is not a well-formed structured claim.
+
+    Deliberately fatal rather than salvaged. A skipped line is a *dropped claim*,
+    and dropped claims are not recoverable damage here: extraction is memoised
+    durably, so the loss is written to disk once and every arm then answers from
+    the same reduced memory for the rest of the run — invisibly, because a
+    smaller claim set looks exactly like a session that had less to say. Failing
+    the session leaves the operator a retry; skipping the line leaves them a
+    benchmark quietly measured over different inputs than it claims.
+    """
+
+
+@dataclass(frozen=True)
+class StructuredClaim:
+    """One extracted claim: the sentence, plus the fact it is about."""
+
+    text: str
+    subject: str
+    value: str
+
+
+def extracted_claims(completion: str) -> list[StructuredClaim]:
+    """Parse a structured-extraction completion into claims, strictly.
+
+    Blank lines and bare code-fence delimiters are skipped: they carry no claim,
+    and a model that wraps its output in a fence has still answered correctly.
+    Anything else that is not a JSON object with three non-empty string fields
+    raises :class:`ExtractionFormatError` — see that class for why a malformed
+    line may not simply be dropped.
+    """
+    claims: list[StructuredClaim] = []
+    for raw in completion.split("\n"):
+        line = raw.strip()
+        if not line or _FENCE_DELIMITER_RE.fullmatch(line):
+            continue
+        if line.startswith("```"):
+            # A fence with a claim on the same line is not scaffolding, it is a
+            # malformed claim. Skipping any line that merely *starts* with a
+            # fence would drop it silently, and the reduced extraction would be
+            # cached for every arm — the exact loss the fail-loud policy exists
+            # to prevent.
+            raise ExtractionFormatError(
+                f"extractor line opens a code fence but carries content: "
+                f"{line[:160]!r}. Only a standalone fence delimiter is scaffolding."
+            )
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ExtractionFormatError(
+                f"extractor line is not JSON ({exc}): {line[:160]!r}"
+            ) from exc
+        if not isinstance(record, dict):
+            raise ExtractionFormatError(
+                f"extractor line is not a JSON object: {line[:160]!r}"
+            )
+        unexpected = sorted(set(record) - set(CLAIM_FIELDS))
+        if unexpected:
+            # Schema drift fails loud for the same reason a malformed line does:
+            # an extra field means the model answered a contract this harness did
+            # not pin, and quietly keeping the three fields it recognises would
+            # cache that mismatch as if it were the agreed shape.
+            raise ExtractionFormatError(
+                f"extractor line carries unexpected field(s) {unexpected}; the "
+                f"pinned claim shape is exactly {list(CLAIM_FIELDS)}: {line[:160]!r}"
+            )
+        fields = {}
+        for name in CLAIM_FIELDS:
+            field_value = record.get(name)
+            if not isinstance(field_value, str) or not field_value.strip():
+                raise ExtractionFormatError(
+                    f"extractor line has no usable {name!r}: {line[:160]!r}"
+                )
+            fields[name] = " ".join(field_value.split())
+        claims.append(StructuredClaim(**fields))
+    return claims
+
+
+def extract_structured_messages(text: str) -> list[dict[str, str]]:
+    """The chat payload for one structured extraction call."""
+    return [
+        {
+            "role": "system",
+            "content": f"{EXTRACT_STRUCTURED_SYSTEM_PROMPT}\n\n{DATA_FENCE_NOTE}",
+        },
         {"role": "user", "content": fenced("SESSION", text)},
     ]
 

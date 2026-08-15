@@ -3,7 +3,7 @@
   "status": "pinned",
   "pinned_date": "2026-07-19",
   "design_doc": "docs/benchmark/longmemeval-3arm-design.md",
-  "design_doc_sha256": "16ac99fd50172a2b520e5c96788948eab1a83332948e4f470238d4a7b6d3e391",
+  "design_doc_sha256": "1cb356ef101063cfa4f0719dae31282c9279d03d1aac8aacdf5679a1d64a7a14",
   "amendments": [
     {
       "date": "2026-08-14",
@@ -22,6 +22,17 @@
       "matching_rationale": "raw substring matching is not a conservative default, it is systematically wrong on this label set: 23 of the 70 labels are <= 4 characters ('4', '20', 'two'), so a substring test fires on '42', '2024' and '14:30'. That inflates A and C by roughly the same false-positive mass, and because M3's gate is a RATIO, adding the same mass to both sides pushes C/A toward 1 and biases the pinned C <= 0.5 * A gate toward FAIL. Pinned before any arm has run, so the rule cannot be chosen to suit a result",
       "denominator_rationale": "the pinned M3 justification already restricts the metric to questions where an update actually exists. The 2026-08-14 step removed the 6 _abs variants on that ground structurally; this step removes 6 more on the same ground empirically, after a full-transcript labeling pass found no superseded value in their evidence at all. Four of the six ASK for the earlier value (their gold answer IS the historical fact, so nothing supersedes it) and two state their value once and never revise it. Like the _abs variants they are uncontaminable for every arm alike, so leaving them in would deflate A and C by the same 6 questions and bias the ratio toward FAIL",
       "scope_note": "split.knowledge_update stays 78 and M1 still gates at N=78; the labels file still carries all 72 structural keys (6 with an empty list) so the exclusion is auditable rather than invisible. Only M3's scoring denominator moves, 72 -> 66"
+    },
+    {
+      "date": "2026-08-15",
+      "authority": "design doc S6.3 pre-registration amendment window - legal because no arm has run",
+      "summary": "re-pins the answering and extractor models, and fixes the extraction mechanism the 2026-08-15 diagnostics proved broken: (1) answering_model and extractor_model move from gpt-oss:120b to qwen3.8, resolving a standing conflict between the 2026-07-19 pin and the maintainer's 2026-06-10 fleet ruling that retired the former; (2) the extractor now emits STRUCTURED claims (text + subject + value) and the shared linker keys lineages on the supplied subject, because free-text claims produced zero update edges",
+      "gates_moved": "none - M1 +3pp, M2 A+0.10 / epsilon=0.02, M3 C <= 0.5 * A with N=66 and alpha=0.05, M4 no-gate, M5 100/100 and AG +3pp are all unchanged, as are the seed 20260717 and temperature 0. This amendment changes WHICH model serves two stages and HOW the shared extract+link stage represents a claim; it moves no threshold and no denominator",
+      "model_repin_rationale": "the 2026-07-19 pin named gpt-oss:120b, but the maintainer's 2026-06-10 fleet ruling had retired that model; the two standing instructions could not both be honoured. Resolved by the maintainer on 2026-08-15 in favour of the fleet ruling. The fairness constraint is untouched: one model still serves the answering and extractor stages identically across arms A/B/C, so the memory layer remains the only independent variable. Quality was gated before the switch, not after: an extraction probe over 10 real knowledge-update questions produced atomic, faithful claims that captured both the old and the new value of a changed fact (e.g. a score recorded at 124 points and later at 132)",
+      "mechanism_fix_rationale": "the same probe measured the central validity risk design doc S7.3 names in its own words - 'the linker's recall bounds Arm C's ceiling' - and found it realised: 243 extracted records resolved to 243 unique lineages with ZERO supersedes edges and zero restatement groups. The cause is mechanical, not a model deficiency. default_subject_policy derives a subject only when a claim body ends in a value-like token, and real claim phrasing varies between sessions ('The user's highest score in Ticket to Ride is 124 points' vs 'The user reported achieving their highest score in Ticket to Ride, which was 132 points'), so no two phrasings of one fact ever landed on one subject. Arm C would have degenerated to Arm B and M1/M3 could not have moved. The extractor therefore emits a stable subject slug and the value alongside each claim sentence, and the linker keys lineages on that subject and decides update-vs-restatement on that value. The claim SENTENCE still feeds retrieval and answering unchanged, so the arms see the same context they would have seen",
+      "evidence_trail": "extraction-only diagnostics run 2026-08-15 against the new pin; no arm was run, no benchmark metric was computed, and no result was seen. The probe measured claim quality and linker statistics only, which is why fixing the mechanism afterwards remains inside the S6.3 window: nothing about a gate outcome was knowable from it",
+      "serving_note": "the pinned endpoint speaks the chat-completions dialect and requires template_kwargs {enable_thinking: false}: without it the model's chat template emits a reasoning preamble that consumes the whole completion budget and returns empty content, so the switch is part of the pin rather than a client detail. reference_launch records the serving command so the run is reproducible when the container is not up",
+      "scope_note": "the judge pin is untouched. Offline smokes are unaffected: they bind the mechanical stub extractor, which supplies no subject, so the linker takes its existing free-text fallback path and their output stays byte-identical"
     }
   ],
   "split": {
@@ -97,8 +108,32 @@
       }
     }
   },
-  "answering_model": "gpt-oss:120b @ GB10 ollama 192.168.1.134:11434",
-  "extractor_model": "gpt-oss:120b @ GB10 ollama 192.168.1.134:11434",
+  "answering_model": {
+    "model": "qwen3.8",
+    "api": "chat-completions",
+    "endpoint": "http://192.168.1.134:8000/v1",
+    "upstream_model": "Qwen/Qwen3.8-27B-FP8",
+    "template_kwargs": {
+      "enable_thinking": false
+    },
+    "max_model_len": 131072,
+    "served_by": "vLLM OpenAI-compatible server on GB10",
+    "reference_launch": "vllm serve Qwen/Qwen3.8-27B-FP8 --served-model-name qwen3.8 --host 0.0.0.0 --port 8000 --max-model-len 131072 --gpu-memory-utilization 0.5 --max-num-seqs 1 --enable-chunked-prefill --enable-prefix-caching",
+    "superseded_pin": "gpt-oss:120b @ GB10 ollama 192.168.1.134:11434"
+  },
+  "extractor_model": {
+    "model": "qwen3.8",
+    "api": "chat-completions",
+    "endpoint": "http://192.168.1.134:8000/v1",
+    "upstream_model": "Qwen/Qwen3.8-27B-FP8",
+    "template_kwargs": {
+      "enable_thinking": false
+    },
+    "max_model_len": 131072,
+    "served_by": "vLLM OpenAI-compatible server on GB10",
+    "reference_launch": "vllm serve Qwen/Qwen3.8-27B-FP8 --served-model-name qwen3.8 --host 0.0.0.0 --port 8000 --max-model-len 131072 --gpu-memory-utilization 0.5 --max-num-seqs 1 --enable-chunked-prefill --enable-prefix-caching",
+    "superseded_pin": "gpt-oss:120b @ GB10 ollama 192.168.1.134:11434"
+  },
   "model_fairness_constraint": "answering model, extractor model, and retriever MUST be identical across arms A/B/C; the memory layer is the only independent variable",
   "judge_model": "claude-opus-4-8 via claude -p (subscription), fallback gemini-2.5-pro",
   "retriever": "shared deterministic BM25 (stdlib), identical across arms",

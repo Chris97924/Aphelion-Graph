@@ -38,6 +38,7 @@ from typing import Any, Mapping, Sequence
 import pytest
 
 from benchmarks.longmemeval import clients, corpus, real_run
+from benchmarks.longmemeval import linker as linker_mod
 from benchmarks.longmemeval.arms import ARM_STORES
 from benchmarks.longmemeval.metrics import m3_contamination
 from benchmarks.longmemeval.pipeline import (
@@ -52,6 +53,19 @@ from benchmarks.longmemeval.pipeline import (
     pinned_seed,
     preregistered,
 )
+
+
+def _structured_claim(line: str) -> dict[str, str]:
+    """Split a fixture line into the structured shape the real extractor emits.
+
+    The fixture sessions end in a value token, so the subject is everything
+    before it. This mirrors what the pinned model does on real sessions — one
+    stable subject slug per fact, the value carried separately — which is what
+    lets a fixture run exercise the structured linking path rather than the
+    free-text fallback.
+    """
+    words = line.split()
+    return {"text": line, "subject": " ".join(words[:-1]).lower(), "value": words[-1]}
 
 
 def _unfence(label: str, text: str) -> str:
@@ -92,29 +106,64 @@ _CLI_PIN = clients.CliPin(
 
 
 @pytest.mark.unit
-def test_server_pin_parses_the_real_pinned_answering_model() -> None:
-    """The live pin must resolve to a model plus exactly one endpoint.
+def test_the_real_pinned_answering_model_parses() -> None:
+    """The live pin must resolve to a model, an endpoint and its serving config.
 
     Asserted against ``preregister.json`` itself rather than a fixture: the
-    parser's whole job is reading *that* text, and a fixture-only test would stay
-    green while the real pin became unreadable.
+    parser's whole job is reading *that* record, and a fixture-only test would
+    stay green while the real pin became unreadable.
     """
-    pin = clients.answering_pin()
-    raw = str(preregistered("answering_model"))
+    chat_pin = clients.answering_pin()
+    raw = preregistered("answering_model")
 
-    assert pin.model in raw
-    assert pin.model.split("@")[0].strip() == pin.model
-    assert pin.endpoint.startswith(clients.DEFAULT_SCHEME)
-    assert pin.endpoint.rsplit("/", 1)[-1] in raw
-    assert pin.temperature == float(preregistered("temperature"))
-    assert pin.seed == pinned_seed()
+    assert chat_pin.pin.model == raw["model"]
+    assert chat_pin.pin.endpoint == raw["endpoint"].rstrip("/")
+    assert chat_pin.pin.temperature == float(preregistered("temperature"))
+    assert chat_pin.pin.seed == pinned_seed()
+    assert chat_pin.api in clients.API_CHOICES
+    assert chat_pin.upstream_model == raw["upstream_model"]
+
+    # The template switch is part of the pin, not a client detail: without it the
+    # pinned model returns empty content rather than a worse answer.
+    assert chat_pin.template_kwargs == raw["template_kwargs"]
+    assert chat_pin.template_kwargs, "the pinned model needs a template switch"
 
 
 @pytest.mark.unit
 def test_extractor_and_answering_pins_are_read_independently() -> None:
     """Both are pinned to one model today; each is still read from its own key."""
-    assert clients.extractor_pin().model == clients.answering_pin().model
-    assert clients.extractor_pin().endpoint == clients.answering_pin().endpoint
+    assert clients.extractor_pin().pin.model == clients.answering_pin().pin.model
+    assert clients.extractor_pin().pin.endpoint == clients.answering_pin().pin.endpoint
+    assert clients.extractor_pin().template_kwargs == (
+        clients.answering_pin().template_kwargs
+    )
+
+
+@pytest.mark.unit
+def test_a_prose_pin_still_parses_as_the_native_dialect() -> None:
+    """The original sentence shape stays readable; the shape selects the client."""
+    chat_pin = clients.parse_chat_pin("m @ host 10.0.0.1:1234", temperature=0.0, seed=1)
+    assert chat_pin.api == clients.API_NATIVE_CHAT
+    assert chat_pin.pin.model == "m"
+    assert isinstance(clients.client_for(chat_pin), clients.LocalChatClient)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"endpoint": "http://h:1/v1"},
+        {"model": "", "endpoint": "http://h:1/v1"},
+        {"model": "m"},
+        {"model": "m", "endpoint": "ftp://h:1"},
+        {"model": "m", "endpoint": "http://h:1/v1", "template_kwargs": []},
+        {"model": "m", "endpoint": "http://h:1/v1", "upstream_model": 7},
+        42,
+    ],
+)
+def test_a_malformed_structured_pin_is_refused(value) -> None:
+    with pytest.raises(clients.PinParseError):
+        clients.parse_chat_pin(value, temperature=0.0, seed=1)
 
 
 @pytest.mark.unit
@@ -187,8 +236,8 @@ def test_a_pinned_endpoint_scheme_outside_http_is_rejected(endpoint: str) -> Non
 
 @pytest.mark.unit
 def test_the_real_pinned_endpoints_use_http() -> None:
-    for pin in (clients.answering_pin(), clients.extractor_pin()):
-        assert pin.endpoint.startswith(clients.ALLOWED_SCHEMES)
+    for chat_pin in (clients.answering_pin(), clients.extractor_pin()):
+        assert chat_pin.pin.endpoint.startswith(clients.ALLOWED_SCHEMES)
 
 
 @pytest.mark.unit
@@ -462,6 +511,453 @@ def test_a_hung_or_unlaunchable_judge_is_a_typed_transport_error(
         clients._subprocess_runner(["stub", "-p"], b"prompt", 1.0)
 
 
+# --------------------------------------------------------------------------- #
+# Structured extraction and subject-keyed linking (amendment #3)               #
+# --------------------------------------------------------------------------- #
+
+# Verbatim claim sentences from the 2026-08-15 extraction probe, two sessions of
+# question 0e4e4c46. They are the same fact - the user's highest Ticket to Ride
+# score - stated once at 124 points and later at 132. Used as fixtures precisely
+# because they are real output rather than phrasing invented to be linkable.
+_PROBE_OLD = "The user's highest score in Ticket to Ride is 124 points."
+_PROBE_NEW = (
+    "The user reported achieving their highest score in Ticket to Ride, "
+    "which was 132 points."
+)
+_PROBE_SUBJECT = "user/ticket-to-ride/highest-score"
+
+
+@pytest.mark.unit
+def test_free_text_phrasing_cannot_link_the_probe_pair() -> None:
+    """The measured failure, kept as a regression: this is WHY structure was added.
+
+    Both sentences end in the word "points.", which is not a value-like token, so
+    default_subject_policy reads no subject from either and the two phrasings of
+    one fact never meet. Over the probe's 10 questions this produced 243 records,
+    243 lineages and zero update edges - Arm C degenerated to Arm B.
+    """
+    assert linker_mod.default_subject_policy(_PROBE_OLD) is None
+    assert linker_mod.default_subject_policy(_PROBE_NEW) is None
+
+    linker = linker_mod.SharedLinker("0e4e4c46")
+    linker(Session(id="s1", text=_PROBE_OLD, metadata={}))
+    linker(Session(id="s2", text=_PROBE_NEW, metadata={}))
+
+    stats = linker.stats
+    assert stats.records == 2
+    assert stats.subjects == 2, "two phrasings read as two unrelated facts"
+    assert stats.supersedes_edges == 0
+
+
+@pytest.mark.unit
+def test_a_supplied_subject_links_the_probe_pair_into_one_update() -> None:
+    """The fix, on the same real sentences: one subject, one edge, old -> new."""
+    linker = linker_mod.SharedLinker("0e4e4c46")
+    linker(
+        Session(
+            id="s1",
+            text=_PROBE_OLD,
+            metadata={
+                "occurred_at": "2023-05-01T00:00:00Z",
+                linker_mod.STRUCTURED_KEY: {
+                    _PROBE_OLD: {"subject": _PROBE_SUBJECT, "value": "124 points"}
+                },
+            },
+        )
+    )
+    linker(
+        Session(
+            id="s2",
+            text=_PROBE_NEW,
+            metadata={
+                "occurred_at": "2023-06-01T00:00:00Z",
+                linker_mod.STRUCTURED_KEY: {
+                    _PROBE_NEW: {"subject": _PROBE_SUBJECT, "value": "132 points"}
+                },
+            },
+        )
+    )
+
+    stats = linker.stats
+    assert stats.subjects == 1, "one fact, however it is worded"
+    assert stats.supersedes_edges == 1
+    assert stats.updated_subjects == 1
+
+    old_claim, new_claim = linker.claims
+    assert old_claim.text == _PROBE_OLD, "the sentence still feeds retrieval"
+    assert old_claim.metadata["subject"] == _PROBE_SUBJECT
+    assert old_claim.metadata["object"] == "124 points"
+    assert new_claim.metadata["object"] == "132 points"
+    assert new_claim.metadata["supersedes"] == [old_claim.metadata["claim_id"]]
+    # The update edge carries when it became true, from the session's own instant.
+    assert new_claim.metadata["valid_from"] == "2023-06-01T00:00:00Z"
+
+
+@pytest.mark.unit
+def test_a_rephrasing_at_the_same_value_is_not_an_update() -> None:
+    """Otherwise every restatement would forge an edge and inflate Arm C's ceiling."""
+    linker = linker_mod.SharedLinker("q")
+    for index, text in enumerate(
+        ["The user's score is 124 points.", "The user reported a score of 124 points."]
+    ):
+        linker(
+            Session(
+                id=f"s{index}",
+                text=text,
+                metadata={
+                    linker_mod.STRUCTURED_KEY: {
+                        text: {"subject": _PROBE_SUBJECT, "value": "124 points"}
+                    }
+                },
+            )
+        )
+
+    stats = linker.stats
+    assert stats.subjects == 1
+    assert stats.supersedes_edges == 0, "same value, different words, is no update"
+    assert len({claim.metadata["claim_id"] for claim in linker.claims}) == 1
+
+
+@pytest.mark.unit
+def test_subject_keys_are_normalized_but_not_guessed_at() -> None:
+    """Case and spacing are not identity; different words are."""
+    assert linker_mod.normalize_subject("  User/Ticket-To-Ride/Score  ") == (
+        "user/ticket-to-ride/score"
+    )
+    assert linker_mod.normalize_subject("a   b") == "a b"
+    assert linker_mod.normalize_subject("user/score") != linker_mod.normalize_subject(
+        "user/scores"
+    )
+
+
+@pytest.mark.unit
+def test_subjectless_claims_still_take_the_free_text_fallback() -> None:
+    """The stub extractor supplies no subject; its behaviour must not move.
+
+    This is what keeps the offline smokes byte-identical while the real path gets
+    structure.
+    """
+    text = "user: my 5k personal best is 22:00"
+    with_structure = linker_mod.SharedLinker("q")
+    without = linker_mod.SharedLinker("q")
+
+    with_structure(Session(id="s", text=text, metadata={}))
+    without(Session(id="s", text=text, metadata={linker_mod.STRUCTURED_KEY: {}}))
+
+    assert with_structure.claims[0].metadata == without.claims[0].metadata
+    assert with_structure.claims[0].metadata["subject"] == (
+        linker_mod.default_subject_policy(text)
+    )
+
+
+def _structured_session(index: int, text: str, subject: str, value: str) -> Session:
+    return Session(
+        id=f"s{index}",
+        text=text,
+        metadata={
+            "occurred_at": f"2023-0{index}-01T00:00:00Z",
+            linker_mod.STRUCTURED_KEY: {text: {"subject": subject, "value": value}},
+        },
+    )
+
+
+@pytest.mark.unit
+def test_a_revert_then_a_reworded_update_still_mints_an_edge() -> None:
+    """A -> B -> A -> B' : the head maps must stay in lockstep through the revert.
+
+    A revert advances which lineage stands on the subject. If the map recording
+    the standing VALUE is not advanced with it, the next differently-worded claim
+    at the superseded value reads as a restatement of a lineage that has already
+    been superseded: no edge is minted, and Arm C goes on surfacing A while B' is
+    current — the stale-value leak Arm C exists to prevent.
+    """
+    subject = "user/score"
+    linker = linker_mod.SharedLinker("q")
+    linker(_structured_session(1, "score is A", subject, "A"))
+    linker(_structured_session(2, "score is B", subject, "B"))
+    # The revert re-uses session 1's exact wording, which is what routes it
+    # through _revert_lineage rather than through a fresh structured lineage.
+    linker(_structured_session(3, "score is A", subject, "A"))
+    linker(_structured_session(4, "the score reads B now", subject, "B"))
+
+    assert linker.stats.subjects == 1
+    assert linker.stats.supersedes_edges == 3, "A->B, B->A, A->B' are all updates"
+
+    final = linker.claims[-1]
+    assert final.metadata["object"] == "B"
+    assert final.metadata.get("supersedes"), "the reworded B must supersede the revert"
+    # The head really is the newest claim, not the one the revert displaced.
+    assert linker._head_by_subject[subject] == final.metadata["claim_id"]
+    # Claims carry a copy of the frontmatter, so this compares by value.
+    assert linker._head_meta_by_subject[subject] == final.metadata
+
+
+@pytest.mark.unit
+def test_a_revert_keeps_the_two_head_maps_consistent() -> None:
+    """The invariant directly, at every step, not only at the end."""
+    subject = "user/score"
+    linker = linker_mod.SharedLinker("q")
+    for index, (text, value) in enumerate(
+        [("v is A", "A"), ("v is B", "B"), ("v is A", "A")], start=1
+    ):
+        linker(_structured_session(index, text, subject, value))
+        assert (
+            linker._head_meta_by_subject[subject]["claim_id"]
+            == linker._head_by_subject[subject]
+        ), "the two head maps disagreed"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("metadata_value", [[], "", 0, ["x"], "text", {"a": 1}.keys()])
+def test_present_but_malformed_structured_metadata_is_refused(
+    metadata_value,
+) -> None:
+    """Falsey malformed values must not read as "absent" and slide to the fallback.
+
+    ``or {}`` turned ``[]`` into "no structured claims", which silently restored
+    the free-text policy that produced 243 lineages and zero edges.
+    """
+    linker = linker_mod.SharedLinker("q")
+    with pytest.raises(TypeError, match=linker_mod.STRUCTURED_KEY):
+        linker(
+            Session(
+                id="s",
+                text="a claim",
+                metadata={linker_mod.STRUCTURED_KEY: metadata_value},
+            )
+        )
+
+
+@pytest.mark.unit
+def test_an_absent_structured_key_is_still_the_legitimate_fallback() -> None:
+    """Absence is how the stub extractor asks for the free-text path."""
+    linker = linker_mod.SharedLinker("q")
+    claims = linker(Session(id="s", text="user: my best is 22:00", metadata={}))
+    assert claims[0].metadata["subject"] == linker_mod.default_subject_policy(
+        "user: my best is 22:00"
+    )
+
+
+@pytest.mark.unit
+def test_malformed_structured_metadata_is_refused_not_ignored() -> None:
+    """Falling back silently would restore the 243/243 behaviour it replaced."""
+    linker = linker_mod.SharedLinker("q")
+    with pytest.raises(TypeError, match=linker_mod.STRUCTURED_KEY):
+        linker(
+            Session(id="s", text="a claim", metadata={linker_mod.STRUCTURED_KEY: ["x"]})
+        )
+
+
+@pytest.mark.unit
+def test_the_structured_extraction_rubric_asks_for_what_the_linker_needs() -> None:
+    completion = "\n".join(
+        [
+            json.dumps({"text": _PROBE_OLD, "subject": _PROBE_SUBJECT, "value": "124 points"}),
+            json.dumps({"text": "The user likes trains.", "subject": "user/likes", "value": "trains"}),
+        ]
+    )
+    claims = clients.extracted_claims(completion)
+
+    assert [claim.text for claim in claims] == [_PROBE_OLD, "The user likes trains."]
+    assert claims[0].subject == _PROBE_SUBJECT
+    assert claims[0].value == "124 points"
+
+    messages = clients.extract_structured_messages("user: hi")
+    assert clients.DATA_FENCE_NOTE in messages[0]["content"]
+    assert _unfence("SESSION", messages[1]["content"]) == "user: hi"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fence", ["```", "```json", "```JSON", "```jsonl"])
+def test_standalone_code_fences_and_blank_lines_are_tolerated(fence: str) -> None:
+    """A fenced answer is still a correct answer; a bare delimiter carries no claim."""
+    line = json.dumps({"text": "t", "subject": "s", "value": "v"})
+    claims = clients.extracted_claims(f"{fence}\n{line}\n\n```")
+    assert len(claims) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "line",
+    [
+        '```json {"text": "t", "subject": "s", "value": "v"}',
+        '```{"text": "t", "subject": "s", "value": "v"}',
+        "``` not a delimiter",
+        "```json trailing words",
+    ],
+)
+def test_a_fence_prefixed_line_carrying_content_is_not_silently_dropped(
+    line: str,
+) -> None:
+    """Only a STANDALONE delimiter is scaffolding.
+
+    Skipping anything that merely starts with a fence would make a claim vanish
+    with no error, and the reduced extraction would then be cached for every arm
+    — the precise loss the fail-loud policy exists to prevent.
+    """
+    with pytest.raises(clients.ExtractionFormatError, match="fence"):
+        clients.extracted_claims(line)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra", [{"confidence": 0.9}, {"session_id": "s1"}, {"Text": "dup"}]
+)
+def test_unknown_fields_on_a_claim_line_fail_loud(extra: dict) -> None:
+    """Schema drift must not be quietly trimmed to the three fields we recognise."""
+    record = {"text": "t", "subject": "s", "value": "v", **extra}
+    with pytest.raises(clients.ExtractionFormatError, match="unexpected field"):
+        clients.extracted_claims(json.dumps(record))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("missing", "match"),
+    [("api", "api"), ("template_kwargs", "template_kwargs")],
+)
+def test_a_structured_pin_must_state_its_dialect_and_template_switches(
+    missing: str, match: str
+) -> None:
+    """A defaulted template switch fails only later, as an empty completion.
+
+    By then the answering stage has already been entered and the operator is
+    debugging the model rather than the pin.
+    """
+    pin = {
+        "model": "m",
+        "endpoint": "http://h:1/v1",
+        "api": clients.API_CHAT_COMPLETIONS,
+        "template_kwargs": {"enable_thinking": False},
+    }
+    pin.pop(missing)
+    with pytest.raises(clients.PinParseError, match=match):
+        clients.parse_chat_pin(pin, temperature=0.0, seed=1)
+
+
+@pytest.mark.unit
+def test_an_empty_template_kwargs_object_is_a_statement_not_an_omission() -> None:
+    """An endpoint that needs no switch says so; a missing key does not."""
+    chat_pin = clients.parse_chat_pin(
+        {
+            "model": "m",
+            "endpoint": "http://h:1/v1",
+            "api": clients.API_CHAT_COMPLETIONS,
+            "template_kwargs": {},
+        },
+        temperature=0.0,
+        seed=1,
+    )
+    assert chat_pin.template_kwargs == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["131072", 1.5, True, []])
+def test_a_non_integer_max_model_len_is_refused(bad) -> None:
+    with pytest.raises(clients.PinParseError, match="max_model_len"):
+        clients.parse_chat_pin(
+            {
+                "model": "m",
+                "endpoint": "http://h:1/v1",
+                "api": clients.API_CHAT_COMPLETIONS,
+                "template_kwargs": {},
+                "max_model_len": bad,
+            },
+            temperature=0.0,
+            seed=1,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "line",
+    [
+        "not json at all",
+        '["text", "subject", "value"]',
+        '{"text": "t", "subject": "s"}',
+        '{"text": "t", "subject": "", "value": "v"}',
+        '{"text": "t", "subject": "s", "value": 42}',
+        '{"text": "   ", "subject": "s", "value": "v"}',
+    ],
+)
+def test_a_malformed_extraction_line_fails_the_session(line: str) -> None:
+    """Fail loud, never salvage.
+
+    A skipped line is a dropped claim, and extraction is memoised durably: the
+    loss would be written to disk once and every arm would then answer from the
+    same reduced memory for the rest of the run, invisibly, because a smaller
+    claim set looks exactly like a session that had less to say.
+    """
+    with pytest.raises(clients.ExtractionFormatError):
+        clients.extracted_claims(line)
+
+
+@pytest.mark.unit
+def test_the_chat_completions_client_sends_the_pinned_template_switch() -> None:
+    """Without it the pinned model returns empty content, not a worse answer."""
+    seen: list[tuple[str, dict]] = []
+    chat_pin = clients.ChatPin(
+        pin=ModelPin(model="m", endpoint="http://h:1/v1", temperature=0.0, seed=7),
+        api=clients.API_CHAT_COMPLETIONS,
+        template_kwargs={"enable_thinking": False},
+    )
+    client = clients.client_for(
+        chat_pin,
+        transport=_transport(
+            [{"choices": [{"message": {"content": "hello"}}]}], seen
+        ),
+    )
+
+    assert client.chat([{"role": "user", "content": "hi"}]) == "hello"
+    url, body = seen[0]
+    assert url == "http://h:1/v1" + clients.COMPLETIONS_PATH
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["temperature"] == 0.0 and body["seed"] == 7
+    assert body["stream"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"choices": []},
+        {"choices": [{"message": {"content": None}}]},
+        {"choices": [{"message": {"content": "  "}}]},
+        {"error": "model not found"},
+        {"no_choices": 1},
+    ],
+)
+def test_the_chat_completions_client_refuses_an_empty_completion(response) -> None:
+    """content=None is the signature of a reasoning preamble eating the budget."""
+    chat_pin = clients.ChatPin(
+        pin=ModelPin(model="m", endpoint="http://h:1/v1", temperature=0.0, seed=7),
+        api=clients.API_CHAT_COMPLETIONS,
+    )
+    client = clients.client_for(chat_pin, transport=_transport([response], []))
+    with pytest.raises(clients.LocalModelResponseError):
+        client.chat([{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.integration
+def test_the_real_run_links_structured_claims_end_to_end(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The whole path: model emits structure, linker keys on it, edges appear."""
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    metrics = real_run.execute(
+        cfg, client_factory=_factory([]), judge_client=FakeJudge()
+    )
+
+    assert metrics["linker"]["supersedes_edges"] >= 2, (
+        "the fixture's knowledge-update pair must produce update edges"
+    )
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+    assert rows and all(
+        set(claim) == {"text", "subject", "value"}
+        for row in rows
+        for claim in row["claims"]
+    )
+
+
 @pytest.mark.unit
 def test_untrusted_values_are_fenced_and_labelled_as_data() -> None:
     """A candidate that impersonates the rubric would inflate one arm's M1.
@@ -672,18 +1168,23 @@ class FakeChat:
     prompt, so any difference between arms comes from the memory layer.
     """
 
-    def __init__(self, pin: ModelPin) -> None:
-        self.pin = pin
+    def __init__(self, pin) -> None:
+        self.chat_pin = pin
+        self.pin = getattr(pin, "pin", pin)
         self.extract_calls = 0
         self.answer_calls = 0
         self.fail_after: int | None = None
 
     def chat(self, messages: Sequence[dict]) -> str:
         system, user = messages[0]["content"], messages[1]["content"]
-        if system.startswith(clients.EXTRACT_SYSTEM_PROMPT):
+        if system.startswith(clients.EXTRACT_STRUCTURED_SYSTEM_PROMPT):
             self.extract_calls += 1
             self._maybe_fail()
-            return _unfence("SESSION", user)
+            return "\n".join(
+                json.dumps(_structured_claim(line))
+                for line in _unfence("SESSION", user).split("\n")
+                if line.strip()
+            )
         self.answer_calls += 1
         self._maybe_fail()
         first = _unfence("MEMORY", user).split("\n")[0]
@@ -925,7 +1426,7 @@ def test_the_manifest_records_the_pins_the_answers_were_produced_under(
         (cfg.out_dir / real_run.MANIFEST_NAME).read_text(encoding="utf-8")
     )
     assert set(manifest["pins"]) == {"extractor", "answering", "judge"}
-    assert manifest["pins"]["answering"]["model"] == clients.answering_pin().model
+    assert manifest["pins"]["answering"]["model"] == clients.answering_pin().pin.model
     assert manifest["pins"]["judge"]["model"] == clients.judge_pin().pin.model
     assert manifest["pins"]["answering"]["seed"] == pinned_seed()
     assert manifest["haystack"] == real_run.HAYSTACK_ORACLE
@@ -2780,10 +3281,10 @@ def test_preflight_reports_every_stage_without_generating(tmp_path: Path) -> Non
     """--preflight touches the inventory and a version, never a completion."""
     seen: list[tuple[str, dict]] = []
 
-    def factory(pin: ModelPin) -> clients.LocalChatClient:
-        return clients.LocalChatClient(
-            pin=pin,
-            get_transport=_transport([{"models": [{"name": pin.model}]}], seen),
+    def factory(chat_pin: clients.ChatPin) -> clients.ChatCompletionsClient:
+        return clients.client_for(
+            chat_pin,
+            get_transport=_transport([{"data": [{"id": chat_pin.pin.model}]}], seen),
             transport=lambda *args: pytest.fail("preflight must not generate"),
         )
 
@@ -2793,16 +3294,19 @@ def test_preflight_reports_every_stage_without_generating(tmp_path: Path) -> Non
 
     assert report["ready"] is True
     assert report["errors"] == []
-    assert all(url.endswith(clients.TAGS_PATH) for url, _ in seen)
+    # The model inventory only - never a completion.
+    assert all(url.endswith(clients.MODELS_PATH) for url, _ in seen)
+    assert report["answering"]["model_present"] is True
+    assert report["answering"]["template_kwargs"], "the pin's switch must be visible"
 
 
 @pytest.mark.integration
 def test_preflight_reports_failures_instead_of_raising() -> None:
     """A preflight is a report; it must not die on the first unreachable stage."""
 
-    def factory(pin: ModelPin) -> clients.LocalChatClient:
-        return clients.LocalChatClient(
-            pin=pin,
+    def factory(chat_pin: clients.ChatPin) -> clients.ChatCompletionsClient:
+        return clients.client_for(
+            chat_pin,
             get_transport=_transport([urllib.error.URLError("refused")], []),
         )
 

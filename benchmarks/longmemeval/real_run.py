@@ -60,6 +60,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from benchmarks.longmemeval import clients, corpus, labeled_pairs
 from benchmarks.longmemeval.arms import ARM_STORES
 from benchmarks.longmemeval.arms.aphelion_arm import AphelionStore
+from benchmarks.longmemeval import linker as linker_mod
 from benchmarks.longmemeval.linker import LinkerStats, SharedLinker, parse_corpus_instant
 from benchmarks.longmemeval.metrics import (
     m1_qa,
@@ -471,20 +472,21 @@ class ExtractionCache:
 
     def __init__(self, path: Path) -> None:
         self._writer = JsonlWriter(path)
-        self._bodies: dict[str, list[str]] = {
-            row["session_id"]: list(row["bodies"]) for row in read_jsonl(path)
+        self._records: dict[str, list[dict]] = {
+            row["session_id"]: list(row["claims"]) for row in read_jsonl(path)
         }
 
     def __len__(self) -> int:
-        return len(self._bodies)
+        return len(self._records)
 
-    def get(self, session_id: str) -> list[str] | None:
-        bodies = self._bodies.get(session_id)
-        return list(bodies) if bodies is not None else None
+    def get(self, session_id: str) -> list[dict] | None:
+        records = self._records.get(session_id)
+        return [dict(record) for record in records] if records is not None else None
 
-    def put(self, session_id: str, bodies: Sequence[str]) -> None:
-        self._bodies[session_id] = list(bodies)
-        self._writer.append({"session_id": session_id, "bodies": list(bodies)})
+    def put(self, session_id: str, records: Sequence[Mapping[str, str]]) -> None:
+        stored = [dict(record) for record in records]
+        self._records[session_id] = stored
+        self._writer.append({"session_id": session_id, "claims": stored})
 
 
 @dataclass
@@ -505,14 +507,37 @@ class RealExtractor:
     calls: int = 0
 
     def __call__(self, session: Session, *, pin: ModelPin) -> list[Claim]:
-        bodies = self.cache.get(session.id)
-        if bodies is None:
-            completion = self.client.chat(clients.extract_messages(session.text))
-            bodies = clients.extracted_lines(completion)
-            self.cache.put(session.id, bodies)
+        records = self.cache.get(session.id)
+        if records is None:
+            completion = self.client.chat(
+                clients.extract_structured_messages(session.text)
+            )
+            records = [
+                {"text": claim.text, "subject": claim.subject, "value": claim.value}
+                for claim in clients.extracted_claims(completion)
+            ]
+            self.cache.put(session.id, records)
             self.calls += 1
+
+        # The claim sentences are what retrieval and answering see, exactly as
+        # before; the subject/value pair travels beside them so the shared linker
+        # can key lineages on the FACT rather than on its phrasing. Free-text
+        # phrasing varies between sessions, which is why the 2026-08-15 probe
+        # found 243 records resolving to 243 lineages and zero update edges.
+        metadata = dict(session.metadata)
+        metadata[linker_mod.STRUCTURED_KEY] = {
+            record["text"]: {
+                "subject": record["subject"],
+                "value": record["value"],
+            }
+            for record in records
+        }
         return self.linker(
-            Session(id=session.id, text="\n".join(bodies), metadata=dict(session.metadata))
+            Session(
+                id=session.id,
+                text="\n".join(record["text"] for record in records),
+                metadata=metadata,
+            )
         )
 
 
@@ -687,6 +712,7 @@ def build_manifest(
     split_manifest: Mapping[str, Any],
     judge_standing: Mapping[str, Any],
     label_source: M3LabelSource | None,
+    model_config: Mapping[str, Any],
 ) -> dict[str, Any]:
     """The run's provenance record: what ran, against what, under which pins."""
     preregister = json.loads(cfg.preregister_path.read_text(encoding="utf-8"))
@@ -697,6 +723,10 @@ def build_manifest(
         "mode": "real",
         "arms": sorted(ARM_STORES),
         "pins": dict(pins),
+        # Beyond the four fields pipeline.py's fairness checks compare: the chat
+        # dialect, the upstream weights a served name resolves to, and the
+        # template switches without which the server answers differently.
+        "model_config": dict(model_config),
         "judge_fallback_model": judge_fallback,
         "design_doc_sha256": preregister.get("design_doc_sha256"),
         "preregister_sha256": _sha256_text(
@@ -997,6 +1027,7 @@ _IDENTITY_FIELDS = (
     "split_manifest_sha256",
     "corpus_loaded_sha256",
     "corpus_data_dir",
+    "model_config",
     "m3_labels_sha256",
     # Whether M3 was scored from the pre-registered sample. A resume that swapped
     # a deviant label set in halfway would otherwise report one M3 over two.
@@ -1084,8 +1115,9 @@ def answer_questions(
     cfg: RealRunConfig,
     *,
     retriever: Retriever,
-    client_factory: Callable[[ModelPin], Any],
+    client_factory: Callable[[Any], Any],
     pins: Mapping[str, ModelPin],
+    chat_pins: Mapping[str, Any],
     phase: AnswerPhase,
     progress: Callable[[str], None] = lambda _message: None,
 ) -> AnswerPhase:
@@ -1098,8 +1130,8 @@ def answer_questions(
     answers = JsonlWriter(cfg.out_dir / ANSWERS_NAME)
     claims_out = JsonlWriter(cfg.out_dir / CLAIMS_NAME)
     cache = ExtractionCache(cfg.out_dir / EXTRACTIONS_NAME)
-    extract_client = client_factory(pins["extractor"])
-    answer_client = client_factory(pins["answering"])
+    extract_client = client_factory(chat_pins["extractor"])
+    answer_client = client_factory(chat_pins["answering"])
 
     for position, spec in enumerate(specs, 1):
         pending = [arm for arm in ARM_STORES if not phase.answered(spec.question_id, arm)]
@@ -2390,8 +2422,9 @@ def compute_metrics(
 # ---------------------------------------------------------------------------
 
 
-def default_client_factory(pin: ModelPin) -> clients.LocalChatClient:
-    return clients.LocalChatClient(pin=pin)
+def default_client_factory(chat_pin: clients.ChatPin) -> Any:
+    """Build the client the pinned endpoint's dialect calls for."""
+    return clients.client_for(chat_pin)
 
 
 def preflight(
@@ -2418,7 +2451,11 @@ def preflight(
         try:
             report[name] = client_factory(pin).preflight()
         except Exception as exc:  # noqa: BLE001 - a preflight reports, never raises
-            report[name] = {"model": pin.model, "endpoint": pin.endpoint, "error": str(exc)}
+            report[name] = {
+                "model": pin.pin.model,
+                "endpoint": pin.pin.endpoint,
+                "error": str(exc),
+            }
             errors.append(f"{name}: {exc}")
     try:
         report["judge"] = judge.preflight()
@@ -2495,9 +2532,13 @@ def execute(
     # than surface hours later as a metric nobody can attribute.
     label_source = resolve_m3_labels(cfg, cfg.preregister_path)
 
-    pins = {
+    chat_pins = {
         "answering": clients.answering_pin(cfg.preregister_path),
         "extractor": clients.extractor_pin(cfg.preregister_path),
+    }
+    pins = {
+        "answering": chat_pins["answering"].pin,
+        "extractor": chat_pins["extractor"].pin,
         "judge": judge.pin,
     }
     retriever = BM25Retriever()
@@ -2515,6 +2556,10 @@ def execute(
             split_manifest=split_manifest,
             judge_standing=standing,
             label_source=label_source,
+            model_config={
+                stage: chat_pin.as_record()
+                for stage, chat_pin in sorted(chat_pins.items())
+            },
         ),
     )
 
@@ -2526,6 +2571,7 @@ def execute(
         retriever=retriever,
         client_factory=client_factory,
         pins=pins,
+        chat_pins=chat_pins,
         phase=phase,
         progress=progress,
     )
