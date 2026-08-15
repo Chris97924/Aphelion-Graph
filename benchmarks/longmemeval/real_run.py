@@ -835,6 +835,22 @@ _HARNESS_ROOTS = (
 )
 
 
+def _framed(digest: "hashlib._Hash", *parts: bytes) -> None:
+    """Feed length-prefixed parts, so no two different inputs can collide.
+
+    Concatenating a path and its bytes straight into the hash is ambiguous: a
+    tree whose file content ends with the next file's path produces the same
+    byte stream as a tree where that text is genuinely a separate file, and the
+    two get the same digest without SHA-256 being broken at all. Prefixing each
+    part with its length makes the stream self-delimiting, so a digest identifies
+    exactly one (path, bytes) sequence.
+    """
+    for part in parts:
+        digest.update(str(len(part)).encode("ascii"))
+        digest.update(b":")
+        digest.update(part)
+
+
 def harness_digest(roots: Sequence[Path] = _HARNESS_ROOTS) -> str:
     """Digest the code that decides what the arms — and M5 — do.
 
@@ -860,9 +876,55 @@ def harness_digest(roots: Sequence[Path] = _HARNESS_ROOTS) -> str:
         for path in paths:
             if "__pycache__" in path.parts:
                 continue
-            digest.update(path.name.encode("utf-8"))
-            digest.update(path.read_bytes() if path.is_file() else b"<absent>")
+            _framed(
+                digest,
+                path.name.encode("utf-8"),
+                path.read_bytes() if path.is_file() else b"<absent>",
+            )
     return digest.hexdigest()
+
+
+class SamplesTreeError(ValueError):
+    """A symlink was found inside the sample corpus.
+
+    :func:`~benchmarks.longmemeval.metrics.m5_roundtrip._package_dirs` decides
+    what a package is with ``candidate.is_dir()``, which *follows* symlinks, so a
+    symlinked directory is a package M5 reads. The digest must therefore cover it
+    too, or a resume could accept a corpus whose content moved.
+
+    Refusing is chosen over following. Following reaches arbitrary locations
+    outside the tree — whose content can change with nothing in the repository
+    changing — and admits symlink cycles, so the digest would have to defend
+    against unbounded traversal to describe a corpus that is, by construction, a
+    fixed set of package directories. Refusing keeps the guarantee exact: what is
+    hashed is everything M5 can reach. Copy the target in instead.
+    """
+
+
+def _sample_files(base: Path) -> list[Path]:
+    """Every regular file under ``base``, refusing symlinks anywhere inside.
+
+    Walked explicitly rather than through ``rglob``: on this Python ``rglob`` does
+    not recurse into symlinked directories, while M5's own package discovery
+    follows them, and a digest that sees less than the metric it protects is
+    worse than none.
+    """
+    found: list[Path] = []
+    stack = [base]
+    while stack:
+        for entry in sorted(stack.pop().iterdir()):
+            if entry.is_symlink():
+                raise SamplesTreeError(
+                    f"{entry} is a symlink. M5 follows symlinked directories when "
+                    "it enumerates packages, so a digest that skipped this could "
+                    "accept a resume after the target changed; and following it "
+                    "would reach outside the corpus. Replace the link with a copy."
+                )
+            if entry.is_dir():
+                stack.append(entry)
+            elif entry.is_file():
+                found.append(entry)
+    return found
 
 
 def samples_digest(root: Path) -> str:
@@ -875,18 +937,22 @@ def samples_digest(root: Path) -> str:
     is exactly how a resumed run could report an M5 measured over a different
     corpus than the one it started with.
 
-    Relative paths are hashed alongside the bytes so a rename is a change, and the
-    walk is sorted so the digest does not depend on directory iteration order.
+    Relative paths are hashed alongside the bytes so a rename is a change, both
+    are length-framed so no two trees can collide (:func:`_framed`), and the walk
+    is sorted so the digest does not depend on directory iteration order.
     """
     base = Path(root)
     if not base.is_dir():
         return _sha256_text(f"<absent:{base.name}>")
     digest = hashlib.sha256()
-    for path in sorted(base.rglob("*")):
-        if not path.is_file():
-            continue
-        digest.update(str(path.relative_to(base)).replace("\\", "/").encode("utf-8"))
-        digest.update(path.read_bytes())
+    for path in sorted(
+        _sample_files(base), key=lambda p: p.relative_to(base).as_posix()
+    ):
+        _framed(
+            digest,
+            path.relative_to(base).as_posix().encode("utf-8"),
+            path.read_bytes(),
+        )
     return digest.hexdigest()
 
 
@@ -1437,13 +1503,30 @@ def _pinned_number(
             f"{type(value).__name__} ({value!r}). This harness will not default a "
             "pinned threshold."
         )
+    # ``json.loads`` accepts the JavaScript literals NaN / Infinity, and a
+    # non-finite threshold silently inverts the rule it encodes rather than
+    # failing: every comparison against NaN is False, so an ``alpha`` of NaN
+    # makes ``p_value >= alpha`` false for every input and M3 reads as *always*
+    # readable — the opposite of the pre-registered INCONCLUSIVE guard.
+    if not math.isfinite(value):
+        raise GatePinError(
+            f"{path}: pinned {metric} {key!r} is {value!r}, which is not a finite "
+            "number. Every comparison against a NaN is false, so a non-finite "
+            "threshold does not merely misread — it silently inverts the rule it "
+            "is supposed to enforce."
+        )
     return float(value)
 
 
 def _pinned_int(
     record: Mapping[str, Any], key: str, metric: str, path: Path
 ) -> int:
-    """Read one required integer knob (a denominator) out of a pinned record."""
+    """Read one required integer knob (a denominator) out of a pinned record.
+
+    ``bool`` is rejected explicitly because ``isinstance(True, int)`` is true in
+    Python, so a pin carrying ``true`` where a denominator belongs would
+    otherwise be read as the number 1.
+    """
     value = record.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         raise GatePinError(
@@ -1539,7 +1622,7 @@ def m3_gate_verdict(
 
 def m3_denominator_ids(
     split_manifest: Mapping[str, Any], path: Path = PREREGISTER_PATH
-) -> tuple[list[str], int | None]:
+) -> tuple[list[str], int]:
     """The knowledge-update ids M3 is defined over, and the pinned denominator.
 
     Derived structurally — the KU pool minus its abstention (``_abs``) variants —
@@ -1549,11 +1632,14 @@ def m3_denominator_ids(
     would silently rot if the split ever moved. The pinned ``N`` is returned
     alongside so callers can report whether the derivation actually lands on it.
     """
+    # The pin is read FIRST and strictly. Deriving the ids first would let a
+    # label-set mismatch raise before an unreadable ``N`` was ever noticed, so
+    # the louder error would mask the one that says the pre-registration itself
+    # cannot be read.
+    pinned_n = _pinned_int(preregistered_metric("M3", path), "N", "M3", path)
     ku = [str(qid) for qid in split_manifest.get("question_ids", {}).get("ku", [])]
     ids = sorted(qid for qid in ku if not qid.endswith("_abs"))
-    record = preregistered_metric("M3", path)
-    pinned_n = record.get("N")
-    return ids, pinned_n if isinstance(pinned_n, int) else None
+    return ids, pinned_n
 
 
 class M3LabelError(ValueError):
