@@ -215,6 +215,14 @@ def test_a_garbled_judge_command_is_rejected_where_the_pin_is_read(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("command", ["cmd 'unclosed", 'cmd "unclosed', "cmd 'a\"b"])
+def test_an_unquotable_judge_command_is_a_pin_parse_error(command: str) -> None:
+    """Unbalanced quoting is an unreadable pin, not a bare tokenizer crash."""
+    with pytest.raises(clients.PinParseError, match="unreadable command"):
+        clients.parse_cli_pin(f"m via {command}", temperature=0.0, seed=1)
+
+
+@pytest.mark.unit
 def test_the_real_judge_pin_passes_the_command_check() -> None:
     assert clients.judge_pin().argv[0].isidentifier()
 
@@ -793,10 +801,111 @@ def test_a_fence_prefixed_line_carrying_content_is_not_silently_dropped(
 
     Skipping anything that merely starts with a fence would make a claim vanish
     with no error, and the reduced extraction would then be cached for every arm
-    — the precise loss the fail-loud policy exists to prevent.
+    — the precise loss the fail-loud policy exists to prevent. The stream parser
+    keeps that property: the leftover backticks are non-whitespace garbage sitting
+    where an object should start, so they refuse rather than disappear.
     """
-    with pytest.raises(clients.ExtractionFormatError, match="fence"):
+    with pytest.raises(clients.ExtractionFormatError):
         clients.extracted_claims(line)
+
+
+_REAL_COMPLETION_SAMPLE = Path(
+    "E:/Workspace/.agents/lme-real-run-20260815/real-qwen-completion-sample.txt"
+)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not _REAL_COMPLETION_SAMPLE.is_file(),
+    reason=f"captured completion sample not found at {_REAL_COMPLETION_SAMPLE}",
+)
+def test_the_real_captured_completion_parses() -> None:
+    """Real pinned-model output, captured from the post-merge probe.
+
+    The single most valuable fixture available: whatever the parser believes
+    about layout, this is what the model actually emitted.
+    """
+    claims = clients.extracted_claims(
+        _REAL_COMPLETION_SAMPLE.read_text(encoding="utf-8")
+    )
+
+    assert len(claims) == 20
+    assert all(claim.text and claim.subject and claim.value for claim in claims)
+    # The subject slugs are the whole point of structured extraction: they must
+    # look like the entity/attribute paths the rubric asks for.
+    assert all("/" in claim.subject for claim in claims)
+    assert claims[1].value == "17"
+
+
+@pytest.mark.unit
+def test_a_pretty_printed_completion_parses_identically() -> None:
+    """The layout the probe died on. Same objects, different whitespace.
+
+    The model is deterministic per input but not uniform across inputs: some
+    sessions come back one object per line, others pretty-printed. Both are the
+    agreed payload, so the parser reads a stream of objects rather than lines.
+    """
+    records = [
+        {"text": "A claim.", "subject": "user/a", "value": "1"},
+        {"text": "Another claim.", "subject": "user/b", "value": "2"},
+    ]
+    single_line = "\n".join(json.dumps(record) for record in records)
+    pretty = "\n".join(json.dumps(record, indent=2) for record in records)
+
+    assert pretty != single_line and "\n" in json.dumps(records[0], indent=2)
+    assert clients.extracted_claims(pretty) == clients.extracted_claims(single_line)
+
+
+@pytest.mark.unit
+def test_a_mixed_layout_completion_parses() -> None:
+    """One pretty-printed object beside a single-line one, as observed."""
+    pretty = json.dumps(
+        {"text": "A claim.", "subject": "user/a", "value": "1"}, indent=4
+    )
+    flat = json.dumps({"text": "Another.", "subject": "user/b", "value": "2"})
+
+    claims = clients.extracted_claims(f"{pretty}\n{flat}\n")
+    assert [claim.subject for claim in claims] == ["user/a", "user/b"]
+
+    # ...and with no separator at all between the objects.
+    assert len(clients.extracted_claims(f"{flat}{flat}")) == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "completion",
+    [
+        '{"text":"t","subject":"s","value":"v"} trailing prose',
+        'Here are the claims:\n{"text":"t","subject":"s","value":"v"}',
+        '{"text":"t","subject":"s","value":"v"}, {"text":"u","subject":"s","value":"v"}',
+        '{"text":"t","subject":"s","value":"v"}\n[1, 2]',
+    ],
+)
+def test_garbage_between_or_after_objects_still_fails_loud(completion: str) -> None:
+    """Whitespace is the only thing allowed between objects.
+
+    Tolerating layout must not become tolerating content: anything else there is
+    the model answering a different contract, and accepting it would cache a
+    partial or reinterpreted extraction for every arm.
+    """
+    with pytest.raises(clients.ExtractionFormatError):
+        clients.extracted_claims(completion)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("completion", ["", "   \n\n  ", "```json\n```"])
+def test_a_completion_carrying_no_claims_is_refused(completion: str) -> None:
+    """An empty result is indistinguishable from a session with nothing to say."""
+    with pytest.raises(clients.ExtractionFormatError, match="no claims"):
+        clients.extracted_claims(completion)
+
+
+@pytest.mark.unit
+def test_the_rubric_asks_for_single_line_objects() -> None:
+    """The parser is the guarantee; the rubric still asks for the cheap shape."""
+    prompt = clients.EXTRACT_STRUCTURED_SYSTEM_PROMPT.lower()
+    assert "single-line" in prompt
+    assert "pretty-print" in prompt
 
 
 @pytest.mark.unit
