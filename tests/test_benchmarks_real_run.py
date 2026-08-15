@@ -1236,7 +1236,6 @@ def test_m3_cannot_be_silently_skipped_now_that_its_labels_are_pinned(
     assert source is not None, "the pinned labels must be resolved without a flag"
     assert source.path == real_run.REPO_ROOT / "benchmarks/longmemeval/m3_labels.json"
     assert source.matches_preregistered is True
-    assert real_run.load_m3_labels(None) == {}
 
 
 @pytest.mark.integration
@@ -1918,6 +1917,191 @@ def test_a_preregistration_without_a_label_pin_still_reports_no_m3(
         tmp_path, corpus_dir, split_path, m3_labels=None, preregister_path=path
     )
     assert real_run.resolve_m3_labels(cfg, path) is None
+
+
+@pytest.mark.integration
+def test_labels_modified_mid_run_do_not_change_what_is_scored(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The scored labels are the verified snapshot, not whatever is on disk later.
+
+    Verifying a digest and then re-reading the path to score leaves a window: a
+    file modified between the two would be scored while the manifest still
+    attested the earlier digest and labels_match_preregistered. The mutation here
+    lands after execute() has verified, via the first model call.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    labels_path = cfg.m3_labels
+    original = labels_path.read_bytes()
+
+    def mutating_factory(pin: ModelPin) -> FakeChat:
+        client = FakeChat(pin)
+        original_chat = client.chat
+
+        def chat(messages):
+            # Emptying the labels would drive every arm's contamination to zero
+            # if the run were re-reading the file.
+            labels_path.write_text(
+                json.dumps({"ku-one": [], "ku-two": []}), encoding="utf-8"
+            )
+            return original_chat(messages)
+
+        client.chat = chat  # type: ignore[method-assign]
+        return client
+
+    metrics = real_run.execute(
+        cfg, client_factory=mutating_factory, judge_client=FakeJudge()
+    )
+
+    assert labels_path.read_bytes() != original, "the test must really have mutated it"
+    # Arm A keeps the stale 24:30 claim, so the ORIGINAL labels find it.
+    assert metrics["m3"]["contaminated"]["A"] >= 1
+    assert metrics["m3"]["labels_sha256"] == real_run.digest_bytes(original)
+
+    manifest = json.loads(
+        (cfg.out_dir / real_run.MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert manifest["m3_labels_sha256"] == real_run.digest_bytes(original)
+
+
+@pytest.mark.integration
+def test_labels_deleted_mid_run_do_not_break_the_run(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A deletion after verification is a no-op, not an untyped FileNotFoundError."""
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    labels_path = cfg.m3_labels
+
+    def deleting_factory(pin: ModelPin) -> FakeChat:
+        client = FakeChat(pin)
+        original_chat = client.chat
+
+        def chat(messages):
+            labels_path.unlink(missing_ok=True)
+            return original_chat(messages)
+
+        client.chat = chat  # type: ignore[method-assign]
+        return client
+
+    metrics = real_run.execute(
+        cfg, client_factory=deleting_factory, judge_client=FakeJudge()
+    )
+
+    assert not labels_path.exists()
+    assert metrics["m3"] is not None
+    assert metrics["m3"]["contaminated"]["A"] >= 1
+
+
+@pytest.mark.unit
+def test_the_snapshot_is_parsed_from_the_bytes_that_were_hashed(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Digest and labels come from one read, so they cannot describe two states."""
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    source = real_run.resolve_m3_labels(cfg)
+
+    assert source.labels == {"ku-one": ["24:30"], "ku-two": ["61"]}
+    assert source.sha256 == real_run.digest_bytes(cfg.m3_labels.read_bytes())
+
+    cfg.m3_labels.write_text(json.dumps({"ku-one": ["changed"]}), encoding="utf-8")
+    assert source.labels == {"ku-one": ["24:30"], "ku-two": ["61"]}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "payload",
+    [b"[]", b"{not json", b'{"q": "not-a-list"}', b'{"q": [1, 2]}', b"\xff\xfe"],
+)
+def test_unusable_labels_are_refused_at_verification(
+    tmp_path: Path, payload: bytes
+) -> None:
+    """Parsing happens at verification, so a bad file stops before any model call."""
+    path = tmp_path / "labels.json"
+    path.write_bytes(payload)
+    with pytest.raises(real_run.M3LabelError):
+        real_run.parse_m3_labels(path.read_bytes(), path)
+
+
+# --------------------------------------------------------------------------- #
+# The label pin fails CLOSED                                                   #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        pytest.param(
+            lambda m3: m3.pop("labels_sha256"), "labels_sha256", id="sha_missing"
+        ),
+        pytest.param(lambda m3: m3.pop("labels_file"), "labels_file", id="file_missing"),
+        pytest.param(
+            lambda m3: m3.update(labels_file=42), "labels_file", id="file_wrong_type"
+        ),
+        pytest.param(
+            lambda m3: m3.update(labels_file=""), "labels_file", id="file_empty"
+        ),
+        pytest.param(
+            lambda m3: m3.update(labels_sha256=42), "labels_sha256", id="sha_wrong_type"
+        ),
+        pytest.param(
+            lambda m3: m3.update(labels_sha256="deadbeef"),
+            "labels_sha256",
+            id="sha_too_short",
+        ),
+        pytest.param(
+            lambda m3: m3.update(labels_sha256="A" * 64),
+            "labels_sha256",
+            id="sha_not_lowercase",
+        ),
+        pytest.param(
+            lambda m3: m3.update(labels_sha256="z" * 64),
+            "labels_sha256",
+            id="sha_not_hex",
+        ),
+    ],
+)
+def test_a_partial_or_malformed_label_pin_fails_closed(
+    tmp_path: Path, corpus_dir: Path, split_path: Path, mutate, match: str
+) -> None:
+    """Half a pin is not "no pin" - degrading to the legacy path reopens the hole.
+
+    The unpinned path allows M3 to be skipped for a missing flag and an override
+    to run without acknowledgement, which is exactly what pinning closed.
+    """
+    path = _preregister_with(tmp_path, lambda record: mutate(record["metrics"]["M3"]))
+    cfg = _config(tmp_path, corpus_dir, split_path, preregister_path=path)
+
+    with pytest.raises(GatePinError, match=match):
+        real_run.resolve_m3_labels(cfg, path)
+
+
+@pytest.mark.unit
+def test_both_fields_absent_is_still_the_legal_legacy_path(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Only a genuinely pre-pin configuration takes the unpinned route."""
+
+    def drop_both(record: dict) -> None:
+        del record["metrics"]["M3"]["labels_file"]
+        del record["metrics"]["M3"]["labels_sha256"]
+
+    path = _preregister_with(tmp_path, drop_both)
+    cfg = _config(
+        tmp_path, corpus_dir, split_path, m3_labels=None, preregister_path=path
+    )
+    assert real_run.resolve_m3_labels(cfg, path) is None
+
+
+@pytest.mark.unit
+def test_the_real_preregistration_carries_a_well_formed_pin() -> None:
+    """The shipped pin must satisfy the strict reader it is validated by."""
+    record = json.loads(real_run.PREREGISTER_PATH.read_text(encoding="utf-8"))
+    pinned_file, pinned_sha = real_run._read_label_pin(
+        record["metrics"]["M3"], real_run.PREREGISTER_PATH
+    )
+    assert pinned_file == "benchmarks/longmemeval/m3_labels.json"
+    assert len(pinned_sha) == 64
 
 
 @pytest.mark.unit

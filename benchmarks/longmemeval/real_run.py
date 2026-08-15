@@ -52,7 +52,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -1917,39 +1917,62 @@ def _pool_arm_perf(rows: Iterable[Mapping[str, Any]], arm: str) -> m4_perf.ArmPe
     )
 
 
-def load_m3_labels(path: Path | None) -> dict[str, list[str]]:
-    """Read a stale-value label file, or return no labels.
-
-    M3 needs, per knowledge-update question, the *old* value that must not reach
-    the answering model. LongMemEval ships no such annotation, and the harness
-    deliberately does not synthesise one: the obvious derivation — reading the old
-    value off the shared linker's own ``supersedes`` edges — would label M3 with
-    exactly the edges Arm C acts on, making the metric close to tautological.
-    The label source is therefore a pre-registration-level decision (design doc
-    §6.3), pinned by :func:`resolve_m3_labels` rather than chosen at run time.
-    """
-    if path is None:
-        return {}
-    return {
-        str(qid): [str(value) for value in values]
-        for qid, values in json.loads(path.read_text(encoding="utf-8")).items()
-    }
-
-
-def normalized_digest(path: Path) -> str:
-    """Hex SHA-256 of a file with CRLF normalized to LF.
+def digest_bytes(raw: bytes) -> str:
+    """Hex SHA-256 of ``raw`` with CRLF normalized to LF.
 
     The convention the pre-registration's own ``design_doc_sha256`` and
     ``labels_sha256`` use, so a pin holds on a Windows CRLF working tree and a
     Linux LF checkout of the same committed content alike. Raw-byte hashing would
     make the pinned digest fail on exactly one of the two platforms.
+
+    Takes bytes rather than a path so a caller can hash *the same read* it will
+    use — see :func:`resolve_m3_labels`.
     """
-    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+    return hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def normalized_digest(path: Path) -> str:
+    """Hex SHA-256 of a file, CRLF-normalized. Convenience over :func:`digest_bytes`."""
+    return digest_bytes(path.read_bytes())
+
+
+def parse_m3_labels(raw: bytes, source: Path) -> dict[str, list[str]]:
+    """Parse a labels payload, raising :class:`M3LabelError` on anything unusable.
+
+    Parsed from bytes already in hand rather than from a path, so the labels a run
+    scores are provably the ones whose digest it verified.
+    """
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise M3LabelError(f"{source}: labels are not valid UTF-8 JSON ({exc})") from exc
+    if not isinstance(record, dict):
+        raise M3LabelError(
+            f"{source}: labels must be a JSON object mapping question_id -> "
+            f"[old value, ...], got {type(record).__name__}"
+        )
+    labels: dict[str, list[str]] = {}
+    for qid, values in record.items():
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) for value in values
+        ):
+            raise M3LabelError(
+                f"{source}: labels for {qid!r} must be a list of strings, got "
+                f"{values!r}"
+            )
+        labels[str(qid)] = list(values)
+    return labels
 
 
 @dataclass(frozen=True)
 class M3LabelSource:
-    """The label file a run will actually score M3 from, and its standing.
+    """The labels a run will score M3 from — as a verified **snapshot**.
+
+    ``labels`` is parsed from the very bytes that were hashed, and is the only
+    thing scoring ever reads. The path is never re-opened after verification,
+    which closes the window where a file modified, repointed or deleted between
+    the check and the scoring pass would let a run score one label set while its
+    manifest attested another.
 
     ``matches_preregistered`` is decided by **digest**, not by whether an override
     path was passed: pointing ``--m3-labels`` at the pinned file itself is not a
@@ -1958,6 +1981,7 @@ class M3LabelSource:
 
     path: Path
     sha256: str
+    labels: dict[str, list[str]]
     matches_preregistered: bool
     pinned_file: str | None
     pinned_sha256: str | None
@@ -2000,24 +2024,24 @@ def resolve_m3_labels(
     be scored.
     """
     record = preregistered_metric("M3", path)
-    pinned_file = record.get("labels_file")
-    pinned_sha = record.get("labels_sha256")
-    pinned = isinstance(pinned_file, str) and isinstance(pinned_sha, str)
+    pinned_file, pinned_sha = _read_label_pin(record, path)
 
-    if not pinned:
+    if pinned_file is None:
+        # The legacy, pre-pin configuration: no label pin at all.
         if cfg.m3_labels is None:
             return None
-        return M3LabelSource(
-            path=cfg.m3_labels,
-            sha256=normalized_digest(cfg.m3_labels),
+        return _snapshot_labels(
+            Path(cfg.m3_labels),
             matches_preregistered=False,
             pinned_file=None,
             pinned_sha256=None,
-            deviation_acknowledged=cfg.m3_labels_deviation_ack,
+            acknowledged=cfg.m3_labels_deviation_ack,
         )
 
-    resolved = cfg.m3_labels if cfg.m3_labels is not None else REPO_ROOT / pinned_file
-    if not Path(resolved).is_file():
+    resolved = Path(
+        cfg.m3_labels if cfg.m3_labels is not None else REPO_ROOT / pinned_file
+    )
+    if not resolved.is_file():
         raise M3LabelError(
             f"the pinned M3 labels file {pinned_file!r} was not found at "
             f"{resolved}. M3's sample is pinned in preregister.json "
@@ -2025,27 +2049,101 @@ def resolve_m3_labels(
             "without it, and will not silently report no M3 instead."
         )
 
-    actual = normalized_digest(Path(resolved))
-    matches = actual == pinned_sha
+    source = _snapshot_labels(
+        resolved,
+        matches_preregistered=False,
+        pinned_file=pinned_file,
+        pinned_sha256=pinned_sha,
+        acknowledged=cfg.m3_labels_deviation_ack,
+    )
+    matches = source.sha256 == pinned_sha
     if not matches and not cfg.m3_labels_deviation_ack:
         raise M3LabelError(
             f"the M3 labels at {resolved} do not match the pre-registered "
             f"labels file.\n  expected sha256 = {pinned_sha}\n  actual   sha256 = "
-            f"{actual}\nThe labels file IS M3's sample - its keys are the "
+            f"{source.sha256}\nThe labels file IS M3's sample - its keys are the "
             "denominator and its values define contamination - so scoring a "
             "different one would publish an M3 the pre-registration does not "
             "describe. Restore the pinned file, or pass "
             "--m3-labels-deviation-ack to record the deviation in the results."
         )
+    return replace(source, matches_preregistered=matches)
 
+
+def _snapshot_labels(
+    path: Path,
+    *,
+    matches_preregistered: bool,
+    pinned_file: str | None,
+    pinned_sha256: str | None,
+    acknowledged: bool,
+) -> M3LabelSource:
+    """Read the labels file ONCE, then hash and parse that same read.
+
+    One read is the whole point. Hashing the path and later re-opening it to
+    parse leaves a window in which the file can change between the two, so the
+    run would score bytes it never verified while its manifest attested the
+    digest of bytes it no longer holds.
+    """
+    raw = path.read_bytes()
     return M3LabelSource(
-        path=Path(resolved),
-        sha256=actual,
-        matches_preregistered=matches,
+        path=path,
+        sha256=digest_bytes(raw),
+        labels=parse_m3_labels(raw, path),
+        matches_preregistered=matches_preregistered,
         pinned_file=pinned_file,
-        pinned_sha256=pinned_sha,
-        deviation_acknowledged=cfg.m3_labels_deviation_ack,
+        pinned_sha256=pinned_sha256,
+        deviation_acknowledged=acknowledged,
     )
+
+
+def _read_label_pin(
+    record: Mapping[str, Any], path: Path
+) -> tuple[str | None, str | None]:
+    """Read the label pin, failing CLOSED on anything partial or malformed.
+
+    The legacy no-pin path is legal only when ``labels_file`` and
+    ``labels_sha256`` are *both entirely absent* — the genuine pre-pin
+    configuration. A half-written or mistyped pin is not a configuration without
+    a pin, and treating it as one would silently reopen exactly the hole the pin
+    was added to close: M3 skipped for a missing flag, or an override accepted
+    with no acknowledgement.
+    """
+    has_file = "labels_file" in record
+    has_sha = "labels_sha256" in record
+    if not has_file and not has_sha:
+        return None, None
+
+    if not has_file or not has_sha:
+        missing = "labels_file" if not has_file else "labels_sha256"
+        present = "labels_sha256" if not has_file else "labels_file"
+        raise GatePinError(
+            f"{path}: pinned M3 carries {present!r} but not {missing!r}. A label "
+            "pin is both fields or neither; half a pin cannot be verified, and "
+            "this harness will not fall back to the unpinned path to make it "
+            "usable."
+        )
+
+    pinned_file = record["labels_file"]
+    pinned_sha = record["labels_sha256"]
+    if not isinstance(pinned_file, str) or not pinned_file.strip():
+        raise GatePinError(
+            f"{path}: pinned M3 'labels_file' must be a non-empty string, got "
+            f"{pinned_file!r}."
+        )
+    if (
+        not isinstance(pinned_sha, str)
+        or len(pinned_sha) != 64
+        or pinned_sha != pinned_sha.lower()
+        or any(character not in "0123456789abcdef" for character in pinned_sha)
+    ):
+        raise GatePinError(
+            f"{path}: pinned M3 'labels_sha256' must be 64 lowercase hex "
+            f"characters, got {pinned_sha!r}. Reported as a malformed pin rather "
+            "than left to surface later as a digest mismatch, which would blame "
+            "the labels file for a defect in the pre-registration."
+        )
+    return pinned_file, pinned_sha
 
 
 def compute_metrics(
@@ -2154,7 +2252,11 @@ def compute_metrics(
     }
 
     # -- M3 ---------------------------------------------------------------
-    labels = load_m3_labels(label_source.path) if label_source else {}
+    # The verified snapshot, never a re-read of the path: between verification
+    # and here the file may have been modified, repointed or deleted, and a run
+    # that scored those bytes while its manifest attested the earlier digest
+    # would be unattributable.
+    labels = label_source.labels if label_source else {}
     if label_source and labels:
         denominator = m3_denominator(split_manifest, path)
         validate_m3_labels(labels, denominator.label_ids)
