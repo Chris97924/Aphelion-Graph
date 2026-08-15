@@ -1095,6 +1095,20 @@ def test_a_pins_only_config_cannot_run_a_stage() -> None:
         config.extractor.call(None, pin=_PIN)
 
 
+@pytest.mark.unit
+def test_the_judge_prompt_mode_is_a_run_setting_not_a_code_edit() -> None:
+    """Which form the installed CLI accepts is discovered on the driver's box.
+
+    It cannot be verified from here — no real judgement may be made before the
+    run — so the choice has to be reachable from the command line rather than
+    require editing the harness mid-run.
+    """
+    assert real_run.RealRunConfig().judge_prompt_via == clients.PROMPT_VIA_STDIN
+    assert set(clients.PROMPT_VIA_CHOICES) == {"stdin", "argv"}
+    with pytest.raises(ValueError, match="prompt_via"):
+        clients.JudgeClient(cli_pin=_CLI_PIN, prompt_via="telepathy")
+
+
 @pytest.mark.integration
 def test_preflight_reports_every_stage_without_generating(tmp_path: Path) -> None:
     """--preflight touches the inventory and a version, never a completion."""

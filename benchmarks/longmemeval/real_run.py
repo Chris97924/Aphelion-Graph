@@ -537,6 +537,11 @@ class RealRunConfig:
     samples_root: Path = SAMPLES_ROOT
     m3_labels: Path | None = None
     resamples: int = m1_qa.BOOTSTRAP_RESAMPLES
+    # Which form the judge CLI is handed its prompt. Exposed as a run setting
+    # because which form the installed build accepts is an operational fact about
+    # that machine, and discovering it must not require editing the harness in
+    # the middle of a run.
+    judge_prompt_via: str = clients.PROMPT_VIA_STDIN
     split_manifest_path: Path = corpus.MANIFEST_PATH
     preregister_path: Path = PREREGISTER_PATH
 
@@ -1323,7 +1328,9 @@ def execute(
         "judge": clients.judge_pin(cfg.preregister_path).pin,
     }
     cli_pin = clients.judge_pin(cfg.preregister_path)
-    judge = judge_client or clients.JudgeClient(cli_pin=cli_pin)
+    judge = judge_client or clients.JudgeClient(
+        cli_pin=cli_pin, prompt_via=cfg.judge_prompt_via
+    )
     retriever = BM25Retriever()
 
     config = pins_config(pins)

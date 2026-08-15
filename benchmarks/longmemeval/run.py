@@ -871,7 +871,7 @@ def _add_real_run_arguments(parser: argparse.ArgumentParser) -> None:
     must have exactly one definition). Deferring the import to call time keeps the
     dependency one-directional whichever module a caller reaches first.
     """
-    from benchmarks.longmemeval import real_run
+    from benchmarks.longmemeval import clients, real_run
 
     parser.add_argument(
         "--real",
@@ -928,6 +928,16 @@ def _add_real_run_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--judge-prompt-via",
+        choices=clients.PROMPT_VIA_CHOICES,
+        default=clients.PROMPT_VIA_STDIN,
+        help=(
+            "how the judge CLI receives its prompt (default: stdin, which has no "
+            "command-line length limit; switch to argv if the installed build "
+            "does not read a piped prompt)"
+        ),
+    )
+    parser.add_argument(
         "--m3-labels",
         type=Path,
         default=None,
@@ -972,6 +982,7 @@ def _run_real(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         data_dir=args.data_dir,
         top_k=args.top_k,
         m3_labels=args.m3_labels,
+        judge_prompt_via=args.judge_prompt_via,
     )
     metrics = real_run.execute(config, progress=print)
 
