@@ -612,6 +612,10 @@ class RealRunConfig:
     # that machine, and discovering it must not require editing the harness in
     # the middle of a run.
     judge_prompt_via: str = clients.PROMPT_VIA_STDIN
+    # Set only to run with a judge the pre-registration does not name. The design
+    # doc sanctions a manual fallback judge, so this exists to make that an
+    # explicit act rather than something a run can drift into unnoticed.
+    judge_deviation_ack: bool = False
     split_manifest_path: Path = corpus.MANIFEST_PATH
     preregister_path: Path = PREREGISTER_PATH
 
@@ -678,11 +682,13 @@ def build_manifest(
     judge_fallback: str | None,
     retriever_params: Mapping[str, Any],
     split_manifest: Mapping[str, Any],
+    judge_standing: Mapping[str, Any],
 ) -> dict[str, Any]:
     """The run's provenance record: what ran, against what, under which pins."""
     preregister = json.loads(cfg.preregister_path.read_text(encoding="utf-8"))
     git = git_provenance()
     return {
+        **dict(judge_standing),
         "benchmark": preregister.get("benchmark"),
         "mode": "real",
         "arms": sorted(ARM_STORES),
@@ -700,6 +706,8 @@ def build_manifest(
         "corpus_data_dir": str(cfg.directory()),
         "m3_labels_path": str(cfg.m3_labels) if cfg.m3_labels else None,
         "m3_labels_sha256": file_digest(cfg.m3_labels),
+        "samples_root": str(cfg.samples_root),
+        "samples_sha256": samples_digest(cfg.samples_root),
         "haystack": cfg.haystack,
         "split": cfg.split,
         "limit": cfg.limit,
@@ -714,6 +722,58 @@ def build_manifest(
         "git_dirty": git.get("dirty"),
         "git": git,
     }
+
+
+class JudgeDeviationError(ValueError):
+    """The configured judge is not the pre-registered one, and nobody said so.
+
+    The design doc sanctions a *manual* fallback judge (§5.2 names one), so this
+    is not a prohibition — it is a requirement that the deviation be an explicit
+    operator act rather than something a run drifts into. A run that quietly
+    judged with another model would publish M1 and AG under the pre-registered
+    judge's name, and nothing in the results would say otherwise.
+    """
+
+
+def judge_standing(
+    judge_client: Any, preregistered: ModelPin
+) -> dict[str, Any]:
+    """Compare the judge that will actually run against the pre-registered pin.
+
+    Returns the fields a run records about *which* judge produced its verdicts.
+    The comparison is on the full pin record — model, endpoint, temperature and
+    seed — because reaching the same model a different way is also a change the
+    results have to be able to state.
+    """
+    pin = getattr(judge_client, "pin", None)
+    if not isinstance(pin, ModelPin):
+        raise UnrecordedPinsError(
+            f"{type(judge_client).__name__} exposes no ModelPin, so the run could "
+            "not record which judge produced its verdicts."
+        )
+    matches = pin.as_record() == preregistered.as_record()
+    return {
+        "judge_pin": pin.as_record(),
+        "judge_model": pin.model,
+        "preregistered_judge_model": preregistered.model,
+        "judge_matches_preregistered_pin": matches,
+    }
+
+
+def require_judge_acknowledged(standing: Mapping[str, Any], acknowledged: bool) -> None:
+    """Refuse an unacknowledged deviation from the pre-registered judge."""
+    if standing["judge_matches_preregistered_pin"] or acknowledged:
+        return
+    raise JudgeDeviationError(
+        f"the configured judge is {standing['judge_model']!r} but "
+        f"benchmarks/longmemeval/preregister.json pins "
+        f"{standing['preregistered_judge_model']!r} (design doc §5.2). Running "
+        "the pinned benchmark with a different judge is allowed — the design doc "
+        "names a fallback — but it has to be deliberate: pass "
+        "--judge-deviation-ack to record the deviation in the run manifest. "
+        "Without it the results would carry M1 and AG numbers produced by a judge "
+        "the pre-registration does not name."
+    )
 
 
 def file_digest(path: Path | None) -> str | None:
@@ -762,30 +822,71 @@ def questions_digest(specs: Sequence[QuestionSpec]) -> str:
     )
 
 
-# The source trees whose contents decide what a run produces: the harness itself
-# and the aphelion package Arm C's machinery lives in.
+# The sources whose contents decide what a run produces: the harness itself, the
+# aphelion package Arm C's machinery lives in, and the independent reader M5's
+# gate is measured against. The reader is named as a single file because it sits
+# outside every package tree — it is deliberately import-free of ``aphelion``,
+# which is the whole reason M5 can use it as a second implementation — and
+# because nothing else in ``scripts/`` affects a run.
 _HARNESS_ROOTS = (
     Path(__file__).resolve().parent,
     REPO_ROOT / "src" / "aphelion",
+    REPO_ROOT / "scripts" / "external_reader.py",
 )
 
 
 def harness_digest(roots: Sequence[Path] = _HARNESS_ROOTS) -> str:
-    """Digest the code that decides what the arms do.
+    """Digest the code that decides what the arms — and M5 — do.
 
-    A git sha alone is not code identity — uncommitted edits move behaviour
-    without moving the sha, and an untracked new module is invisible to it — so
+    A git sha alone is not code identity: uncommitted edits move behaviour
+    without moving the sha, and an untracked new module is invisible to it, so
     the resume check hashes the actual source that produces the results. This is
-    the precise form of the guard: an edit to an unrelated file elsewhere in the
-    repo does not block a resume, and an edit to an arm does.
+    the precise form of the guard — an edit to an unrelated file elsewhere in the
+    repo does not block a resume, and an edit to an arm or to the independent
+    reader does.
+
+    Both directories and single files are accepted, and a *missing* named file
+    still contributes to the digest, so its disappearance is a change rather than
+    a silent no-op.
     """
     digest = hashlib.sha256()
     for root in roots:
-        for path in sorted(Path(root).rglob("*.py")):
+        target = Path(root)
+        paths = (
+            [target]
+            if target.suffix == ".py" and not target.is_dir()
+            else sorted(target.rglob("*.py"))
+        )
+        for path in paths:
             if "__pycache__" in path.parts:
                 continue
             digest.update(path.name.encode("utf-8"))
-            digest.update(path.read_bytes())
+            digest.update(path.read_bytes() if path.is_file() else b"<absent>")
+    return digest.hexdigest()
+
+
+def samples_digest(root: Path) -> str:
+    """Digest the sample corpus M5's gate is measured over.
+
+    M5's denominator and verdict are functions of what is in ``samples/``: adding
+    a package changes the gate's ``n``, and editing one changes whether the two
+    implementations agree. Those files are frequently untracked while being
+    worked on, so neither the git sha nor :func:`harness_digest` sees them — which
+    is exactly how a resumed run could report an M5 measured over a different
+    corpus than the one it started with.
+
+    Relative paths are hashed alongside the bytes so a rename is a change, and the
+    walk is sorted so the digest does not depend on directory iteration order.
+    """
+    base = Path(root)
+    if not base.is_dir():
+        return _sha256_text(f"<absent:{base.name}>")
+    digest = hashlib.sha256()
+    for path in sorted(base.rglob("*")):
+        if not path.is_file():
+            continue
+        digest.update(str(path.relative_to(base)).replace("\\", "/").encode("utf-8"))
+        digest.update(path.read_bytes())
     return digest.hexdigest()
 
 
@@ -812,6 +913,13 @@ _IDENTITY_FIELDS = (
     "corpus_loaded_sha256",
     "corpus_data_dir",
     "m3_labels_sha256",
+    # M5's inputs: its gate is a function of the sample corpus, which is often
+    # untracked and therefore invisible to both git and the harness digest.
+    "samples_sha256",
+    # The judge that actually ran — not the pinned one — so a fallback judge
+    # cannot be swapped in halfway through one blind batch.
+    "judge_model",
+    "judge_matches_preregistered_pin",
 )
 
 
@@ -1034,6 +1142,7 @@ def judge_blind(
     judge_record = judge_identity(judge_client)
     for row in rows:
         verify_verdict_judge(row, judge_record)
+    verify_verdict_prompts(rows, specs, phase, judge_client)
     recorded: dict[tuple[str, str], dict] = {
         (row["arm"], row["question_id"]): row for row in rows
     }
@@ -1054,7 +1163,12 @@ def judge_blind(
             )
 
         candidate = answer_row["prediction"]
-        verdict = judge_client.verdict(spec.question, spec.gold, candidate)
+        # The prompt comes back from the call that sent it, so the digest
+        # recorded is of what was actually asked rather than of a second
+        # rendering that could have drifted from it.
+        verdict, prompt = judge_client.verdict_with_prompt(
+            spec.question, spec.gold, candidate
+        )
         row = {
             "kind": "verdict",
             "arm": slot.arm,
@@ -1063,9 +1177,7 @@ def judge_blind(
             "batch_position": position,
             "verdict": strict_verdict(verdict, arm=slot.arm, question_id=spec.question_id),
             "payload_sha256": payload_digest(spec.question, spec.gold, candidate),
-            "prompt_sha256": _sha256_text(
-                clients.judge_prompt(spec.question, spec.gold, candidate)
-            ),
+            "prompt_sha256": _sha256_text(prompt),
             "judged_at": datetime.now(timezone.utc).isoformat(),
             **judge_record,
         }
@@ -1138,6 +1250,49 @@ def verify_verdict_judge(row: Mapping[str, Any], expected: Mapping[str, Any]) ->
             "blind batch would be reported under a single judge pin; start a new "
             "--out-dir, or restore the judge the batch was begun with."
         )
+
+
+def verify_verdict_prompts(
+    rows: Sequence[Mapping[str, Any]],
+    specs: Sequence[QuestionSpec],
+    phase: AnswerPhase,
+    judge_client: Any,
+) -> None:
+    """Refuse recorded verdicts whose prompt is not the one this judge would send.
+
+    The judge identity fields say *which model* answered; this says *what it was
+    asked*. They are different guarantees: the same model handed a different
+    rubric — a wrapper that prepends an instruction, a rubric edited between
+    sessions — produces verdicts that are not comparable with the ones already on
+    disk, while every model/endpoint field still matches.
+
+    The expected digest is re-derived through the client's own
+    ``render_prompt``, which is the same method
+    :meth:`clients.JudgeClient.verdict_with_prompt` sends, so this compares the
+    recorded ask against the ask this run would make rather than against a copy
+    of the template kept here.
+    """
+    by_question = {spec.question_id: spec for spec in specs}
+    for row in rows:
+        recorded = row.get("prompt_sha256")
+        spec = by_question.get(row.get("question_id"))
+        answer = phase.rows.get((row.get("question_id"), row.get("arm")))
+        if spec is None or answer is None:
+            # Absent answers are the blind-batch completeness problem, reported
+            # by MissingAnswerError with a better message than this check could.
+            continue
+        expected = _sha256_text(
+            judge_client.render_prompt(spec.question, spec.gold, answer["prediction"])
+        )
+        if recorded != expected:
+            raise VerdictReplayError(
+                f"the verdict recorded for arm {row.get('arm')!r} question "
+                f"{row.get('question_id')!r} was made against prompt "
+                f"{recorded} but this run would send {expected}. The judge is "
+                "being asked a different question than the one already scored, so "
+                "the two halves of the batch are not comparable; start a new "
+                "--out-dir, or restore the prompt the batch was begun with."
+            )
 
 
 def verify_verdict_prefix(
@@ -1264,6 +1419,40 @@ def _gate_number(text: str, pattern: str, metric: str, path: Path) -> float:
     return float(match.group(1))
 
 
+def _pinned_number(
+    record: Mapping[str, Any], key: str, metric: str, path: Path
+) -> float:
+    """Read one required numeric knob out of a pinned metric record.
+
+    Sibling of :func:`_gate_number` and for the same reason: a knob the
+    pre-registration does not carry may not be defaulted in code. ``alpha`` and
+    the AG tier thresholds are pinned decision boundaries — silently substituting
+    an in-code constant would score the run against a rule the pre-registration
+    never froze, which is precisely what design doc §6.1 guard 3 forbids.
+    """
+    value = record.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GatePinError(
+            f"{path}: pinned {metric} {key!r} must be a number, got "
+            f"{type(value).__name__} ({value!r}). This harness will not default a "
+            "pinned threshold."
+        )
+    return float(value)
+
+
+def _pinned_int(
+    record: Mapping[str, Any], key: str, metric: str, path: Path
+) -> int:
+    """Read one required integer knob (a denominator) out of a pinned record."""
+    value = record.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GatePinError(
+            f"{path}: pinned {metric} {key!r} must be an int, got "
+            f"{type(value).__name__} ({value!r})."
+        )
+    return value
+
+
 def m2_gate_verdict(
     f1: Mapping[str, float], path: Path = PREREGISTER_PATH
 ) -> dict[str, Any]:
@@ -1277,11 +1466,7 @@ def m2_gate_verdict(
     record = preregistered_metric("M2", path)
     gate = str(record.get("gate", ""))
     margin = _gate_number(gate, r"A\.F1\s*\+\s*([\d.]+)", "M2", path)
-    epsilon = record.get("epsilon")
-    if not isinstance(epsilon, (int, float)) or isinstance(epsilon, bool):
-        raise GatePinError(
-            f"{path}: pinned M2 'epsilon' must be a number, got {epsilon!r}."
-        )
+    epsilon = _pinned_number(record, "epsilon", "M2", path)
 
     missing = sorted({"A", "B", "C"} - set(f1))
     if missing:
@@ -1320,7 +1505,7 @@ def m3_gate_verdict(
     record = preregistered_metric("M3", path)
     gate = str(record.get("gate", ""))
     ratio = _gate_number(gate, r"C\s*<=\s*([\d.]+)\s*\*\s*A", "M3", path)
-    pinned_n = record.get("N")
+    pinned_n = _pinned_int(record, "N", "M3", path)
 
     missing = sorted({"A", "C"} - set(rate))
     if missing:
@@ -1421,8 +1606,14 @@ def m3_readability(
 ) -> dict[str, Any]:
     """M3's pinned INCONCLUSIVE test over the paired A-only / C-only discordances."""
     record = preregistered_metric("M3", path)
-    test = record.get("inconclusive_test", {})
-    alpha = float(test.get("alpha", 0.05))
+    test = record.get("inconclusive_test")
+    if not isinstance(test, dict):
+        raise GatePinError(
+            f"{path}: pinned M3 carries no 'inconclusive_test' record, so the "
+            "readability rule that decides whether the ratio may be read at all "
+            "cannot be applied. This harness will not substitute one."
+        )
+    alpha = _pinned_number(test, "alpha", "M3.inconclusive_test", path)
 
     a_only = sorted(
         qid
@@ -1464,9 +1655,17 @@ def adversarial_diagnostic(
     """
     answers = answers or {}
     record = preregistered_metric("AG", path)
-    response = record.get("breach_response", {})
-    tier1 = float(response.get("tier1_pp", 5.0))
-    tier2 = float(response.get("tier2_pp", 10.0))
+    response = record.get("breach_response")
+    if not isinstance(response, dict):
+        raise GatePinError(
+            f"{path}: pinned AG carries no 'breach_response' record, so the tiered "
+            "response the tripwire mandates cannot be read."
+        )
+    # The tier boundaries decide whether M1/M3 may be trusted, so they are read
+    # strictly for the same reason the gates are: an in-code default would let a
+    # run answer a question the pre-registration never froze.
+    tier1 = _pinned_number(response, "tier1_pp", "AG.breach_response", path)
+    tier2 = _pinned_number(response, "tier2_pp", "AG.breach_response", path)
     tripwire_pp = _gate_number(
         str(record.get("gate", "")), r"([+-]?\d+(?:\.\d+)?)\s*pp", "AG", path
     )
@@ -1832,6 +2031,15 @@ def preflight(
             errors.append(f"{name}: {exc}")
     try:
         report["judge"] = judge.preflight()
+        # Whether the judge is the pre-registered one is exactly the thing a
+        # preflight should surface before hours of judging, not after.
+        report["judge"].update(
+            {
+                key: value
+                for key, value in judge_standing(judge, cli_pin.pin).items()
+                if key != "judge_pin"
+            }
+        )
     except Exception as exc:  # noqa: BLE001 - same contract as above
         report["judge"] = {"model": cli_pin.pin.model, "error": str(exc)}
         errors.append(f"judge: {exc}")
@@ -1879,15 +2087,23 @@ def execute(
             f"the {cfg.split!r} split with limit {cfg.limit!r} selects no questions"
         )
 
-    pins = {
-        "answering": clients.answering_pin(cfg.preregister_path),
-        "extractor": clients.extractor_pin(cfg.preregister_path),
-        "judge": clients.judge_pin(cfg.preregister_path).pin,
-    }
     cli_pin = clients.judge_pin(cfg.preregister_path)
     judge = judge_client or clients.JudgeClient(
         cli_pin=cli_pin, prompt_via=cfg.judge_prompt_via
     )
+    # The judge recorded is the one that will actually run, never a blind copy of
+    # the pinned one: a manual fallback is a sanctioned path, and results that
+    # named the pinned judge while another model produced them would be worse
+    # than results that name the deviation.
+    standing = judge_standing(judge, cli_pin.pin)
+    require_judge_acknowledged(standing, cfg.judge_deviation_ack)
+    standing["judge_deviation_acknowledged"] = cfg.judge_deviation_ack
+
+    pins = {
+        "answering": clients.answering_pin(cfg.preregister_path),
+        "extractor": clients.extractor_pin(cfg.preregister_path),
+        "judge": judge.pin,
+    }
     retriever = BM25Retriever()
 
     config = pins_config(pins)
@@ -1901,6 +2117,7 @@ def execute(
             judge_fallback=cli_pin.fallback_model,
             retriever_params=retriever.params,
             split_manifest=split_manifest,
+            judge_standing=standing,
         ),
     )
 
@@ -1969,8 +2186,26 @@ def execute(
         split_manifest=split_manifest,
     )
     metrics["manifest"] = {
-        key: manifest.get(key) for key in ("pins", "haystack", "split", "git")
+        key: manifest.get(key)
+        for key in (
+            "pins",
+            "haystack",
+            "split",
+            "git",
+            "judge_model",
+            "preregistered_judge_model",
+            "judge_matches_preregistered_pin",
+            "judge_deviation_acknowledged",
+            "samples_sha256",
+        )
     }
+    # Surfaced at the top level too: whether the judge was the pre-registered one
+    # is a property of the M1 and AG numbers themselves, and a reader should not
+    # have to open the manifest to find out.
+    metrics["judge_matches_preregistered_pin"] = manifest.get(
+        "judge_matches_preregistered_pin"
+    )
+    metrics["judge_model"] = manifest.get("judge_model")
     (cfg.out_dir / METRICS_NAME).write_bytes(
         (json.dumps(metrics, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
         .encode("utf-8")

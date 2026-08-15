@@ -938,6 +938,16 @@ def _add_real_run_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--judge-deviation-ack",
+        action="store_true",
+        help=(
+            "acknowledge that the configured judge is NOT the pre-registered one. "
+            "The design doc names a manual fallback judge, so this is allowed - "
+            "but it must be deliberate, and the deviation is recorded in the run "
+            "manifest alongside both model names"
+        ),
+    )
+    parser.add_argument(
         "--m3-labels",
         type=Path,
         default=None,
@@ -983,6 +993,7 @@ def _run_real(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         top_k=args.top_k,
         m3_labels=args.m3_labels,
         judge_prompt_via=args.judge_prompt_via,
+        judge_deviation_ack=args.judge_deviation_ack,
     )
     metrics = real_run.execute(config, progress=print)
 
