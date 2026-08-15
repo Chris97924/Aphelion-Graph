@@ -650,6 +650,94 @@ def test_subjectless_claims_still_take_the_free_text_fallback() -> None:
     )
 
 
+def _structured_session(index: int, text: str, subject: str, value: str) -> Session:
+    return Session(
+        id=f"s{index}",
+        text=text,
+        metadata={
+            "occurred_at": f"2023-0{index}-01T00:00:00Z",
+            linker_mod.STRUCTURED_KEY: {text: {"subject": subject, "value": value}},
+        },
+    )
+
+
+@pytest.mark.unit
+def test_a_revert_then_a_reworded_update_still_mints_an_edge() -> None:
+    """A -> B -> A -> B' : the head maps must stay in lockstep through the revert.
+
+    A revert advances which lineage stands on the subject. If the map recording
+    the standing VALUE is not advanced with it, the next differently-worded claim
+    at the superseded value reads as a restatement of a lineage that has already
+    been superseded: no edge is minted, and Arm C goes on surfacing A while B' is
+    current — the stale-value leak Arm C exists to prevent.
+    """
+    subject = "user/score"
+    linker = linker_mod.SharedLinker("q")
+    linker(_structured_session(1, "score is A", subject, "A"))
+    linker(_structured_session(2, "score is B", subject, "B"))
+    # The revert re-uses session 1's exact wording, which is what routes it
+    # through _revert_lineage rather than through a fresh structured lineage.
+    linker(_structured_session(3, "score is A", subject, "A"))
+    linker(_structured_session(4, "the score reads B now", subject, "B"))
+
+    assert linker.stats.subjects == 1
+    assert linker.stats.supersedes_edges == 3, "A->B, B->A, A->B' are all updates"
+
+    final = linker.claims[-1]
+    assert final.metadata["object"] == "B"
+    assert final.metadata.get("supersedes"), "the reworded B must supersede the revert"
+    # The head really is the newest claim, not the one the revert displaced.
+    assert linker._head_by_subject[subject] == final.metadata["claim_id"]
+    # Claims carry a copy of the frontmatter, so this compares by value.
+    assert linker._head_meta_by_subject[subject] == final.metadata
+
+
+@pytest.mark.unit
+def test_a_revert_keeps_the_two_head_maps_consistent() -> None:
+    """The invariant directly, at every step, not only at the end."""
+    subject = "user/score"
+    linker = linker_mod.SharedLinker("q")
+    for index, (text, value) in enumerate(
+        [("v is A", "A"), ("v is B", "B"), ("v is A", "A")], start=1
+    ):
+        linker(_structured_session(index, text, subject, value))
+        assert (
+            linker._head_meta_by_subject[subject]["claim_id"]
+            == linker._head_by_subject[subject]
+        ), "the two head maps disagreed"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("metadata_value", [[], "", 0, ["x"], "text", {"a": 1}.keys()])
+def test_present_but_malformed_structured_metadata_is_refused(
+    metadata_value,
+) -> None:
+    """Falsey malformed values must not read as "absent" and slide to the fallback.
+
+    ``or {}`` turned ``[]`` into "no structured claims", which silently restored
+    the free-text policy that produced 243 lineages and zero edges.
+    """
+    linker = linker_mod.SharedLinker("q")
+    with pytest.raises(TypeError, match=linker_mod.STRUCTURED_KEY):
+        linker(
+            Session(
+                id="s",
+                text="a claim",
+                metadata={linker_mod.STRUCTURED_KEY: metadata_value},
+            )
+        )
+
+
+@pytest.mark.unit
+def test_an_absent_structured_key_is_still_the_legitimate_fallback() -> None:
+    """Absence is how the stub extractor asks for the free-text path."""
+    linker = linker_mod.SharedLinker("q")
+    claims = linker(Session(id="s", text="user: my best is 22:00", metadata={}))
+    assert claims[0].metadata["subject"] == linker_mod.default_subject_policy(
+        "user: my best is 22:00"
+    )
+
+
 @pytest.mark.unit
 def test_malformed_structured_metadata_is_refused_not_ignored() -> None:
     """Falling back silently would restore the 243/243 behaviour it replaced."""
@@ -680,11 +768,103 @@ def test_the_structured_extraction_rubric_asks_for_what_the_linker_needs() -> No
 
 
 @pytest.mark.unit
-def test_code_fences_and_blank_lines_around_the_payload_are_tolerated() -> None:
-    """A fenced answer is still a correct answer; the fence carries no claim."""
+@pytest.mark.parametrize("fence", ["```", "```json", "```JSON", "```jsonl"])
+def test_standalone_code_fences_and_blank_lines_are_tolerated(fence: str) -> None:
+    """A fenced answer is still a correct answer; a bare delimiter carries no claim."""
     line = json.dumps({"text": "t", "subject": "s", "value": "v"})
-    claims = clients.extracted_claims(f"```json\n{line}\n\n```")
+    claims = clients.extracted_claims(f"{fence}\n{line}\n\n```")
     assert len(claims) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "line",
+    [
+        '```json {"text": "t", "subject": "s", "value": "v"}',
+        '```{"text": "t", "subject": "s", "value": "v"}',
+        "``` not a delimiter",
+        "```json trailing words",
+    ],
+)
+def test_a_fence_prefixed_line_carrying_content_is_not_silently_dropped(
+    line: str,
+) -> None:
+    """Only a STANDALONE delimiter is scaffolding.
+
+    Skipping anything that merely starts with a fence would make a claim vanish
+    with no error, and the reduced extraction would then be cached for every arm
+    — the precise loss the fail-loud policy exists to prevent.
+    """
+    with pytest.raises(clients.ExtractionFormatError, match="fence"):
+        clients.extracted_claims(line)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "extra", [{"confidence": 0.9}, {"session_id": "s1"}, {"Text": "dup"}]
+)
+def test_unknown_fields_on_a_claim_line_fail_loud(extra: dict) -> None:
+    """Schema drift must not be quietly trimmed to the three fields we recognise."""
+    record = {"text": "t", "subject": "s", "value": "v", **extra}
+    with pytest.raises(clients.ExtractionFormatError, match="unexpected field"):
+        clients.extracted_claims(json.dumps(record))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("missing", "match"),
+    [("api", "api"), ("template_kwargs", "template_kwargs")],
+)
+def test_a_structured_pin_must_state_its_dialect_and_template_switches(
+    missing: str, match: str
+) -> None:
+    """A defaulted template switch fails only later, as an empty completion.
+
+    By then the answering stage has already been entered and the operator is
+    debugging the model rather than the pin.
+    """
+    pin = {
+        "model": "m",
+        "endpoint": "http://h:1/v1",
+        "api": clients.API_CHAT_COMPLETIONS,
+        "template_kwargs": {"enable_thinking": False},
+    }
+    pin.pop(missing)
+    with pytest.raises(clients.PinParseError, match=match):
+        clients.parse_chat_pin(pin, temperature=0.0, seed=1)
+
+
+@pytest.mark.unit
+def test_an_empty_template_kwargs_object_is_a_statement_not_an_omission() -> None:
+    """An endpoint that needs no switch says so; a missing key does not."""
+    chat_pin = clients.parse_chat_pin(
+        {
+            "model": "m",
+            "endpoint": "http://h:1/v1",
+            "api": clients.API_CHAT_COMPLETIONS,
+            "template_kwargs": {},
+        },
+        temperature=0.0,
+        seed=1,
+    )
+    assert chat_pin.template_kwargs == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["131072", 1.5, True, []])
+def test_a_non_integer_max_model_len_is_refused(bad) -> None:
+    with pytest.raises(clients.PinParseError, match="max_model_len"):
+        clients.parse_chat_pin(
+            {
+                "model": "m",
+                "endpoint": "http://h:1/v1",
+                "api": clients.API_CHAT_COMPLETIONS,
+                "template_kwargs": {},
+                "max_model_len": bad,
+            },
+            temperature=0.0,
+            seed=1,
+        )
 
 
 @pytest.mark.unit

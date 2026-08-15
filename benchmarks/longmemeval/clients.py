@@ -304,7 +304,23 @@ def parse_chat_pin(value: Any, *, temperature: float, seed: int) -> ChatPin:
             f"{ALLOWED_SCHEMES}"
         )
 
-    template_kwargs = value.get("template_kwargs", {})
+    # ``api`` and ``template_kwargs`` are required rather than defaulted. A pin
+    # that omitted the template switch would be accepted here and then fail much
+    # later as an empty completion — after the answering stage had already been
+    # entered — and the operator would be debugging the model rather than the
+    # pin. An endpoint that genuinely needs no switch says so with an empty
+    # object, which is a statement; a missing key is not.
+    for required in ("api", "template_kwargs"):
+        if required not in value:
+            raise PinParseError(
+                f"pinned chat model {model!r} carries no {required!r}. A structured "
+                "pin states its dialect and its template switches explicitly: "
+                "defaulting them would let a pin run under settings the "
+                "pre-registration never recorded, and a missing template switch "
+                "surfaces only as an empty completion much later."
+            )
+
+    template_kwargs = value["template_kwargs"]
     if not isinstance(template_kwargs, dict):
         raise PinParseError(
             f"pinned template_kwargs must be an object, got {template_kwargs!r}"
@@ -313,6 +329,14 @@ def parse_chat_pin(value: Any, *, temperature: float, seed: int) -> ChatPin:
     if upstream is not None and not isinstance(upstream, str):
         raise PinParseError(f"pinned upstream_model must be a string, got {upstream!r}")
 
+    max_model_len = value.get("max_model_len")
+    if max_model_len is not None and (
+        isinstance(max_model_len, bool) or not isinstance(max_model_len, int)
+    ):
+        raise PinParseError(
+            f"pinned max_model_len must be an int, got {max_model_len!r}"
+        )
+
     return ChatPin(
         pin=ModelPin(
             model=model.strip(),
@@ -320,10 +344,10 @@ def parse_chat_pin(value: Any, *, temperature: float, seed: int) -> ChatPin:
             temperature=temperature,
             seed=seed,
         ),
-        api=str(value.get("api", API_CHAT_COMPLETIONS)),
+        api=str(value["api"]),
         upstream_model=upstream,
         template_kwargs=dict(template_kwargs),
-        max_model_len=value.get("max_model_len"),
+        max_model_len=max_model_len,
     )
 
 
@@ -841,6 +865,14 @@ EXTRACT_STRUCTURED_SYSTEM_PROMPT = (
 )
 
 
+# The pinned claim shape. Exactly these three fields — no more, no fewer.
+CLAIM_FIELDS: tuple[str, ...] = ("text", "subject", "value")
+
+# A standalone code-fence delimiter: three backticks, optionally a language tag,
+# and nothing else on the line. Only these are scaffolding.
+_FENCE_DELIMITER_RE = re.compile(r"```[A-Za-z0-9_+-]*")
+
+
 class ExtractionFormatError(ValueError):
     """The extractor returned a line that is not a well-formed structured claim.
 
@@ -875,8 +907,18 @@ def extracted_claims(completion: str) -> list[StructuredClaim]:
     claims: list[StructuredClaim] = []
     for raw in completion.split("\n"):
         line = raw.strip()
-        if not line or line.startswith("```"):
+        if not line or _FENCE_DELIMITER_RE.fullmatch(line):
             continue
+        if line.startswith("```"):
+            # A fence with a claim on the same line is not scaffolding, it is a
+            # malformed claim. Skipping any line that merely *starts* with a
+            # fence would drop it silently, and the reduced extraction would be
+            # cached for every arm — the exact loss the fail-loud policy exists
+            # to prevent.
+            raise ExtractionFormatError(
+                f"extractor line opens a code fence but carries content: "
+                f"{line[:160]!r}. Only a standalone fence delimiter is scaffolding."
+            )
         try:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
@@ -887,8 +929,18 @@ def extracted_claims(completion: str) -> list[StructuredClaim]:
             raise ExtractionFormatError(
                 f"extractor line is not a JSON object: {line[:160]!r}"
             )
+        unexpected = sorted(set(record) - set(CLAIM_FIELDS))
+        if unexpected:
+            # Schema drift fails loud for the same reason a malformed line does:
+            # an extra field means the model answered a contract this harness did
+            # not pin, and quietly keeping the three fields it recognises would
+            # cache that mismatch as if it were the agreed shape.
+            raise ExtractionFormatError(
+                f"extractor line carries unexpected field(s) {unexpected}; the "
+                f"pinned claim shape is exactly {list(CLAIM_FIELDS)}: {line[:160]!r}"
+            )
         fields = {}
-        for name in ("text", "subject", "value"):
+        for name in CLAIM_FIELDS:
             field_value = record.get(name)
             if not isinstance(field_value, str) or not field_value.strip():
                 raise ExtractionFormatError(

@@ -231,7 +231,14 @@ class SharedLinker:
         one shared linker over the same sessions.
         """
         occurred_at = session.metadata.get(self._occurred_at_key)
-        structured = session.metadata.get(STRUCTURED_KEY) or {}
+        # Absent is a legitimate state (the mechanical stub extractor supplies
+        # nothing and must keep taking the free-text path); present-but-unusable
+        # is not. Testing membership rather than truthiness is what keeps the two
+        # apart: ``or {}`` turned a malformed ``[]`` into "absent" and slid the
+        # run back onto the policy that produced 243 lineages and no edges.
+        structured: Any = {}
+        if STRUCTURED_KEY in session.metadata:
+            structured = session.metadata[STRUCTURED_KEY]
         if not isinstance(structured, Mapping):
             # Raised rather than ignored. Falling back to the free-text policy
             # would silently restore the very behaviour structured extraction
@@ -298,6 +305,21 @@ class SharedLinker:
         self._meta_by_body[body] = meta
         return Claim(id=record_id, text=line, metadata=dict(meta))
 
+    def _set_head(self, subject: str, meta: dict[str, Any]) -> None:
+        """Advance a subject's head — both maps, always together.
+
+        ``_head_by_subject`` answers "which lineage stands here" and
+        ``_head_meta_by_subject`` answers "at what value". They are two views of
+        one fact, and a transition that moved only the first left the second
+        describing a lineage that had already been superseded: the next
+        differently-worded claim at that stale value would then read as a
+        restatement of it, mint no edge, and leave Arm C surfacing a value the
+        corpus had already moved past. Every transition goes through here so the
+        two cannot drift.
+        """
+        self._head_by_subject[subject] = meta["claim_id"]
+        self._head_meta_by_subject[subject] = meta
+
     def _revert_lineage(
         self, prior: dict[str, Any], occurred_at: object
     ) -> dict[str, Any]:
@@ -330,7 +352,7 @@ class SharedLinker:
 
         self._supersedes_edges += 1
         self._updated_subjects.add(subject)
-        self._head_by_subject[subject] = meta["claim_id"]
+        self._set_head(subject, meta)
         return meta
 
     def _new_lineage(
@@ -382,7 +404,7 @@ class SharedLinker:
                 meta["valid_from"] = occurred_at
             self._supersedes_edges += 1
             self._updated_subjects.add(subject)
-        self._head_by_subject[subject] = claim_id
+        self._set_head(subject, meta)
         return meta
 
     def _structured_lineage(
@@ -442,8 +464,7 @@ class SharedLinker:
             self._supersedes_edges += 1
             self._updated_subjects.add(subject)
 
-        self._head_by_subject[subject] = claim_id
-        self._head_meta_by_subject[subject] = meta
+        self._set_head(subject, meta)
         return meta
 
     # -- reporting ----------------------------------------------------------
