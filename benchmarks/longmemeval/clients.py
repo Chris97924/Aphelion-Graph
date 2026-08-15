@@ -203,7 +203,16 @@ def parse_cli_pin(value: str, *, temperature: float, seed: int) -> CliPin:
     # The transport is the command up to the first parenthetical or clause
     # separator, so "(subscription)" and ", fallback ..." stay out of argv.
     transport = remainder.split("(")[0].split(",")[0].strip()
-    argv = tuple(shlex.split(transport))
+    try:
+        argv = tuple(shlex.split(transport))
+    except ValueError as exc:
+        # Unbalanced quoting in the pinned command. Converted at the pin boundary
+        # like every other unreadable pin, so the caller sees "this pin cannot be
+        # read" rather than a bare tokenizer error from three frames down.
+        raise PinParseError(
+            f"pinned model {value!r} has an unreadable command {transport!r} "
+            f"({exc})."
+        ) from exc
     if not argv:
         raise PinParseError(
             f"pinned model {value!r} names no command to run after "
@@ -861,7 +870,8 @@ EXTRACT_STRUCTURED_SYSTEM_PROMPT = (
     "Keep it short and verbatim; do not normalise units or spell out numbers. "
     "When a claim states something with no distinct value, repeat the essential "
     "predicate as the value.\n"
-    "One line per claim, in the order the facts appear."
+    "Output each claim as a SINGLE-LINE JSON object, in the order the facts "
+    "appear. Do not pretty-print and do not indent across lines."
 )
 
 
@@ -895,39 +905,62 @@ class StructuredClaim:
     value: str
 
 
+def _strip_fence_delimiters(completion: str) -> str:
+    """Drop standalone code-fence delimiter lines, keeping everything else.
+
+    A model that wraps correct output in a fence has still answered correctly, so
+    a line that is *only* a delimiter carries no claim and is removed. A fence
+    with content on the same line is left in place deliberately: it is malformed,
+    and the parser below will refuse it rather than let a claim vanish.
+    """
+    return "\n".join(
+        line
+        for line in completion.split("\n")
+        if not _FENCE_DELIMITER_RE.fullmatch(line.strip())
+    )
+
+
 def extracted_claims(completion: str) -> list[StructuredClaim]:
     """Parse a structured-extraction completion into claims, strictly.
 
-    Blank lines and bare code-fence delimiters are skipped: they carry no claim,
-    and a model that wraps its output in a fence has still answered correctly.
-    Anything else that is not a JSON object with three non-empty string fields
-    raises :class:`ExtractionFormatError` — see that class for why a malformed
-    line may not simply be dropped.
+    The completion is read as a **stream of JSON objects**, not as one object per
+    line. The pinned model is deterministic per input but not uniform across
+    inputs: for some sessions it emits exactly one object per line, and for others
+    it pretty-prints the same objects across several lines. Both are the agreed
+    payload — only the whitespace differs — so a line-oriented reader rejected
+    valid output, and no prompt wording closes a layout difference that varies
+    with the input rather than with the instruction.
+
+    Whitespace between objects is skipped; **anything else between or after them
+    is not**. Strictness is unchanged where it matters: the schema is still
+    exactly :data:`CLAIM_FIELDS`, unknown fields still raise, a non-object still
+    raises, and a completion carrying no claims at all still raises rather than
+    returning an empty list — see :class:`ExtractionFormatError` for why a lost
+    claim may not be salvaged into silence.
     """
+    payload = _strip_fence_delimiters(completion)
+    decoder = json.JSONDecoder()
     claims: list[StructuredClaim] = []
-    for raw in completion.split("\n"):
-        line = raw.strip()
-        if not line or _FENCE_DELIMITER_RE.fullmatch(line):
-            continue
-        if line.startswith("```"):
-            # A fence with a claim on the same line is not scaffolding, it is a
-            # malformed claim. Skipping any line that merely *starts* with a
-            # fence would drop it silently, and the reduced extraction would be
-            # cached for every arm — the exact loss the fail-loud policy exists
-            # to prevent.
-            raise ExtractionFormatError(
-                f"extractor line opens a code fence but carries content: "
-                f"{line[:160]!r}. Only a standalone fence delimiter is scaffolding."
-            )
+    index, length = 0, len(payload)
+
+    while True:
+        while index < length and payload[index].isspace():
+            index += 1
+        if index >= length:
+            break
+
         try:
-            record = json.loads(line)
+            record, index = decoder.raw_decode(payload, index)
         except json.JSONDecodeError as exc:
             raise ExtractionFormatError(
-                f"extractor line is not JSON ({exc}): {line[:160]!r}"
+                f"extractor output is not a stream of JSON objects ({exc}) at "
+                f"offset {index}: {payload[index : index + 160]!r}"
             ) from exc
+
         if not isinstance(record, dict):
             raise ExtractionFormatError(
-                f"extractor line is not a JSON object: {line[:160]!r}"
+                f"extractor emitted a {type(record).__name__} where a claim object "
+                f"was expected: {record!r}"
             )
         unexpected = sorted(set(record) - set(CLAIM_FIELDS))
         if unexpected:
@@ -936,18 +969,25 @@ def extracted_claims(completion: str) -> list[StructuredClaim]:
             # not pin, and quietly keeping the three fields it recognises would
             # cache that mismatch as if it were the agreed shape.
             raise ExtractionFormatError(
-                f"extractor line carries unexpected field(s) {unexpected}; the "
-                f"pinned claim shape is exactly {list(CLAIM_FIELDS)}: {line[:160]!r}"
+                f"extractor claim carries unexpected field(s) {unexpected}; the "
+                f"pinned claim shape is exactly {list(CLAIM_FIELDS)}: {record!r}"
             )
         fields = {}
         for name in CLAIM_FIELDS:
             field_value = record.get(name)
             if not isinstance(field_value, str) or not field_value.strip():
                 raise ExtractionFormatError(
-                    f"extractor line has no usable {name!r}: {line[:160]!r}"
+                    f"extractor claim has no usable {name!r}: {record!r}"
                 )
             fields[name] = " ".join(field_value.split())
         claims.append(StructuredClaim(**fields))
+
+    if not claims:
+        raise ExtractionFormatError(
+            "the extractor returned no claims at all. An empty result is not "
+            "scored as a session with nothing to remember: it is indistinguishable "
+            "from one, and the difference would be memoised for every arm."
+        )
     return claims
 
 
