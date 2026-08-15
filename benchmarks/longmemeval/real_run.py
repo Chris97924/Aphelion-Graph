@@ -49,6 +49,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -73,13 +74,17 @@ from benchmarks.longmemeval.pipeline import (
     ArmResult,
     BlindSlot,
     Claim,
+    GatePinError,
+    JudgeVerdictError,
     MemoryStore,
+    MissingArmError,
     ModelPin,
     PipelineConfig,
     QAItem,
     Retriever,
     Session,
     StageBinding,
+    UnrecordedPinsError,
     blind_batch_order,
     build_extractor,
     pinned_seed,
@@ -150,6 +155,16 @@ class RunManifestMismatchError(ValueError):
     """
 
 
+class CorruptRowError(ValueError):
+    """A durable row was terminated but unparseable — corruption, not a tear.
+
+    An interrupted write can only ever damage the *last* row, and only by
+    truncating it before its newline. Anything else means the file was damaged
+    by something this harness does not model, so it stops rather than skipping
+    rows and reporting a run over silently fewer questions.
+    """
+
+
 class MissingAnswerError(ValueError):
     """The judging phase reached a candidate no arm had answered.
 
@@ -175,29 +190,80 @@ class VerdictReplayError(ValueError):
 # ---------------------------------------------------------------------------
 
 
+def _complete_rows(raw: bytes) -> tuple[list[dict], int]:
+    """Parse whole rows out of ``raw``; return them and the byte offset they end at.
+
+    Bytes, not text, all the way through. A process killed mid-``write`` can tear
+    the file in the middle of a UTF-8 sequence, and decoding the whole file first
+    would raise :class:`UnicodeDecodeError` before any tolerance for a torn row
+    could apply — turning a recoverable tear into an unreadable run.
+
+    The returned offset is the end of the last row that parsed, which is where an
+    append may safely resume from. Anything after it is residue.
+    """
+    rows: list[dict] = []
+    offset = 0
+    position = 0
+    for chunk in raw.split(b"\n"):
+        start, position = position, position + len(chunk) + 1
+        if not chunk.strip():
+            # A blank line carries no row, but it is still complete input: an
+            # append may resume after it.
+            if position <= len(raw):
+                offset = min(position, len(raw))
+            continue
+        if position > len(raw):
+            # The final chunk had no terminating newline, so the writer did not
+            # finish it. Torn, by definition.
+            break
+        try:
+            rows.append(json.loads(chunk.decode("utf-8")))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # A row that is terminated but unparseable is corruption in the
+            # middle of the file, not an interrupted write. Surfaced by the
+            # callers below rather than skipped.
+            raise CorruptRowError(
+                f"row ending at byte {position} is terminated but does not parse; "
+                f"first bytes: {chunk[:80]!r}. A complete-but-unparseable row is "
+                "corruption, not an interrupted write, and is never skipped."
+            ) from None
+        offset = position
+    return rows, offset
+
+
 def read_jsonl(path: Path) -> list[dict]:
     """Read durable rows, tolerating one torn row at the end of the file.
 
-    A run killed mid-``write`` can leave a partial final line. Dropping *only* a
-    trailing unparseable line is safe — that work is simply redone, because every
-    phase re-derives what is missing — while an unparseable line anywhere else is
-    corruption that must not be silently skipped.
+    Dropping *only* an unterminated final row is safe — that work is simply
+    redone, because every phase re-derives what is missing — while a terminated
+    row that does not parse is corruption that must not be silently skipped.
     """
     if not path.is_file():
         return []
-    rows: list[dict] = []
-    lines = path.read_text(encoding="utf-8").split("\n")
-    for index, line in enumerate(lines):
-        if not line.strip():
-            continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            remaining = [rest for rest in lines[index + 1 :] if rest.strip()]
-            if remaining:
-                raise
-            break
-    return rows
+    return _complete_rows(path.read_bytes())[0]
+
+
+def repair_jsonl(path: Path) -> int:
+    """Truncate any torn trailing row, returning the number of bytes dropped.
+
+    Reading tolerantly is not enough on its own: the writer appends with ``ab``,
+    so a torn row left in place would have the next row concatenated onto it and
+    become a *permanently* unparseable row in the middle of the file — at which
+    point the tolerance above correctly refuses to read it and the run is stuck.
+    The residue therefore has to go before anything appends, which is why this
+    runs once per durable file at the start of every run.
+    """
+    if not path.is_file():
+        return 0
+    raw = path.read_bytes()
+    _, offset = _complete_rows(raw)
+    dropped = len(raw) - offset
+    if dropped:
+        with path.open("r+b") as handle:
+            handle.truncate(offset)
+            handle.flush()
+            os.fsync(handle.fileno())
+    return dropped
 
 
 class JsonlWriter:
@@ -207,11 +273,15 @@ class JsonlWriter:
     tens of thousands against model calls measured in seconds, so the cost is
     noise, and the property bought — an interrupted run never loses completed
     model work — is the entire reason this run is resumable.
+
+    The file is repaired on construction, so an append can never land on top of a
+    torn row (see :func:`repair_jsonl`).
     """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.repaired_bytes = repair_jsonl(path)
 
     def append(self, row: Mapping[str, Any]) -> None:
         line = json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n"
@@ -564,7 +634,12 @@ def git_provenance(root: Path = REPO_ROOT) -> dict[str, Any]:
             timeout=30,
         )
         dirty = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain"],
+            # Untracked files are excluded deliberately: a run writes its own
+            # durable output under the repo by default, so counting untracked
+            # files would report every run as dirty and say nothing about the
+            # code. Uncommitted edits to code that matters are caught precisely
+            # by :func:`harness_digest`.
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
             capture_output=True,
             check=False,
             timeout=30,
@@ -606,6 +681,7 @@ def build_manifest(
 ) -> dict[str, Any]:
     """The run's provenance record: what ran, against what, under which pins."""
     preregister = json.loads(cfg.preregister_path.read_text(encoding="utf-8"))
+    git = git_provenance()
     return {
         "benchmark": preregister.get("benchmark"),
         "mode": "real",
@@ -620,7 +696,10 @@ def build_manifest(
             cfg.split_manifest_path.read_text(encoding="utf-8")
         ),
         "corpus_source_sha256": split_manifest.get("source_sha256", {}),
+        "corpus_loaded_sha256": corpus_digests(cfg),
         "corpus_data_dir": str(cfg.directory()),
+        "m3_labels_path": str(cfg.m3_labels) if cfg.m3_labels else None,
+        "m3_labels_sha256": file_digest(cfg.m3_labels),
         "haystack": cfg.haystack,
         "split": cfg.split,
         "limit": cfg.limit,
@@ -629,15 +708,91 @@ def build_manifest(
         "query_time": PINNED_QUERY_TIME.isoformat(),
         "retriever_params": dict(retriever_params),
         "question_count": len(specs),
-        "questions_sha256": _sha256_text(
-            "\n".join(spec.question_id for spec in specs)
-        ),
-        "git": git_provenance(),
+        "questions_sha256": questions_digest(specs),
+        "harness_sha256": harness_digest(),
+        "git_sha": git.get("sha"),
+        "git_dirty": git.get("dirty"),
+        "git": git,
     }
 
 
+def file_digest(path: Path | None) -> str | None:
+    """Hex SHA-256 of a file's bytes, or ``None`` when there is no file."""
+    if path is None or not Path(path).is_file():
+        return None
+    return corpus.sha256_file(Path(path))
+
+
+def corpus_digests(cfg: RealRunConfig) -> dict[str, str | None]:
+    """Digest every corpus file this run actually reads.
+
+    ``split_manifest.json``'s own ``source_sha256`` records what the *split* was
+    frozen over, which is not the same claim: a run can point ``--data-dir`` at a
+    different directory whose files carry the same question ids. Hashing what was
+    loaded is what ties the results to the bytes they came from.
+    """
+    directory = cfg.directory()
+    names = [corpus.ORACLE_FILENAME]
+    if cfg.haystack == HAYSTACK_S:
+        names.append(corpus.S_CLEANED_FILENAME)
+    return {name: file_digest(directory / name) for name in names}
+
+
+def questions_digest(specs: Sequence[QuestionSpec]) -> str:
+    """Digest the run's questions by content, not just by id.
+
+    Ids alone would let a corpus swap that preserved question ids resume onto
+    rows answered against different text. The session ids are folded in too, so a
+    haystack that changed underneath a resume is caught even where the question
+    and gold answer did not move.
+    """
+    return _sha256_text(
+        "\n".join(
+            "\t".join(
+                [
+                    spec.question_id,
+                    spec.split,
+                    spec.question,
+                    spec.gold,
+                    ",".join(session.id for session in spec.sessions),
+                ]
+            )
+            for spec in specs
+        )
+    )
+
+
+# The source trees whose contents decide what a run produces: the harness itself
+# and the aphelion package Arm C's machinery lives in.
+_HARNESS_ROOTS = (
+    Path(__file__).resolve().parent,
+    REPO_ROOT / "src" / "aphelion",
+)
+
+
+def harness_digest(roots: Sequence[Path] = _HARNESS_ROOTS) -> str:
+    """Digest the code that decides what the arms do.
+
+    A git sha alone is not code identity — uncommitted edits move behaviour
+    without moving the sha, and an untracked new module is invisible to it — so
+    the resume check hashes the actual source that produces the results. This is
+    the precise form of the guard: an edit to an unrelated file elsewhere in the
+    repo does not block a resume, and an edit to an arm does.
+    """
+    digest = hashlib.sha256()
+    for root in roots:
+        for path in sorted(Path(root).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            digest.update(path.name.encode("utf-8"))
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 # The manifest fields that define what a run *is*. A resume whose shape differs
-# on any of them is a different experiment sharing an output directory.
+# on any of them is a different experiment sharing an output directory: the rows
+# already on disk were produced under one set of these, and rows appended after a
+# change would be produced under another, with nothing in the results to say so.
 _IDENTITY_FIELDS = (
     "arms",
     "pins",
@@ -648,6 +803,15 @@ _IDENTITY_FIELDS = (
     "seed",
     "question_count",
     "questions_sha256",
+    # Content identity: the frozen inputs and the code that consumes them.
+    "harness_sha256",
+    "git_sha",
+    "git_dirty",
+    "preregister_sha256",
+    "split_manifest_sha256",
+    "corpus_loaded_sha256",
+    "corpus_data_dir",
+    "m3_labels_sha256",
 )
 
 
@@ -863,13 +1027,17 @@ def judge_blind(
     the position the pinned shuffle put it, so an interruption cannot change what
     the judge saw next.
     """
+    order = blind_slots(specs, seed)
     verdicts_out = JsonlWriter(cfg.out_dir / VERDICTS_NAME)
+    rows = read_jsonl(cfg.out_dir / VERDICTS_NAME)
+    verify_verdict_prefix(rows, order, specs)
+    judge_record = judge_identity(judge_client)
+    for row in rows:
+        verify_verdict_judge(row, judge_record)
     recorded: dict[tuple[str, str], dict] = {
-        (row["arm"], row["question_id"]): row
-        for row in read_jsonl(cfg.out_dir / VERDICTS_NAME)
+        (row["arm"], row["question_id"]): row for row in rows
     }
 
-    order = blind_slots(specs, seed)
     for position, slot in enumerate(order):
         spec = specs[slot.question_index]
         key = (slot.arm, spec.question_id)
@@ -893,15 +1061,127 @@ def judge_blind(
             "question_id": spec.question_id,
             "question_index": slot.question_index,
             "batch_position": position,
-            "verdict": bool(verdict),
+            "verdict": strict_verdict(verdict, arm=slot.arm, question_id=spec.question_id),
             "payload_sha256": payload_digest(spec.question, spec.gold, candidate),
+            "prompt_sha256": _sha256_text(
+                clients.judge_prompt(spec.question, spec.gold, candidate)
+            ),
             "judged_at": datetime.now(timezone.utc).isoformat(),
+            **judge_record,
         }
         verdicts_out.append(row)
         recorded[key] = row
         progress(f"  [{position + 1}/{len(order)}] judged {spec.question_id}")
 
     return recorded
+
+
+def strict_verdict(verdict: Any, *, arm: str, question_id: str) -> bool:
+    """Accept a judge result only if it is genuinely ``True`` or ``False``.
+
+    ``bool(verdict)`` is not a safe read here and never was: a judge adapter that
+    returned the *string* ``"INCORRECT"`` would coerce to ``True`` and be recorded
+    as a correct answer, while ``None`` would coerce to ``False`` and be recorded
+    as a wrong one. Both then travel into M1's gate and the AG tripwire as
+    measurements. ``pipeline.build_judge`` refuses the same coercion for exactly
+    this reason; the durable judging phase does not go through it, so it has to
+    make the check itself.
+    """
+    if verdict is True or verdict is False:
+        return verdict
+    raise JudgeVerdictError(
+        f"the judge returned {type(verdict).__name__} ({verdict!r}) for arm "
+        f"{arm!r} question {question_id!r}; a verdict must be a bool. This is not "
+        "coerced: a truthy 'INCORRECT' would be recorded as a correct answer and "
+        "a None as a wrong one, and both would enter M1 as measurements."
+    )
+
+
+def judge_identity(judge_client: Any) -> dict[str, Any]:
+    """The judge fields stamped onto every verdict row.
+
+    A verdict row carrying only a payload digest and a boolean can be replayed by
+    *any* judge that saw the same payload — including a different model, or the
+    pinned model reached a different way — and the results would still attribute
+    it to the pinned judge. Recording the identity next to the verdict is what
+    makes that attributable.
+
+    A client that cannot name its model raises rather than stamping ``null``:
+    nulls would compare equal to each other on resume, so the check would pass
+    while attributing the verdicts to nothing at all — the failure this record
+    exists to prevent, wearing the shape of a green check.
+    """
+    pin = getattr(judge_client, "pin", None)
+    model = getattr(pin, "model", None)
+    if not isinstance(model, str) or not model.strip():
+        raise UnrecordedPinsError(
+            f"{type(judge_client).__name__} exposes no judge pin, so its verdicts "
+            "could not record which model produced them. Give the judge client a "
+            "'pin' (a ModelPin) — every verdict has to be attributable to a model "
+            "for the results to be auditable against preregister.json."
+        )
+    return {
+        "judge_model": model,
+        "judge_endpoint": getattr(pin, "endpoint", None),
+        "judge_prompt_via": getattr(judge_client, "prompt_via", None),
+    }
+
+
+def verify_verdict_judge(row: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
+    """Refuse verdicts produced by a judge other than the one now configured."""
+    actual = {key: row.get(key) for key in expected}
+    if actual != dict(expected):
+        raise VerdictReplayError(
+            f"the recorded verdict for arm {row.get('arm')!r} question "
+            f"{row.get('question_id')!r} was produced by {actual}, but this run is "
+            f"configured with {dict(expected)}. Verdicts from two judges in one "
+            "blind batch would be reported under a single judge pin; start a new "
+            "--out-dir, or restore the judge the batch was begun with."
+        )
+
+
+def verify_verdict_prefix(
+    rows: Sequence[Mapping[str, Any]],
+    order: Sequence[BlindSlot],
+    specs: Sequence[QuestionSpec],
+) -> None:
+    """Require the recorded verdicts to be exactly positions 0..k-1 of the shuffle.
+
+    Keying resume on ``(arm, question_id)`` alone would let a file with a *hole* —
+    a missing middle verdict, however it arose — resume by judging that one slot
+    last, out of its pinned position. The replay pass would then still accept the
+    stream, because every payload digest matches its own row. Requiring the
+    recorded rows to be a strict prefix of the recomputed order is what makes the
+    blind batch's ordering a checked property of the durable file rather than of
+    the process that happened to write it.
+    """
+    if not rows:
+        return
+    positions = [row.get("batch_position") for row in rows]
+    expected = list(range(len(rows)))
+    if sorted(position for position in positions if isinstance(position, int)) != expected:
+        missing = sorted(set(expected) - {p for p in positions if isinstance(p, int)})
+        raise VerdictReplayError(
+            f"the recorded verdicts are not a prefix of the pinned blind batch: "
+            f"{len(rows)} rows should occupy positions 0..{len(rows) - 1} but "
+            f"{missing or 'duplicate/absent positions'} are missing. Resuming would "
+            "judge the gap out of its pinned position, so the batch order would no "
+            "longer be the one the seed fixes (design doc §6.1 guard 1)."
+        )
+
+    by_position = {row["batch_position"]: row for row in rows}
+    for position in expected:
+        row = by_position[position]
+        slot = order[position]
+        spec = specs[slot.question_index]
+        if (row.get("arm"), row.get("question_id")) != (slot.arm, spec.question_id):
+            raise VerdictReplayError(
+                f"the verdict recorded at batch position {position} is arm "
+                f"{row.get('arm')!r} question {row.get('question_id')!r}, but the "
+                f"pinned shuffle puts arm {slot.arm!r} question "
+                f"{spec.question_id!r} there. The durable stream and the canonical "
+                "order disagree."
+            )
 
 
 def replay_judge(
@@ -951,7 +1231,9 @@ def replay_judge(
                 "The verdict stream and the pinned blind order disagree; scoring "
                 "would attribute verdicts to the wrong answers."
             )
-        return bool(row["verdict"])
+        return strict_verdict(
+            row["verdict"], arm=slot.arm, question_id=spec.question_id
+        )
 
     return judge
 
@@ -959,6 +1241,162 @@ def replay_judge(
 # ---------------------------------------------------------------------------
 # Phase 3 — metrics
 # ---------------------------------------------------------------------------
+
+
+def _gate_number(text: str, pattern: str, metric: str, path: Path) -> float:
+    """Pull one frozen number out of a pinned gate string.
+
+    The §4 thresholds are prose in ``preregister.json`` and are parsed there
+    rather than re-declared in Python, exactly as the metric modules do, so a
+    pinned value and the code enforcing it cannot drift apart. A parse failure
+    raises :class:`GatePinError` rather than falling back to a constant: scoring
+    a run against a gate the pre-registration does not carry is worse than
+    stopping (design doc §6.1 guard 3).
+    """
+    match = re.search(pattern, text)
+    if match is None:
+        raise GatePinError(
+            f"{path}: pinned {metric} gate {text!r} does not carry a number "
+            f"matching {pattern!r}. This harness enforces the pinned shape and "
+            "will not guess a threshold; re-read the pin (design doc §4) and "
+            "update the parser deliberately."
+        )
+    return float(match.group(1))
+
+
+def m2_gate_verdict(
+    f1: Mapping[str, float], path: Path = PREREGISTER_PATH
+) -> dict[str, Any]:
+    """The pinned M2 gate: ``C.F1 > A.F1 + 0.10 AND C.F1 >= B.F1 - epsilon``.
+
+    Both arms of the conjunction are reported separately, because §8's M2-fail
+    row diagnoses them differently: failing the first means dedup is not working
+    at all, while failing the second means the naive control beats the machinery
+    and points at the identity projection.
+    """
+    record = preregistered_metric("M2", path)
+    gate = str(record.get("gate", ""))
+    margin = _gate_number(gate, r"A\.F1\s*\+\s*([\d.]+)", "M2", path)
+    epsilon = record.get("epsilon")
+    if not isinstance(epsilon, (int, float)) or isinstance(epsilon, bool):
+        raise GatePinError(
+            f"{path}: pinned M2 'epsilon' must be a number, got {epsilon!r}."
+        )
+
+    missing = sorted({"A", "B", "C"} - set(f1))
+    if missing:
+        raise MissingArmError(
+            f"M2's pinned gate names arms A, B and C; {missing} are absent from "
+            f"{sorted(f1)}. Every §4 gate is a comparison."
+        )
+
+    clears_floor = f1["C"] > f1["A"] + margin
+    holds_control = f1["C"] >= f1["B"] - float(epsilon)
+    return {
+        "gate": gate,
+        "margin": margin,
+        "epsilon": float(epsilon),
+        "clears_a_plus_margin": clears_floor,
+        "not_below_b_minus_epsilon": holds_control,
+        "verdict": clears_floor and holds_control,
+    }
+
+
+def m3_gate_verdict(
+    rate: Mapping[str, float],
+    readability: Mapping[str, Any],
+    n_scored: int,
+    path: Path = PREREGISTER_PATH,
+) -> dict[str, Any]:
+    """The pinned M3 gate ``C <= 0.5 * A``, read only when the sign test allows.
+
+    The pre-registration is explicit that the ratio is scale-free and therefore
+    says nothing about whether a verdict is *readable*: at ``p >= alpha`` over the
+    paired A-only / C-only discordances, M3 is **INCONCLUSIVE — neither pass nor
+    fail** — and must neither fire §8's state-machine demotion nor count toward
+    §8's All-pass row. That is a pre-registered rule, so it is enforced here
+    rather than left to whoever reads the numbers.
+    """
+    record = preregistered_metric("M3", path)
+    gate = str(record.get("gate", ""))
+    ratio = _gate_number(gate, r"C\s*<=\s*([\d.]+)\s*\*\s*A", "M3", path)
+    pinned_n = record.get("N")
+
+    missing = sorted({"A", "C"} - set(rate))
+    if missing:
+        raise MissingArmError(
+            f"M3's pinned gate names arms A and C; {missing} are absent from "
+            f"{sorted(rate)}."
+        )
+
+    inconclusive = bool(readability.get("inconclusive"))
+    n_matches_pin = n_scored == pinned_n
+    if inconclusive:
+        status, verdict = "INCONCLUSIVE", None
+    elif not n_matches_pin:
+        status, verdict = "UNDERPOWERED", None
+    else:
+        verdict = rate["C"] <= ratio * rate["A"]
+        status = "PASS" if verdict else "FAIL"
+
+    return {
+        "gate": gate,
+        "ratio": ratio,
+        "n": n_scored,
+        "pinned_n": pinned_n,
+        "n_matches_pin": n_matches_pin,
+        "status": status,
+        "verdict": verdict,
+        "fires_s8_demotion": status == "FAIL",
+        "counts_toward_all_pass": status == "PASS",
+    }
+
+
+def m3_denominator_ids(
+    split_manifest: Mapping[str, Any], path: Path = PREREGISTER_PATH
+) -> tuple[list[str], int | None]:
+    """The knowledge-update ids M3 is defined over, and the pinned denominator.
+
+    Derived structurally — the KU pool minus its abstention (``_abs``) variants —
+    rather than by transcribing the six ids out of the pin's prose, because the
+    pin states the *rule* ("the 6 KU ``_abs`` variants ... encode no old→new
+    update, so no stale-value label can exist for them") and a transcribed list
+    would silently rot if the split ever moved. The pinned ``N`` is returned
+    alongside so callers can report whether the derivation actually lands on it.
+    """
+    ku = [str(qid) for qid in split_manifest.get("question_ids", {}).get("ku", [])]
+    ids = sorted(qid for qid in ku if not qid.endswith("_abs"))
+    record = preregistered_metric("M3", path)
+    pinned_n = record.get("N")
+    return ids, pinned_n if isinstance(pinned_n, int) else None
+
+
+class M3LabelError(ValueError):
+    """The supplied stale-value labels are not the pinned M3 sample.
+
+    The label file's keys *are* M3's denominator, so an unchecked file silently
+    redefines the metric: a cherry-picked subset would report an official-looking
+    contamination rate over whichever questions the labeller found convenient,
+    and an over-broad one would score questions the pin excludes. Neither is
+    detectable from the resulting number.
+    """
+
+
+def validate_m3_labels(
+    labels: Mapping[str, Sequence[str]], expected_ids: Sequence[str]
+) -> None:
+    """Require the label keyset to be exactly M3's pinned denominator."""
+    extra = sorted(set(labels) - set(expected_ids))
+    missing = sorted(set(expected_ids) - set(labels))
+    if extra or missing:
+        raise M3LabelError(
+            "the --m3-labels keyset is not M3's pinned denominator "
+            f"({len(expected_ids)} non-abstention knowledge-update questions). "
+            f"Missing {len(missing)}: {missing[:8]}. Unexpected {len(extra)}: "
+            f"{extra[:8]}. The label file's keys define what M3 measures, so a "
+            "partial or over-broad file would report a rate over a sample the "
+            "pre-registration does not carry."
+        )
 
 
 def sign_test_p(b: int, c: int) -> float:
@@ -1015,6 +1453,7 @@ def adversarial_diagnostic(
     indices: Sequence[int],
     question_ids: Sequence[str],
     path: Path,
+    answers: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The AG bias-guard tripwire and the response tier its breach mandates.
 
@@ -1023,10 +1462,14 @@ def adversarial_diagnostic(
     single differing question — and at N = 20 producing it costs nothing, so the
     results carry the evidence whether or not the tripwire fired.
     """
+    answers = answers or {}
     record = preregistered_metric("AG", path)
     response = record.get("breach_response", {})
     tier1 = float(response.get("tier1_pp", 5.0))
     tier2 = float(response.get("tier2_pp", 10.0))
+    tripwire_pp = _gate_number(
+        str(record.get("gate", "")), r"([+-]?\d+(?:\.\d+)?)\s*pp", "AG", path
+    )
 
     treatment = [verdicts["C"][index] for index in indices]
     control = [verdicts["B"][index] for index in indices]
@@ -1037,6 +1480,7 @@ def adversarial_diagnostic(
         {
             "question_id": question_ids[index],
             "winner": "C" if verdicts["C"][index] else "B",
+            **context_diff(question_ids[index], answers),
         }
         for index in indices
         if verdicts["C"][index] != verdicts["B"][index]
@@ -1052,6 +1496,8 @@ def adversarial_diagnostic(
     return {
         "gate": record.get("gate"),
         "gating": record.get("gating"),
+        "tripwire_pp": tripwire_pp,
+        "tripwire_breached": delta_pp > tripwire_pp,
         "n": n,
         "correct": {"B": sum(control), "C": sum(treatment)},
         "delta_pp": delta_pp,
@@ -1059,6 +1505,40 @@ def adversarial_diagnostic(
         "tier2_pp": tier2,
         "response_tier": tier,
         "discordant": discordant,
+        "mandated_response": response.get(tier) if tier != "none" else None,
+    }
+
+
+def context_diff(
+    question_id: str, answers: Mapping[tuple[str, str], Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Arm B's retrieved context against Arm C's, for one discordant question.
+
+    The pinned Tier 1 response is not "list the discordant questions" — it is to
+    *diff each one's Arm B vs Arm C retrieved context and record all findings in
+    the results*. That diff is what could show arm identity leaking into the
+    pipeline, so the ids and the bodies both travel: ids alone cannot be read
+    without re-deriving the claims, and by then the run is over.
+    """
+    b_row = answers.get((question_id, "B"), {})
+    c_row = answers.get((question_id, "C"), {})
+    b_ids = list(b_row.get("retrieved_ids", []))
+    c_ids = list(c_row.get("retrieved_ids", []))
+    b_text = dict(zip(b_ids, b_row.get("retrieved_texts", [])))
+    c_text = dict(zip(c_ids, c_row.get("retrieved_texts", [])))
+
+    b_only = [claim_id for claim_id in b_ids if claim_id not in set(c_ids)]
+    c_only = [claim_id for claim_id in c_ids if claim_id not in set(b_ids)]
+    return {
+        "prediction": {"B": b_row.get("prediction"), "C": c_row.get("prediction")},
+        "retrieved_ids": {"B": b_ids, "C": c_ids},
+        "context_only_in_b": [
+            {"id": claim_id, "text": b_text.get(claim_id)} for claim_id in b_only
+        ],
+        "context_only_in_c": [
+            {"id": claim_id, "text": c_text.get(claim_id)} for claim_id in c_only
+        ],
+        "context_identical": b_ids == c_ids,
     }
 
 
@@ -1110,6 +1590,7 @@ def compute_metrics(
     scored: Mapping[str, ArmResult],
     phase: AnswerPhase,
     claim_rows: Sequence[Mapping[str, Any]],
+    split_manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Reduce the run's durable rows to the §4 metrics.
 
@@ -1146,33 +1627,71 @@ def compute_metrics(
         )
 
     # -- M2 ---------------------------------------------------------------
-    # Labeled pairs are derived from the shared linker's claims pooled across
-    # questions, which is what surfaces the cross-lineage restatements M2's
-    # 2026-07-19 annotation makes the §8 diagnosis check first.
-    linked = [
-        Claim(id=claim["id"], text=claim["text"], metadata=claim["metadata"])
+    # Ground truth and predictions must live in the SAME universe. Each arm's
+    # store is per-question, so a labeled pair whose two claims come from
+    # different questions is unreachable for every arm by construction: pooling
+    # the ground truth across questions and scoring it against per-question
+    # clusters would charge all three arms an identical mass of false negatives
+    # that measures the harness's own scoping, not the memory layer. M2 is
+    # therefore scored on within-question pairs, and the cross-question pairs are
+    # reported alongside rather than dropped — they are exactly the linker
+    # lineage-fragmentation signal design doc §8's M2-fail row must inspect
+    # before blaming the identity projection.
+    claims_by_question = {
+        row["question_id"]: [
+            Claim(id=claim["id"], text=claim["text"], metadata=claim["metadata"])
+            for claim in row["claims"]
+        ]
         for row in claim_rows
-        for claim in row["claims"]
+    }
+    per_question = [
+        labeled_pairs.labeled_pairs_from_claims(claims)
+        for claims in claims_by_question.values()
     ]
-    labeled = labeled_pairs.labeled_pairs_from_claims(linked)
+    scored_pairs: set[frozenset] = set()
+    within_lineage: set[frozenset] = set()
+    for labeled_set in per_question:
+        scored_pairs |= set(labeled_set.pairs)
+        within_lineage |= set(labeled_set.within_lineage)
+
+    pooled = labeled_pairs.labeled_pairs_from_claims(
+        claim for claims in claims_by_question.values() for claim in claims
+    )
+    cross_question = set(pooled.pairs) - scored_pairs
+
     arm_clusters: dict[str, list[list[str]]] = {arm: [] for arm in ARM_STORES}
     for row in answer_rows:
         arm_clusters[row["arm"]].extend(row["clusters"])
     m2_scores = {
-        arm: m2_dedup.score_arm(labeled.pairs, clusters)
+        arm: m2_dedup.score_arm(scored_pairs, clusters)
         for arm, clusters in sorted(arm_clusters.items())
     }
+    f1 = {arm: score.f1 for arm, score in m2_scores.items()}
     metrics["m2"] = {
-        "f1": {arm: score.f1 for arm, score in m2_scores.items()},
+        "f1": f1,
         "precision": {arm: score.precision for arm, score in m2_scores.items()},
         "recall": {arm: score.recall for arm, score in m2_scores.items()},
-        "labeled_pairs": labeled.as_record(),
-        "labeled_pairs_derivation": labeled.derivation,
+        "scored_pairs": len(scored_pairs),
+        "scored_within_lineage": len(within_lineage),
+        "scored_cross_lineage": len(scored_pairs) - len(within_lineage),
+        "cross_question_pairs_excluded": len(cross_question),
+        "pooled_labeled_pairs": pooled.as_record(),
+        "labeled_pairs_derivation": pooled.derivation,
+        "scoring_universe": (
+            "within-question exact restatements only: each arm's store is "
+            "per-question, so a cross-question pair is unreachable for every arm "
+            "and scoring it would add an arm-independent false-negative mass. The "
+            "excluded count is reported for the §8 M2-fail lineage-fragmentation "
+            "check."
+        ),
+        "gate": m2_gate_verdict(f1, path),
     }
 
     # -- M3 ---------------------------------------------------------------
     labels = load_m3_labels(cfg.m3_labels)
     if labels:
+        expected_ids, pinned_n = m3_denominator_ids(split_manifest, path)
+        validate_m3_labels(labels, expected_ids)
         contexts: dict[str, dict[str, list[str]]] = {arm: {} for arm in ARM_STORES}
         for row in answer_rows:
             if row["question_id"] in labels:
@@ -1183,12 +1702,18 @@ def compute_metrics(
         }
         contaminated = {arm: set(score.contaminated_ids) for arm, score in scores.items()}
         labelled_ids = sorted(set(labels) & set(question_ids))
+        readability = m3_readability(contaminated, labelled_ids, path)
+        rate = {arm: score.rate for arm, score in scores.items()}
         metrics["m3"] = {
-            "rate": {arm: score.rate for arm, score in scores.items()},
+            "rate": rate,
             "contaminated": {arm: score.contaminated for arm, score in scores.items()},
             "total": {arm: score.total for arm, score in scores.items()},
-            "readability": m3_readability(contaminated, labelled_ids, path),
+            "readability": readability,
+            "gate": m3_gate_verdict(rate, readability, len(labelled_ids), path),
+            "denominator_ids": len(expected_ids),
+            "denominator_matches_pin": len(expected_ids) == pinned_n,
             "labels_source": str(cfg.m3_labels),
+            "labels_sha256": file_digest(cfg.m3_labels),
         }
     else:
         metrics["m3"] = None
@@ -1230,7 +1755,7 @@ def compute_metrics(
     adv_indices = by_split.get(SPLIT_KEYS["adv"], [])
     if adv_indices and {"B", "C"} <= set(verdicts):
         metrics["ag"] = adversarial_diagnostic(
-            verdicts, adv_indices, question_ids, path
+            verdicts, adv_indices, question_ids, path, answers=phase.rows
         )
     else:
         metrics["ag"] = None
@@ -1238,6 +1763,29 @@ def compute_metrics(
             "no adversarial questions in this slice; the AG tripwire is defined "
             "over the 20-question adversarial set (design doc §6 guard 4)."
         )
+
+    # -- M1/M3 trust standing ---------------------------------------------
+    # Design doc §6 guard 4 makes the Tier 2 leakage investigation a
+    # *precondition* on trusting M1 and M3, not a note to read afterwards. A run
+    # that finished cleanly and printed its M1 number would be read as a result,
+    # so the blocked state is recorded as a machine-readable flag next to the
+    # numbers it blocks rather than left to the reader to remember.
+    ag = metrics["ag"]
+    if ag and ag["response_tier"] == "tier2":
+        metrics["m1_m3_trust"] = "blocked_pending_ag_investigation"
+        metrics["m1_m3_trust_reason"] = (
+            f"AG C-B is {ag['delta_pp']}pp, at or above the pinned Tier 2 "
+            f"threshold of {ag['tier2_pp']}pp. Design doc §6 guard 4 requires the "
+            "full leakage investigation to be COMPLETED before M1 and M3 are "
+            "trusted: at N=20 an adversarial gain this large means the machinery "
+            "is winning where it structurally cannot help, which points at arm "
+            "identity leaking into the pipeline. The M1/M3 numbers below are "
+            "reported but must not be read as results until that investigation "
+            "closes. Every discordant question's Arm B vs Arm C retrieved context "
+            "is enumerated in metrics.ag.discordant."
+        )
+    else:
+        metrics["m1_m3_trust"] = "ok"
 
     # -- linker recall ----------------------------------------------------
     metrics["linker"] = LinkerStats.total(
@@ -1309,6 +1857,15 @@ def execute(
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     seed = pinned_seed(cfg.preregister_path)
     split_manifest = load_split(cfg.split_manifest_path)
+
+    # Repair before anything reads or appends. A row torn by an interrupted write
+    # has to be truncated rather than merely tolerated: the writers append, so
+    # residue left in place would have the next row concatenated onto it and
+    # become permanently unparseable in the middle of the file.
+    for name in (EXTRACTIONS_NAME, CLAIMS_NAME, ANSWERS_NAME, VERDICTS_NAME):
+        dropped = repair_jsonl(cfg.out_dir / name)
+        if dropped:
+            progress(f"repaired {name}: dropped {dropped} torn byte(s)")
 
     specs = load_questions(
         split=cfg.split,
@@ -1409,6 +1966,7 @@ def execute(
         scored=scored,
         phase=phase,
         claim_rows=read_jsonl(cfg.out_dir / CLAIMS_NAME),
+        split_manifest=split_manifest,
     )
     metrics["manifest"] = {
         key: manifest.get(key) for key in ("pins", "haystack", "split", "git")

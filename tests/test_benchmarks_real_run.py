@@ -29,19 +29,32 @@ import types
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import pytest
 
 from benchmarks.longmemeval import clients, corpus, real_run
 from benchmarks.longmemeval.arms import ARM_STORES
 from benchmarks.longmemeval.pipeline import (
+    GatePinError,
     JudgeVerdictError,
+    MissingArmError,
     ModelPin,
+    Session,
+    UnrecordedPinsError,
     blind_batch_order,
     pinned_seed,
     preregistered,
 )
+
+
+def _rewrite(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    """Rewrite a durable file from ``rows`` — the tamper helper for the guards."""
+    path.write_bytes(
+        "".join(
+            json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n" for row in rows
+        ).encode("utf-8")
+    )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SAMPLES_ROOT = _REPO_ROOT / "samples"
@@ -536,12 +549,19 @@ class FakeChat:
 
 
 class FakeJudge:
-    """A blind judge that records exactly what it was shown, in order."""
+    """A blind judge that records exactly what it was shown, in order.
+
+    It carries the real pinned identity, because that identity is stamped onto
+    every verdict row: a fake without one would exercise a code path the real
+    client never takes.
+    """
 
     def __init__(self) -> None:
         self.seen: list[tuple[str, str, str]] = []
         self.fail_after: int | None = None
         self.fallback_model = "stub-fallback"
+        self.pin = clients.judge_pin().pin
+        self.prompt_via = clients.PROMPT_VIA_STDIN
 
     def verdict(self, question: str, gold: str, candidate_answer: str) -> bool:
         if self.fail_after is not None and len(self.seen) >= self.fail_after:
@@ -967,9 +987,10 @@ def test_read_jsonl_tolerates_one_torn_final_row(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_a_corrupt_row_in_the_middle_is_not_skipped(tmp_path: Path) -> None:
+    """A terminated but unparseable row is corruption, not an interrupted write."""
     path = tmp_path / "rows.jsonl"
     path.write_bytes(b'{"a": 1}\n{"b": \n{"c": 3}\n')
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(real_run.CorruptRowError):
         real_run.read_jsonl(path)
 
 
@@ -1036,9 +1057,16 @@ def test_m3_is_reported_as_not_computed_rather_than_zero(
 def test_m3_is_scored_when_stale_value_labels_are_supplied(
     tmp_path: Path, corpus_dir: Path, split_path: Path
 ) -> None:
-    """With labels in hand the pinned readability test is reported alongside."""
+    """With labels in hand the pinned readability test and gate are reported.
+
+    The label file must cover M3's whole pinned denominator - every
+    non-abstention knowledge-update question in the split - so the fixture
+    supplies both.
+    """
     labels = tmp_path / "m3.json"
-    labels.write_text(json.dumps({"ku-one": ["24:30"]}), encoding="utf-8")
+    labels.write_text(
+        json.dumps({"ku-one": ["24:30"], "ku-two": ["61"]}), encoding="utf-8"
+    )
     cfg = _config(tmp_path, corpus_dir, split_path, m3_labels=labels)
 
     metrics = real_run.execute(
@@ -1050,6 +1078,20 @@ def test_m3_is_scored_when_stale_value_labels_are_supplied(
     assert readability["n"] == readability["b_a_only"] + readability["c_c_only"]
     assert 0.0 <= readability["p_value"] <= 1.0
     assert metrics["m3"]["labels_source"] == str(labels)
+    assert metrics["m3"]["labels_sha256"] is not None
+
+    # Arm A keeps the stale 24:30 claim; Arm C suppresses it. That is M3's whole
+    # subject, so the fixture must show the arms separating on it.
+    assert metrics["m3"]["contaminated"]["A"] > metrics["m3"]["contaminated"]["C"]
+
+    # The fixture split is 2 questions, not the pinned 72, so the ratio is not
+    # read as a verdict - the same refusal M1 makes away from its pinned N.
+    gate = metrics["m3"]["gate"]
+    assert gate["n_matches_pin"] is False
+    assert gate["verdict"] is None
+    assert gate["status"] in {"INCONCLUSIVE", "UNDERPOWERED"}
+    assert gate["fires_s8_demotion"] is False
+    assert metrics["m3"]["denominator_matches_pin"] is False
 
 
 @pytest.mark.unit
@@ -1093,6 +1135,459 @@ def test_a_pins_only_config_cannot_run_a_stage() -> None:
         config.judge.call("q", "g", "c", pin=_CLI_PIN.pin)
     with pytest.raises(AssertionError, match="RealExtractor"):
         config.extractor.call(None, pin=_PIN)
+
+
+# --------------------------------------------------------------------------- #
+# Gate r1 — resume identity, durability, verdict typing, pinned gates          #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param("harness", id="arm_code_edited"),
+        pytest.param("preregister", id="preregister_edited"),
+        pytest.param("corpus", id="corpus_swapped_same_ids"),
+        pytest.param("labels", id="m3_labels_swapped"),
+        pytest.param("data_dir", id="data_dir_moved"),
+    ],
+)
+def test_resume_is_refused_when_the_run_is_no_longer_the_same_experiment(
+    tmp_path: Path,
+    corpus_dir: Path,
+    split_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate: str,
+) -> None:
+    """Same question ids is not the same run.
+
+    Every one of these leaves the (question_id, arm) resume keys intact, so the
+    old and new rows would mix silently: a manifest that only fingerprints the
+    ids would reconcile cleanly and the results would describe two experiments.
+    """
+    labels = tmp_path / "m3.json"
+    labels.write_text(
+        json.dumps({"ku-one": ["24:30"], "ku-two": ["61"]}), encoding="utf-8"
+    )
+    cfg = _config(tmp_path, corpus_dir, split_path, m3_labels=labels)
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+
+    resumed = cfg
+    if mutate == "harness":
+        monkeypatch.setattr(real_run, "harness_digest", lambda *args, **kw: "0" * 64)
+    elif mutate == "preregister":
+        forged = tmp_path / "preregister.json"
+        forged.write_text(
+            real_run.PREREGISTER_PATH.read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
+        resumed = _config(
+            tmp_path, corpus_dir, split_path, m3_labels=labels, preregister_path=forged
+        )
+    elif mutate == "corpus":
+        body = json.loads(
+            (corpus_dir / corpus.ORACLE_FILENAME).read_text(encoding="utf-8")
+        )
+        body[0]["answer"] = "a different gold answer"
+        (corpus_dir / corpus.ORACLE_FILENAME).write_text(
+            json.dumps(body, ensure_ascii=False), encoding="utf-8"
+        )
+    elif mutate == "labels":
+        labels.write_text(
+            json.dumps({"ku-one": ["99:99"], "ku-two": ["61"]}), encoding="utf-8"
+        )
+    elif mutate == "data_dir":
+        moved = tmp_path / "data-copy"
+        moved.mkdir()
+        for name in (corpus.ORACLE_FILENAME, corpus.S_CLEANED_FILENAME):
+            (moved / name).write_bytes((corpus_dir / name).read_bytes())
+        resumed = _config(tmp_path, moved, split_path, m3_labels=labels)
+
+    with pytest.raises(real_run.RunManifestMismatchError):
+        real_run.execute(
+            resumed, client_factory=_factory([]), judge_client=FakeJudge()
+        )
+
+
+@pytest.mark.unit
+def test_the_harness_digest_tracks_code_not_just_commits(tmp_path: Path) -> None:
+    """A git sha cannot see an uncommitted edit or an untracked new module."""
+    root = tmp_path / "pkg"
+    root.mkdir()
+    (root / "arm.py").write_text("VALUE = 1\n", encoding="utf-8")
+    before = real_run.harness_digest([root])
+
+    (root / "arm.py").write_text("VALUE = 2\n", encoding="utf-8")
+    assert real_run.harness_digest([root]) != before
+
+    (root / "arm.py").write_text("VALUE = 1\n", encoding="utf-8")
+    assert real_run.harness_digest([root]) == before
+
+    (root / "extra.py").write_text("", encoding="utf-8")
+    assert real_run.harness_digest([root]) != before
+
+
+@pytest.mark.unit
+def test_the_questions_digest_covers_content_not_only_ids() -> None:
+    """A corpus swap that preserved ids must not reconcile as the same run."""
+    base = real_run.QuestionSpec(
+        question_id="q1", split="ku", question="Q?", gold="A", sessions=()
+    )
+    assert real_run.questions_digest([base]) != real_run.questions_digest(
+        [real_run.QuestionSpec(**{**vars(base), "gold": "B"})]
+    )
+    assert real_run.questions_digest([base]) != real_run.questions_digest(
+        [real_run.QuestionSpec(**{**vars(base), "question": "different?"})]
+    )
+    session = Session(id="s1", text="body", metadata={})
+    assert real_run.questions_digest([base]) != real_run.questions_digest(
+        [real_run.QuestionSpec(**{**vars(base), "sessions": (session,)})]
+    )
+
+
+@pytest.mark.unit
+def test_a_torn_row_is_truncated_before_the_next_append(tmp_path: Path) -> None:
+    """Tolerating a tear is not enough — appending onto it corrupts the file.
+
+    Without the truncate, the next row is concatenated onto the residue and
+    becomes a permanently unparseable row in the MIDDLE of the file, which the
+    reader then correctly refuses, leaving the run unresumable.
+    """
+    path = tmp_path / "rows.jsonl"
+    path.write_bytes(b'{"a": 1}\n{"b": 2}\n{"c": ')
+
+    writer = real_run.JsonlWriter(path)
+    assert writer.repaired_bytes == len(b'{"c": ')
+    writer.append({"d": 4})
+
+    assert real_run.read_jsonl(path) == [{"a": 1}, {"b": 2}, {"d": 4}]
+    assert path.read_bytes().endswith(b'{"d": 4}\n')
+
+
+@pytest.mark.unit
+def test_a_tear_inside_a_multibyte_character_is_a_torn_row_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    """Decoding the whole file first would raise before any tolerance applied."""
+    path = tmp_path / "rows.jsonl"
+    complete = json.dumps({"a": "ok"}).encode("utf-8") + b"\n"
+    path.write_bytes(complete + '{"b": "中'.encode("utf-8")[:-1])
+
+    assert real_run.read_jsonl(path) == [{"a": "ok"}]
+    assert real_run.repair_jsonl(path) > 0
+    assert path.read_bytes() == complete
+
+
+@pytest.mark.unit
+def test_repairing_a_clean_file_changes_nothing(tmp_path: Path) -> None:
+    path = tmp_path / "rows.jsonl"
+    path.write_bytes(b'{"a": 1}\n{"b": 2}\n')
+    assert real_run.repair_jsonl(path) == 0
+    assert real_run.repair_jsonl(tmp_path / "absent.jsonl") == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("verdict", ["INCORRECT", "CORRECT", None, 1, 0, "", "false"])
+def test_a_non_bool_verdict_is_never_coerced(verdict: Any) -> None:
+    """bool('INCORRECT') is True and bool(None) is False — both are measurements.
+
+    A judge adapter returning either would push a fabricated verdict into M1's
+    gate and the AG tripwire, which is precisely the coercion pipeline.py's
+    build_judge refuses. The durable judging phase does not go through it, so it
+    makes the same refusal itself.
+    """
+    with pytest.raises(JudgeVerdictError):
+        real_run.strict_verdict(verdict, arm="C", question_id="q1")
+
+
+@pytest.mark.unit
+def test_real_bools_pass_through_strict_verdict() -> None:
+    assert real_run.strict_verdict(True, arm="A", question_id="q") is True
+    assert real_run.strict_verdict(False, arm="A", question_id="q") is False
+
+
+@pytest.mark.integration
+def test_a_string_verdict_from_the_judge_stops_the_run(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """End to end: no verdicts.jsonl row is written from an untyped verdict."""
+
+    class StringJudge(FakeJudge):
+        def verdict(self, question: str, gold: str, candidate_answer: str) -> bool:
+            return "INCORRECT"  # type: ignore[return-value]
+
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    with pytest.raises(JudgeVerdictError):
+        real_run.execute(
+            cfg, client_factory=_factory([]), judge_client=StringJudge()
+        )
+    assert real_run.read_jsonl(cfg.out_dir / real_run.VERDICTS_NAME) == []
+
+
+@pytest.mark.integration
+def test_a_hole_in_the_verdict_stream_is_refused(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Resume must continue the shuffle, not backfill a gap out of position.
+
+    Keying only on (arm, question_id) would let the missing slot be judged last,
+    and every payload digest would still match its own row, so the replay pass
+    alone cannot catch it.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+
+    path = cfg.out_dir / real_run.VERDICTS_NAME
+    rows = [row for row in real_run.read_jsonl(path) if row["batch_position"] != 3]
+    _rewrite(path, rows)
+
+    with pytest.raises(real_run.VerdictReplayError, match="not a prefix"):
+        real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+
+
+@pytest.mark.integration
+def test_a_reordered_verdict_stream_is_refused(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+
+    path = cfg.out_dir / real_run.VERDICTS_NAME
+    rows = real_run.read_jsonl(path)
+    other = next(arm for arm in sorted(ARM_STORES) if arm != rows[0]["arm"])
+    rows[0]["arm"] = other
+    _rewrite(path, rows)
+
+    with pytest.raises(real_run.VerdictReplayError, match="batch position 0"):
+        real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+
+
+@pytest.mark.integration
+def test_verdicts_from_another_judge_are_refused(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Identical payloads replay cleanly — the judge identity is what separates them.
+
+    Without it, a verdicts file produced by the fallback judge (or by the pinned
+    model reached another way) would be reported under the pinned judge's pin.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+
+    path = cfg.out_dir / real_run.VERDICTS_NAME
+    rows = real_run.read_jsonl(path)
+    assert rows[0]["judge_model"] == clients.judge_pin().pin.model
+    assert rows[0]["prompt_sha256"]
+    for row in rows:
+        row["judge_model"] = "some-other-judge"
+    _rewrite(path, rows)
+
+    with pytest.raises(real_run.VerdictReplayError, match="produced by"):
+        real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+
+
+@pytest.mark.unit
+def test_a_judge_that_cannot_name_its_model_is_refused() -> None:
+    """Stamping nulls would make the resume check pass while attributing nothing.
+
+    Two null identities compare equal, so a degraded record would read as a
+    verified one — worse than having no record at all.
+    """
+
+    class NamelessJudge:
+        def verdict(self, question: str, gold: str, candidate: str) -> bool:
+            return True
+
+    with pytest.raises(UnrecordedPinsError, match="no judge pin"):
+        real_run.judge_identity(NamelessJudge())
+
+    identity = real_run.judge_identity(FakeJudge())
+    assert identity["judge_model"] == clients.judge_pin().pin.model
+    assert identity["judge_prompt_via"] == clients.PROMPT_VIA_STDIN
+
+
+@pytest.mark.unit
+def test_the_m2_gate_is_read_from_the_pin_with_both_arms_reported() -> None:
+    """C must clear A by the pinned margin AND not regress below B by epsilon."""
+    pinned = json.loads(real_run.PREREGISTER_PATH.read_text(encoding="utf-8"))
+    epsilon = pinned["metrics"]["M2"]["epsilon"]
+
+    passing = real_run.m2_gate_verdict({"A": 0.0, "B": 0.90, "C": 0.95})
+    assert passing["epsilon"] == epsilon
+    assert passing["verdict"] is True
+
+    # The false-positive trap the pinned second arm exists to catch: C clears
+    # A + margin while being catastrophically worse than the naive control.
+    trap = real_run.m2_gate_verdict({"A": 0.0, "B": 0.90, "C": 0.11})
+    assert trap["clears_a_plus_margin"] is True
+    assert trap["not_below_b_minus_epsilon"] is False
+    assert trap["verdict"] is False
+
+    with pytest.raises(MissingArmError):
+        real_run.m2_gate_verdict({"A": 0.1, "C": 0.5})
+
+
+@pytest.mark.unit
+def test_the_m3_gate_is_not_read_when_the_sign_test_says_unreadable() -> None:
+    """p >= alpha is INCONCLUSIVE: it must not fire §8's demotion branch."""
+    unreadable = real_run.m3_gate_verdict(
+        {"A": 0.5, "C": 0.0}, {"inconclusive": True}, 72
+    )
+    assert unreadable["status"] == "INCONCLUSIVE"
+    assert unreadable["verdict"] is None
+    assert unreadable["fires_s8_demotion"] is False
+    assert unreadable["counts_toward_all_pass"] is False
+
+    passing = real_run.m3_gate_verdict(
+        {"A": 0.50, "C": 0.20}, {"inconclusive": False}, 72
+    )
+    assert passing["ratio"] == 0.5
+    assert passing["verdict"] is True
+    assert passing["counts_toward_all_pass"] is True
+
+    failing = real_run.m3_gate_verdict(
+        {"A": 0.50, "C": 0.40}, {"inconclusive": False}, 72
+    )
+    assert failing["verdict"] is False
+    assert failing["fires_s8_demotion"] is True
+
+
+@pytest.mark.unit
+def test_an_unparseable_pinned_gate_stops_rather_than_guessing() -> None:
+    with pytest.raises(GatePinError):
+        real_run._gate_number("no numbers here", r"([\d.]+)x", "M2", real_run.PREREGISTER_PATH)
+
+
+@pytest.mark.unit
+def test_m3_labels_must_be_exactly_the_pinned_denominator() -> None:
+    """The label file's keys ARE M3's sample, so a partial file redefines it."""
+    expected = ["a", "b", "c"]
+    real_run.validate_m3_labels({"a": ["1"], "b": ["2"], "c": ["3"]}, expected)
+
+    with pytest.raises(real_run.M3LabelError, match="Missing 1"):
+        real_run.validate_m3_labels({"a": ["1"], "b": ["2"]}, expected)
+    with pytest.raises(real_run.M3LabelError, match="Unexpected 1"):
+        real_run.validate_m3_labels(
+            {"a": ["1"], "b": ["2"], "c": ["3"], "d": ["4"]}, expected
+        )
+
+
+@pytest.mark.unit
+def test_the_m3_denominator_excludes_abstention_variants() -> None:
+    """The 6 _abs variants encode no old->new update, so no label can exist."""
+    manifest = {"question_ids": {"ku": ["a", "b_abs", "c", "d_abs"]}}
+    ids, pinned_n = real_run.m3_denominator_ids(manifest)
+    assert ids == ["a", "c"]
+    assert pinned_n == json.loads(
+        real_run.PREREGISTER_PATH.read_text(encoding="utf-8")
+    )["metrics"]["M3"]["N"]
+
+
+@pytest.mark.unit
+def test_the_real_split_manifest_derives_the_pinned_72() -> None:
+    """The structural rule must land on the pin's own number on the real split."""
+    ids, pinned_n = real_run.m3_denominator_ids(real_run.load_split())
+    assert len(ids) == pinned_n == 72
+    assert not any(qid.endswith("_abs") for qid in ids)
+
+
+@pytest.mark.unit
+def test_the_adversarial_diff_records_each_discordance_context() -> None:
+    """Pinned Tier 1 is a context DIFF per discordant question, not a list of ids."""
+    answers = {
+        ("q0", "B"): {
+            "prediction": "stale",
+            "retrieved_ids": ["c1", "c2"],
+            "retrieved_texts": ["old value", "shared"],
+        },
+        ("q0", "C"): {
+            "prediction": "fresh",
+            "retrieved_ids": ["c2"],
+            "retrieved_texts": ["shared"],
+        },
+    }
+    report = real_run.adversarial_diagnostic(
+        {"B": [False], "C": [True]}, [0], ["q0"], real_run.PREREGISTER_PATH, answers
+    )
+    diff = report["discordant"][0]
+
+    assert diff["winner"] == "C"
+    assert diff["context_only_in_b"] == [{"id": "c1", "text": "old value"}]
+    assert diff["context_only_in_c"] == []
+    assert diff["context_identical"] is False
+    assert diff["prediction"] == {"B": "stale", "C": "fresh"}
+
+
+@pytest.mark.unit
+def test_a_tier2_adversarial_breach_blocks_m1_m3_trust() -> None:
+    """§6 guard 4 makes the investigation a precondition, not an afterthought."""
+    verdicts = {"B": [False] * 10, "C": [True] * 10}
+    report = real_run.adversarial_diagnostic(
+        verdicts, list(range(10)), [f"q{i}" for i in range(10)],
+        real_run.PREREGISTER_PATH,
+    )
+    assert report["response_tier"] == "tier2"
+    assert report["tripwire_breached"] is True
+    assert report["mandated_response"]
+
+
+@pytest.mark.integration
+def test_the_run_flags_blocked_trust_on_a_tier2_breach(
+    tmp_path: Path, corpus_dir: Path, split_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blocked run must not finish looking clean."""
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+    clean = json.loads(
+        (cfg.out_dir / real_run.METRICS_NAME).read_text(encoding="utf-8")
+    )
+    assert clean["m1_m3_trust"] == "ok"
+
+    real_diagnostic = real_run.adversarial_diagnostic
+
+    def breaching(*args: Any, **kwargs: Any):
+        report = real_diagnostic(*args, **kwargs)
+        return {**report, "response_tier": "tier2", "delta_pp": 25.0}
+
+    monkeypatch.setattr(real_run, "adversarial_diagnostic", breaching)
+    breached = _config(tmp_path / "second", corpus_dir, split_path)
+    metrics = real_run.execute(
+        breached, client_factory=_factory([]), judge_client=FakeJudge()
+    )
+
+    assert metrics["m1_m3_trust"] == "blocked_pending_ag_investigation"
+    assert "must not be read as results" in metrics["m1_m3_trust_reason"]
+
+
+@pytest.mark.integration
+def test_m2_scores_ground_truth_and_predictions_in_one_universe(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Cross-question pairs are unreachable for every arm, so they are not scored.
+
+    They are reported instead: they are the linker lineage-fragmentation signal
+    design doc §8's M2-fail row must check before blaming the identity
+    projection.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    metrics = real_run.execute(
+        cfg, client_factory=_factory([]), judge_client=FakeJudge()
+    )
+    m2 = metrics["m2"]
+
+    assert m2["scored_pairs"] >= 0
+    assert m2["cross_question_pairs_excluded"] >= 0
+    assert (
+        m2["scored_pairs"] + m2["cross_question_pairs_excluded"]
+        == m2["pooled_labeled_pairs"]["total"]
+    )
+    # Arm A never merges, so with a within-question labeled pair present it must
+    # score 0.0 while the dedup arms score above it — the sanity check that the
+    # scoring universe did not simply empty itself.
+    if m2["scored_pairs"]:
+        assert m2["f1"]["A"] < m2["f1"]["B"]
+    assert set(m2["gate"]) >= {"verdict", "clears_a_plus_margin", "margin"}
 
 
 @pytest.mark.unit

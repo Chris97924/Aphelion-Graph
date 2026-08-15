@@ -545,6 +545,19 @@ JUDGE_PROMPT_TEMPLATE = (
     f"{VERDICT_INCORRECT}."
 )
 
+def judge_prompt(question: str, gold: str, candidate_answer: str) -> str:
+    """Render the one judgement prompt. Exactly the §6.1 payload, no arm label.
+
+    Module-level rather than inlined in :meth:`JudgeClient.verdict` so a caller
+    can record the digest of *what was actually asked* alongside the verdict
+    without re-deriving the wording — two renderings that drifted apart would
+    make that record worse than none.
+    """
+    return JUDGE_PROMPT_TEMPLATE.format(
+        question=question, gold=gold, candidate=candidate_answer
+    )
+
+
 # How long one judgement may take before it is abandoned and retried by hand.
 DEFAULT_JUDGE_TIMEOUT_SECONDS = 300.0
 
@@ -772,9 +785,7 @@ class JudgeClient:
         only by the harness-side slot bookkeeping in
         :func:`~benchmarks.longmemeval.pipeline.score_blind`.
         """
-        prompt = JUDGE_PROMPT_TEMPLATE.format(
-            question=question, gold=gold, candidate=candidate_answer
-        )
+        prompt = judge_prompt(question, gold, candidate_answer)
         argv = self._argv(prompt)
         stdin = prompt.encode("utf-8") if self.prompt_via == PROMPT_VIA_STDIN else None
         return parse_verdict(self._run(argv, stdin))
