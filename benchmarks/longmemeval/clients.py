@@ -991,14 +991,55 @@ def extracted_claims(completion: str) -> list[StructuredClaim]:
     return claims
 
 
-def extract_structured_messages(text: str) -> list[dict[str, str]]:
-    """The chat payload for one structured extraction call."""
+def known_subjects_block(known_subjects: Sequence[tuple[str, str]]) -> str:
+    """The priming preamble naming subject slugs earlier sessions already minted.
+
+    Each session's extraction is an independent call, so the model has no memory
+    of the slugs it chose for the same facts an hour of corpus earlier. Left to
+    itself it re-derives them, and the 2026-08-16 probe measured what that costs:
+    the mechanism worked (11 update edges over 4 of 10 questions) but the other 6
+    produced none, every miss a pure naming difference for a fact whose value had
+    plainly moved — ``user/postcard-collection/new-acquisitions-count`` in one
+    session and ``user/collection/postcards/new-additions-since-restart`` in the
+    next.
+
+    The block is fenced like every other untrusted value: these slugs are model
+    output derived from corpus text, so they are data the model is being shown,
+    never instructions it should follow.
+    """
+    listing = "\n".join(f"{slug} = {value}" for slug, value in known_subjects)
+    return (
+        "Facts in this conversation were already given subject slugs in EARLIER "
+        "sessions. Here they are, each with the most recent value seen for it:\n"
+        f"{fenced('KNOWN_SUBJECTS', listing)}\n\n"
+        "When a claim you extract is about the SAME fact as one of these, REUSE "
+        "that exact slug, character for character. Do not reword it, do not "
+        "restructure it, and do not add or remove path segments — a slug that "
+        "differs by one character is a different fact. Mint a new slug only for a "
+        "fact that is genuinely not listed above. The value may of course differ: "
+        "that is what makes it an update rather than a repetition."
+    )
+
+
+def extract_structured_messages(
+    text: str, known_subjects: Sequence[tuple[str, str]] = ()
+) -> list[dict[str, str]]:
+    """The chat payload for one structured extraction call.
+
+    ``known_subjects`` primes the call with the vocabulary earlier sessions of
+    the *same question* established. The first session of a question is
+    necessarily unprimed — there is nothing yet to be consistent with — and its
+    payload is exactly what it would be without this parameter.
+    """
+    user = fenced("SESSION", text)
+    if known_subjects:
+        user = f"{known_subjects_block(known_subjects)}\n\n{user}"
     return [
         {
             "role": "system",
             "content": f"{EXTRACT_STRUCTURED_SYSTEM_PROMPT}\n\n{DATA_FENCE_NOTE}",
         },
-        {"role": "user", "content": fenced("SESSION", text)},
+        {"role": "user", "content": user},
     ]
 
 

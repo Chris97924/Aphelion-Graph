@@ -122,3 +122,83 @@ benchmark quietly measured over inputs it does not describe.
 
 Blank lines and bare code-fence delimiters are skipped, because they carry no
 claim: a model that wraps correct output in a fence has still answered correctly.
+
+
+---
+
+## 11. Vocabulary priming (amendment #4, 2026-08-16)
+
+### What the second probe found
+
+Structured extraction worked, and the numbers say so: **11 `supersedes` edges
+across 4 of 10 knowledge-update questions**, where the free-text policy produced
+zero on all of them. But **6 questions still produced none**, and inspecting them
+showed no missing facts — only missing agreement about names:
+
+| Question | Earlier session | Later session |
+|---|---|---|
+| `01493427` | `user/postcard-collection/new-acquisitions-count` = 17 | `user/collection/postcards/new-additions-since-restart` = 25 |
+| `0ddfec37` | `user/autographed-baseball-collection/count` = 15 | `user/collection/autographed-baseballs/recent-additions` = 20 |
+
+Both pairs are the same fact with a moved value — exactly the update M1 and M3
+ride on — and both went unlinked because the two sessions named the fact
+differently.
+
+### Why the rubric could not fix it
+
+Each session is extracted in its **own call**. The model is not being
+inconsistent *within* a call; it is being asked, twice and in isolation, to name
+the same thing, with no memory of its earlier answer. Strengthening the
+instruction cannot close a gap that exists between calls rather than inside one.
+
+### The mechanism
+
+Sessions already run in pinned occurrence order within a question. After each
+session's extraction the question's subject vocabulary is accumulated — slug plus
+the most recent value seen for it, in first-minted order — and every
+**subsequent** session's prompt carries it:
+
+```
+Facts in this conversation were already given subject slugs in EARLIER sessions.
+<<<KNOWN_SUBJECTS
+user/postcard-collection/new-acquisitions-count = 17
+KNOWN_SUBJECTS>>>
+
+When a claim you extract is about the SAME fact as one of these, REUSE that exact
+slug, character for character. ... Mint a new slug only for a fact that is
+genuinely not listed above. The value may of course differ: that is what makes it
+an update rather than a repetition.
+```
+
+The block is fenced like every other untrusted value — the slugs are model output
+derived from corpus text, so they are data the model is shown, never instructions
+it follows. The first session of a question is unprimed; there is nothing yet to
+be consistent with.
+
+### Properties preserved
+
+- **Per question.** Nothing leaks between questions.
+- **Order-derived, not accumulated.** The vocabulary for a session comes from the
+  sessions *preceding* it in pinned order, never from "everything seen so far".
+  Every arm replays the same sessions through the one shared extractor, so an
+  accumulating vocabulary would prime a session differently on the second pass
+  than on the first — and the memoised claims would then no longer correspond to
+  the prompt this code would send.
+- **Resume-equivalent.** A resumed run rebuilds the vocabulary from the cached
+  claims in the same order, so a session extracted after an interruption is
+  primed exactly as it would have been had the run never stopped.
+- **Shared.** One primed extraction feeds all three arms; Arm C receives nothing
+  Arms A and B do not.
+
+### Cache versioning
+
+Extraction is cached per **(question, session)**, because a primed prompt depends
+on the question it sits in. The durable cache carries a format version and
+**refuses** rows written before priming: those claims came from unprimed prompts,
+and replaying them beside newly-primed sessions would mix two extraction
+protocols inside one question, leaving linkage that belongs to neither. A
+pre-priming cache is discarded, never migrated.
+
+Cost: session reuse across questions is negligible — 10,417 (question, session)
+pairs against 9,454 unique sessions, 1.1x — so per-question scoping costs roughly
+10% more extraction calls than session-only caching would. Priced and accepted.
