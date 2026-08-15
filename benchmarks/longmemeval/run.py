@@ -948,14 +948,24 @@ def _add_real_run_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--m3-labels-deviation-ack",
+        action="store_true",
+        help=(
+            "acknowledge that --m3-labels points at a file that is NOT the "
+            "pre-registered one. The deviation is allowed but never implicit, "
+            "and the run records the deviant path, its digest and "
+            "labels_match_preregistered: false"
+        ),
+    )
+    parser.add_argument(
         "--m3-labels",
         type=Path,
         default=None,
         help=(
-            "JSON file of {question_id: [old value, ...]} stale-value labels. "
-            "Without it M3 is reported as not computed, with the reason: the "
-            "corpus ships no such labels and this harness will not derive them "
-            "from the edges Arm C acts on"
+            "override the pre-registered M3 labels file. NOT needed for a "
+            "pinned run: the labels are resolved from preregister.json and their "
+            "sha256 verified before scoring. Requires --m3-labels-deviation-ack "
+            "unless the file's digest equals the pinned one"
         ),
     )
 
@@ -992,6 +1002,7 @@ def _run_real(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         data_dir=args.data_dir,
         top_k=args.top_k,
         m3_labels=args.m3_labels,
+        m3_labels_deviation_ack=args.m3_labels_deviation_ack,
         judge_prompt_via=args.judge_prompt_via,
         judge_deviation_ack=args.judge_deviation_ack,
     )

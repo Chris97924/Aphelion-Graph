@@ -606,6 +606,9 @@ class RealRunConfig:
     top_k: int = DEFAULT_TOP_K
     samples_root: Path = SAMPLES_ROOT
     m3_labels: Path | None = None
+    # Set only to score M3 from a labels file that is not the pre-registered one.
+    # Mirrors judge_deviation_ack: the deviation is allowed, but never implicit.
+    m3_labels_deviation_ack: bool = False
     resamples: int = m1_qa.BOOTSTRAP_RESAMPLES
     # Which form the judge CLI is handed its prompt. Exposed as a run setting
     # because which form the installed build accepts is an operational fact about
@@ -683,6 +686,7 @@ def build_manifest(
     retriever_params: Mapping[str, Any],
     split_manifest: Mapping[str, Any],
     judge_standing: Mapping[str, Any],
+    label_source: M3LabelSource | None,
 ) -> dict[str, Any]:
     """The run's provenance record: what ran, against what, under which pins."""
     preregister = json.loads(cfg.preregister_path.read_text(encoding="utf-8"))
@@ -704,9 +708,24 @@ def build_manifest(
         "corpus_source_sha256": split_manifest.get("source_sha256", {}),
         "corpus_loaded_sha256": corpus_digests(cfg),
         "corpus_data_dir": str(cfg.directory()),
-        "m3_labels_path": str(cfg.m3_labels) if cfg.m3_labels else None,
-        "m3_labels_sha256": file_digest(cfg.m3_labels),
-        "samples_root": str(cfg.samples_root),
+        **(
+            label_source.as_record()
+            if label_source is not None
+            else {
+                "m3_labels_path": None,
+                "m3_labels_sha256": None,
+                "m3_labels_match_preregistered": None,
+                "m3_labels_pinned_file": None,
+                "m3_labels_deviation_acknowledged": False,
+            }
+        ),
+        # Resolved, so the manifest names where the bytes were actually read
+        # from. A symlinked samples root is a legitimate operator arrangement and
+        # the digest covers its target correctly — M5's own package discovery
+        # follows it identically — but a manifest that recorded the link rather
+        # than its destination would describe a corpus that is not the one
+        # measured.
+        "samples_root": str(Path(cfg.samples_root).resolve()),
         "samples_sha256": samples_digest(cfg.samples_root),
         "haystack": cfg.haystack,
         "split": cfg.split,
@@ -979,6 +998,9 @@ _IDENTITY_FIELDS = (
     "corpus_loaded_sha256",
     "corpus_data_dir",
     "m3_labels_sha256",
+    # Whether M3 was scored from the pre-registered sample. A resume that swapped
+    # a deviant label set in halfway would otherwise report one M3 over two.
+    "m3_labels_match_preregistered",
     # M5's inputs: its gate is a function of the sample corpus, which is often
     # untracked and therefore invisible to both git and the harness digest.
     "samples_sha256",
@@ -1896,15 +1918,15 @@ def _pool_arm_perf(rows: Iterable[Mapping[str, Any]], arm: str) -> m4_perf.ArmPe
 
 
 def load_m3_labels(path: Path | None) -> dict[str, list[str]]:
-    """Read an external stale-value label file, or return no labels.
+    """Read a stale-value label file, or return no labels.
 
     M3 needs, per knowledge-update question, the *old* value that must not reach
     the answering model. LongMemEval ships no such annotation, and the harness
     deliberately does not synthesise one: the obvious derivation — reading the old
     value off the shared linker's own ``supersedes`` edges — would label M3 with
     exactly the edges Arm C acts on, making the metric close to tautological.
-    Choosing a label source is a pre-registration-level decision (design doc §6.3)
-    for the maintainer, so it arrives as data or not at all.
+    The label source is therefore a pre-registration-level decision (design doc
+    §6.3), pinned by :func:`resolve_m3_labels` rather than chosen at run time.
     """
     if path is None:
         return {}
@@ -1912,6 +1934,118 @@ def load_m3_labels(path: Path | None) -> dict[str, list[str]]:
         str(qid): [str(value) for value in values]
         for qid, values in json.loads(path.read_text(encoding="utf-8")).items()
     }
+
+
+def normalized_digest(path: Path) -> str:
+    """Hex SHA-256 of a file with CRLF normalized to LF.
+
+    The convention the pre-registration's own ``design_doc_sha256`` and
+    ``labels_sha256`` use, so a pin holds on a Windows CRLF working tree and a
+    Linux LF checkout of the same committed content alike. Raw-byte hashing would
+    make the pinned digest fail on exactly one of the two platforms.
+    """
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+@dataclass(frozen=True)
+class M3LabelSource:
+    """The label file a run will actually score M3 from, and its standing.
+
+    ``matches_preregistered`` is decided by **digest**, not by whether an override
+    path was passed: pointing ``--m3-labels`` at the pinned file itself is not a
+    deviation, and pointing it anywhere else is one even if the keys line up.
+    """
+
+    path: Path
+    sha256: str
+    matches_preregistered: bool
+    pinned_file: str | None
+    pinned_sha256: str | None
+    deviation_acknowledged: bool
+
+    def as_record(self) -> dict[str, Any]:
+        """The label-provenance fields a run records."""
+        return {
+            "m3_labels_path": str(self.path),
+            "m3_labels_sha256": self.sha256,
+            "m3_labels_match_preregistered": self.matches_preregistered,
+            "m3_labels_pinned_file": self.pinned_file,
+            "m3_labels_deviation_acknowledged": self.deviation_acknowledged,
+        }
+
+
+def resolve_m3_labels(
+    cfg: RealRunConfig, path: Path = PREREGISTER_PATH
+) -> M3LabelSource | None:
+    """Resolve, and *enforce*, the label source M3 will be scored from.
+
+    With a label pin in the pre-registration this is no longer an operator
+    choice. The labels file **is** M3's sample — its keys are the denominator and
+    its values are what "contaminated" means — so a run that scored some other
+    JSON, or quietly scored nothing because a flag was omitted, would publish an
+    M3 the pre-registration does not describe. Both were possible before this
+    check existed.
+
+    The pinned file is resolved repo-relative and its digest verified *before*
+    any scoring. A missing file or a digest mismatch is a stop
+    (:class:`M3LabelError`), never a downgrade to "no M3".
+
+    An operator file is still reachable, on the same terms the judge deviation
+    uses: it must be acknowledged explicitly, and the run records the deviant
+    path, its digest and ``m3_labels_match_preregistered: false`` in both the
+    manifest and the metrics, so a deviant run can never read as the pinned one.
+
+    Returns ``None`` only when the pre-registration carries no label pin *and* no
+    override was supplied — the pre-pin configuration, where M3 genuinely cannot
+    be scored.
+    """
+    record = preregistered_metric("M3", path)
+    pinned_file = record.get("labels_file")
+    pinned_sha = record.get("labels_sha256")
+    pinned = isinstance(pinned_file, str) and isinstance(pinned_sha, str)
+
+    if not pinned:
+        if cfg.m3_labels is None:
+            return None
+        return M3LabelSource(
+            path=cfg.m3_labels,
+            sha256=normalized_digest(cfg.m3_labels),
+            matches_preregistered=False,
+            pinned_file=None,
+            pinned_sha256=None,
+            deviation_acknowledged=cfg.m3_labels_deviation_ack,
+        )
+
+    resolved = cfg.m3_labels if cfg.m3_labels is not None else REPO_ROOT / pinned_file
+    if not Path(resolved).is_file():
+        raise M3LabelError(
+            f"the pinned M3 labels file {pinned_file!r} was not found at "
+            f"{resolved}. M3's sample is pinned in preregister.json "
+            "(metrics.M3.labels_file / labels_sha256); a run cannot score M3 "
+            "without it, and will not silently report no M3 instead."
+        )
+
+    actual = normalized_digest(Path(resolved))
+    matches = actual == pinned_sha
+    if not matches and not cfg.m3_labels_deviation_ack:
+        raise M3LabelError(
+            f"the M3 labels at {resolved} do not match the pre-registered "
+            f"labels file.\n  expected sha256 = {pinned_sha}\n  actual   sha256 = "
+            f"{actual}\nThe labels file IS M3's sample - its keys are the "
+            "denominator and its values define contamination - so scoring a "
+            "different one would publish an M3 the pre-registration does not "
+            "describe. Restore the pinned file, or pass "
+            "--m3-labels-deviation-ack to record the deviation in the results."
+        )
+
+    return M3LabelSource(
+        path=Path(resolved),
+        sha256=actual,
+        matches_preregistered=matches,
+        pinned_file=pinned_file,
+        pinned_sha256=pinned_sha,
+        deviation_acknowledged=cfg.m3_labels_deviation_ack,
+    )
 
 
 def compute_metrics(
@@ -1922,6 +2056,7 @@ def compute_metrics(
     phase: AnswerPhase,
     claim_rows: Sequence[Mapping[str, Any]],
     split_manifest: Mapping[str, Any],
+    label_source: M3LabelSource | None,
 ) -> dict[str, Any]:
     """Reduce the run's durable rows to the §4 metrics.
 
@@ -2019,8 +2154,8 @@ def compute_metrics(
     }
 
     # -- M3 ---------------------------------------------------------------
-    labels = load_m3_labels(cfg.m3_labels)
-    if labels:
+    labels = load_m3_labels(label_source.path) if label_source else {}
+    if label_source and labels:
         denominator = m3_denominator(split_manifest, path)
         validate_m3_labels(labels, denominator.label_ids)
         # Scored over the pinned denominator, NOT over every labeled key: the
@@ -2051,18 +2186,32 @@ def compute_metrics(
             "denominator_matches_pin": denominator.matches_pin,
             "no_update_excluded": list(denominator.no_update_ids),
             "matching": preregistered_metric("M3", path).get("matching"),
-            "labels_source": str(cfg.m3_labels),
-            "labels_sha256": file_digest(cfg.m3_labels),
+            "labels_source": str(label_source.path),
+            "labels_sha256": label_source.sha256,
+            "labels_match_preregistered": label_source.matches_preregistered,
+            "labels_deviation_acknowledged": label_source.deviation_acknowledged,
         }
+    elif label_source:
+        # A resolved-but-empty label file. Not reachable with the pinned file
+        # (66 of its 72 keys carry values), so this means an operator file that
+        # labels nothing — reported as a stop rather than as a zero rate.
+        metrics["m3"] = None
+        metrics["m3_reason"] = (
+            f"the labels file at {label_source.path} carries no values, so there "
+            "is nothing for M3 to detect. A rate of 0.0 from an empty label set "
+            "would read as 'no arm surfaced a stale value' rather than 'nothing "
+            "was looked for'."
+        )
     else:
         metrics["m3"] = None
         metrics["m3_reason"] = (
-            "no stale-value labels supplied (--m3-labels). The corpus ships no "
-            "old-value annotation and this harness will not derive one from the "
-            "shared linker's supersedes edges, because those are the very edges "
-            "Arm C acts on: M3 would then score Arm C against its own mechanism. "
-            "Choosing a label source is a maintainer decision under design doc "
-            "§6.3."
+            "this pre-registration carries no M3 label pin "
+            "(metrics.M3.labels_file / labels_sha256), and no override was "
+            "supplied. The corpus ships no old-value annotation and this harness "
+            "will not derive one from the shared linker's supersedes edges, "
+            "because those are the very edges Arm C acts on: M3 would then score "
+            "Arm C against its own mechanism. Choosing a label source is a "
+            "maintainer decision under design doc §6.3."
         )
 
     # -- M4 ---------------------------------------------------------------
@@ -2239,6 +2388,11 @@ def execute(
     require_judge_acknowledged(standing, cfg.judge_deviation_ack)
     standing["judge_deviation_acknowledged"] = cfg.judge_deviation_ack
 
+    # Resolved and digest-verified here, before a single model call: M3's sample
+    # is pinned, so a missing or altered labels file must stop the run rather
+    # than surface hours later as a metric nobody can attribute.
+    label_source = resolve_m3_labels(cfg, cfg.preregister_path)
+
     pins = {
         "answering": clients.answering_pin(cfg.preregister_path),
         "extractor": clients.extractor_pin(cfg.preregister_path),
@@ -2258,6 +2412,7 @@ def execute(
             retriever_params=retriever.params,
             split_manifest=split_manifest,
             judge_standing=standing,
+            label_source=label_source,
         ),
     )
 
@@ -2324,6 +2479,7 @@ def execute(
         phase=phase,
         claim_rows=read_jsonl(cfg.out_dir / CLAIMS_NAME),
         split_manifest=split_manifest,
+        label_source=label_source,
     )
     metrics["manifest"] = {
         key: manifest.get(key)
@@ -2337,6 +2493,9 @@ def execute(
             "judge_matches_preregistered_pin",
             "judge_deviation_acknowledged",
             "samples_sha256",
+            "m3_labels_path",
+            "m3_labels_sha256",
+            "m3_labels_match_preregistered",
         )
     }
     # Surfaced at the top level too: whether the judge was the pre-registered one

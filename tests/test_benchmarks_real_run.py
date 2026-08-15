@@ -727,6 +727,23 @@ class FakeJudge:
         return gold.lower() in candidate_answer.lower()
 
 
+def _fixture_labels(tmp_path: Path) -> Path:
+    """Stale-value labels for the fixture questions.
+
+    A fixture run is, by definition, a deviant label set: it scores a two-question
+    stand-in split, not the pre-registered 66. It therefore travels the same
+    acknowledged-deviation path an operator would, which keeps that path exercised
+    by every end-to-end test rather than by one.
+    """
+    path = tmp_path / "fixture-m3-labels.json"
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"ku-one": ["24:30"], "ku-two": ["61"]}), encoding="utf-8"
+        )
+    return path
+
+
 def _config(tmp_path: Path, corpus_dir: Path, split_path: Path, **overrides: Any):
     settings: dict[str, Any] = {
         "out_dir": tmp_path / "run",
@@ -736,6 +753,8 @@ def _config(tmp_path: Path, corpus_dir: Path, split_path: Path, **overrides: Any
         "samples_root": _SAMPLES_ROOT,
         "split_manifest_path": split_path,
         "resamples": 64,
+        "m3_labels": _fixture_labels(tmp_path),
+        "m3_labels_deviation_ack": True,
     }
     settings.update(overrides)
     return real_run.RealRunConfig(**settings)
@@ -1201,12 +1220,22 @@ def test_the_adversarial_tiers_come_from_the_pre_registration() -> None:
 
 
 @pytest.mark.unit
-def test_m3_is_reported_as_not_computed_rather_than_zero(
+def test_m3_cannot_be_silently_skipped_now_that_its_labels_are_pinned(
     tmp_path: Path, corpus_dir: Path, split_path: Path
 ) -> None:
-    """A missing label source must never read as "no contamination"."""
-    cfg = _config(tmp_path, corpus_dir, split_path)
-    assert cfg.m3_labels is None
+    """Omitting the flag no longer means "no M3" - it means "use the pinned file".
+
+    Before the pin existed, a forgotten --m3-labels produced m3: null, which reads
+    as "not measured" but is one edit away from reading as "measured, nothing
+    found". With the sample pre-registered, the labels are resolved and
+    digest-verified whether or not a flag was passed.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, m3_labels=None)
+    source = real_run.resolve_m3_labels(cfg)
+
+    assert source is not None, "the pinned labels must be resolved without a flag"
+    assert source.path == real_run.REPO_ROOT / "benchmarks/longmemeval/m3_labels.json"
+    assert source.matches_preregistered is True
     assert real_run.load_m3_labels(None) == {}
 
 
@@ -1750,6 +1779,158 @@ def test_the_committed_labels_validate_against_the_structural_keyset() -> None:
 
 
 @pytest.mark.unit
+def test_the_pinned_labels_are_resolved_and_verified(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The normal pinned run needs no flag and no ack, and passes the digest check."""
+    cfg = _config(
+        tmp_path,
+        corpus_dir,
+        split_path,
+        m3_labels=None,
+        m3_labels_deviation_ack=False,
+    )
+    source = real_run.resolve_m3_labels(cfg)
+
+    pinned = json.loads(real_run.PREREGISTER_PATH.read_text(encoding="utf-8"))
+    assert source.sha256 == pinned["metrics"]["M3"]["labels_sha256"]
+    assert source.matches_preregistered is True
+    assert source.deviation_acknowledged is False
+    record = source.as_record()
+    assert record["m3_labels_match_preregistered"] is True
+    assert record["m3_labels_sha256"] == source.sha256
+
+
+@pytest.mark.unit
+def test_a_tampered_labels_file_is_refused(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Same keys, different values, is exactly the attack the digest closes.
+
+    validate_m3_labels only checks the KEYSET, so an operator file with the right
+    72 ids and altered values passed every earlier check while redefining what
+    "contaminated" means.
+    """
+    pinned = json.loads(
+        (real_run.REPO_ROOT / "benchmarks/longmemeval/m3_labels.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    pinned["01493427"] = ["not the labeled value"]
+    tampered = tmp_path / "tampered.json"
+    tampered.write_text(json.dumps(pinned, indent=2, sort_keys=True), encoding="utf-8")
+
+    cfg = _config(
+        tmp_path,
+        corpus_dir,
+        split_path,
+        m3_labels=tampered,
+        m3_labels_deviation_ack=False,
+    )
+    with pytest.raises(real_run.M3LabelError) as excinfo:
+        real_run.resolve_m3_labels(cfg)
+
+    message = str(excinfo.value)
+    assert "expected sha256" in message and "actual   sha256" in message
+    assert "--m3-labels-deviation-ack" in message
+
+
+@pytest.mark.unit
+def test_a_missing_pinned_labels_file_is_refused(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A missing sample is a stop, never a downgrade to 'no M3'."""
+    cfg = _config(
+        tmp_path,
+        corpus_dir,
+        split_path,
+        m3_labels=tmp_path / "does-not-exist.json",
+        m3_labels_deviation_ack=True,
+    )
+    with pytest.raises(real_run.M3LabelError, match="not found"):
+        real_run.resolve_m3_labels(cfg)
+
+
+@pytest.mark.unit
+def test_pointing_the_override_at_the_pinned_file_is_not_a_deviation(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Deviation is decided by DIGEST, not by whether a flag was passed."""
+    cfg = _config(
+        tmp_path,
+        corpus_dir,
+        split_path,
+        m3_labels=real_run.REPO_ROOT / "benchmarks/longmemeval/m3_labels.json",
+        m3_labels_deviation_ack=False,
+    )
+    source = real_run.resolve_m3_labels(cfg)
+    assert source.matches_preregistered is True
+
+
+@pytest.mark.unit
+def test_an_unacknowledged_deviation_is_refused_before_any_scoring(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The fixture labels ARE a deviation; without the ack they must not run."""
+    cfg = _config(tmp_path, corpus_dir, split_path, m3_labels_deviation_ack=False)
+    with pytest.raises(real_run.M3LabelError, match="do not match"):
+        real_run.resolve_m3_labels(cfg)
+
+
+@pytest.mark.integration
+def test_a_deviant_label_run_is_flagged_in_manifest_and_metrics(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A deviant run must never be able to masquerade as the pinned one."""
+    cfg = _config(tmp_path, corpus_dir, split_path)
+    metrics = real_run.execute(
+        cfg, client_factory=_factory([]), judge_client=FakeJudge()
+    )
+    manifest = json.loads(
+        (cfg.out_dir / real_run.MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+
+    assert manifest["m3_labels_match_preregistered"] is False
+    assert manifest["m3_labels_deviation_acknowledged"] is True
+    assert manifest["m3_labels_path"] == str(cfg.m3_labels)
+    assert manifest["m3_labels_sha256"] == real_run.normalized_digest(cfg.m3_labels)
+
+    assert metrics["m3"]["labels_match_preregistered"] is False
+    assert metrics["m3"]["labels_deviation_acknowledged"] is True
+    assert metrics["manifest"]["m3_labels_match_preregistered"] is False
+    # ...and it still scores, so the deviation path is a recorded choice rather
+    # than a broken one.
+    assert set(metrics["m3"]["rate"]) == set(ARM_STORES)
+
+
+@pytest.mark.unit
+def test_a_preregistration_without_a_label_pin_still_reports_no_m3(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The pre-pin configuration stays supported rather than crashing."""
+
+    def drop_pin(record: dict) -> None:
+        del record["metrics"]["M3"]["labels_file"]
+        del record["metrics"]["M3"]["labels_sha256"]
+
+    path = _preregister_with(tmp_path, drop_pin)
+    cfg = _config(
+        tmp_path, corpus_dir, split_path, m3_labels=None, preregister_path=path
+    )
+    assert real_run.resolve_m3_labels(cfg, path) is None
+
+
+@pytest.mark.unit
+def test_the_normalized_digest_is_line_ending_independent(tmp_path: Path) -> None:
+    """The pin must hold on a CRLF working tree and an LF checkout alike."""
+    lf = tmp_path / "lf.json"
+    crlf = tmp_path / "crlf.json"
+    lf.write_bytes(b'{\n  "a": 1\n}\n')
+    crlf.write_bytes(b'{\r\n  "a": 1\r\n}\r\n')
+    assert real_run.normalized_digest(lf) == real_run.normalized_digest(crlf)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("value", "context", "expected"),
     [
@@ -2151,6 +2332,32 @@ def test_the_harness_digest_frames_its_records_too(tmp_path: Path) -> None:
     (tree_b / "c.py").write_bytes(b"")
 
     assert real_run.harness_digest([tree_a]) != real_run.harness_digest([tree_b])
+
+
+@pytest.mark.unit
+def test_a_symlinked_samples_root_is_hashed_at_its_destination(
+    tmp_path: Path,
+) -> None:
+    """A symlinked root is legitimate; the digest must cover what M5 would read.
+
+    M5's package discovery follows the root identically, so following it here is
+    what keeps the two in agreement - and repointing the link changes the digest,
+    which is exactly what the resume check needs.
+    """
+    real = tmp_path / "real-samples"
+    (real / "pkg").mkdir(parents=True)
+    (real / "pkg" / "manifest.json").write_text("{}", encoding="utf-8")
+
+    link = tmp_path / "linked-samples"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform/user cannot create symlinks")
+
+    assert real_run.samples_digest(link) == real_run.samples_digest(real)
+
+    (real / "pkg" / "manifest.json").write_text('{"a": 1}', encoding="utf-8")
+    assert real_run.samples_digest(link) == real_run.samples_digest(real)
 
 
 @pytest.mark.integration
