@@ -19,6 +19,7 @@
 **Amended:** 2026-07-24 — §2.3 amendment's R4-exclusion enumeration completed with `valid_until` (PR #18 residual P2): it is the fourth-and-final `spec/v0.3-claim-semantics.md` §6.5 R4-trigger field (`polarity`/`valid_from`/`valid_until`/`supersedes`) and is excluded from the `content_hash` identity projection like the others. Rationale-only — the normative rule is unchanged, no §4 threshold moved, and no arm has run — a protocol-legal pre-registration amendment (§6.3).
 **Amended:** 2026-08-14 — §4 amendment closing the four pinned-number defects found by the 2026-08-03 threshold audit, all recorded *before* any arm has run. **(1) M3's denominator is corrected 78 → 72** (§3.3, §4 M3 row): 6 of the 78 knowledge-update questions are abstention (`_abs`) variants whose gold answer is *"The information provided is not enough…"* — they encode no old→new update, so no stale-value label can exist for them and the pinned N contradicted the gate's own stated justification ("old→new value labels exist only for that subset"). This is a **factual correction to a denominator, not a threshold move**: the `C ≤ 0.5 × A` ratio is untouched. **(2) M1's `+3pp` is recorded as a decision rule, not a significance test** (§4 M1 row): the bootstrapped CI §3.3 already requires is reported for honesty and does not overturn the gate in either direction. **(3) M3 gains a pre-registered INCONCLUSIVE rule** (§4 M3 row, §8): readability is decided by an exact two-sided sign test over the paired A-only / C-only contamination discordances, and at `p ≥ 0.05` M3 reports INCONCLUSIVE rather than firing §8's state-machine demotion on noise. **(4) AG's mandated breach response is split into two pre-registered tiers** (§4 AG row, §6 guard 4): at N = 20 one question is 5pp, so the smallest non-zero `C − B` already breaches the `≤ +3pp` tripwire; Tier 1 (+5pp net) inspects every discordant question and Tier 2 (≥ +10pp) is the full leakage investigation. **No gate ratio or threshold moves** — M1 `+3pp`, M2 `A + 0.10` / ε = 0.02, M3 `C ≤ 0.5 × A`, M4 no-gate, M5 100/100 and AG `+3pp` are all unchanged — and no arm has run, so this is a protocol-legal pre-registration amendment (§6.3). Defects 2–4 add *interpretation and response* that the pinned text left to be filled in after seeing results, which is precisely what §6.3 exists to prevent. *Revised in review, same pre-run window, before merge:* this amendment's first draft decided M3's readability by a marginal floor (Arm A contaminating fewer than 12 of 72) and scoped AG Tier 1 to "the single differing question". Both measured the wrong quantity — readability depends on the **paired** A-only / C-only discordances, not on A's raw count (A = 12, C = 7 fully overlapping gives `b = 5, c = 0, p = 0.0625`, unreadable yet admitted by the floor), and a `+5pp` **net** advantage does not imply a single discordant question (three C-only against two B-only nets the same). Both were superseded by the rules above while still inside the §6.3 window; **neither was ever exercised — no arm has run.**
 **Amended:** 2026-08-15 — §4 M3 amendment supplying the metric's missing precondition and closing the two defects that arrived with it, all recorded *before* any arm has run. **(1) The stale-value label source is pinned** (§4 M3 row, `preregister.json` `metrics.M3.labels_file` / `labels_sha256`): `benchmarks/longmemeval/m3_labels.json`, 72 keys / 66 non-empty / 70 values, produced by a model that is deliberately *not* the pinned answering or extractor model and is never invoked by the harness, with every value mechanically verified as a verbatim substring of its own question's evidence (`docs/benchmark/m3-labels-methodology.md`). The obvious automatic derivation — reading old values off the harness's own shared-linker `supersedes` edges — was **refused**, because those are the edges Arm C acts on and M3 would then have scored Arm C against its own mechanism. **(2) Contamination matching is pinned as token-boundary and case-sensitive** — `(?<!\w)value(?!\w)` — replacing raw substring containment: 23 of the 70 labels are ≤ 4 characters, so substring matching fires on "42", "2024" and "14:30" for a label of "4", and because M3's gate is a *ratio* the same false-positive mass on both sides pushes `C / A` toward 1 and biases the gate toward FAIL. **(3) M3's denominator is corrected 72 → 66**: a full-transcript labeling pass found 6 knowledge-update questions whose evidence carries no old→new update at all (four of them *ask for* the earlier value, so the gold answer is itself the historical fact; two state their value once and never revise it). Same factual-correction class as the 2026-08-14 `_abs` exclusion and on the same pinned ground — labels exist "only where an update actually exists" — and like the `_abs` variants they are uncontaminable for every arm alike, so keeping them would deflate A and C by the same 6 questions. **No gate ratio or threshold moves** — `C ≤ 0.5 × A`, α = 0.05 and the exact two-sided sign test are all unchanged, and a common denominator cancels out of the ratio — and no arm has run, so this is a protocol-legal pre-registration amendment (§6.3).
+**Amended:** 2026-08-15 — §5.2 model re-pin and §7.3 extraction-mechanism fix, both recorded *before* any arm has run. **(1) The answering and extractor models move from `gpt-oss:120b` to `qwen3.8`** (vLLM chat-completions endpoint on GB10, `template_kwargs {enable_thinking: false}`, temperature 0, seed 20260717). This resolves a standing conflict: the 2026-07-19 pin named a model the maintainer's 2026-06-10 fleet ruling had retired, and the two instructions could not both be honoured. Resolved by the maintainer in favour of the fleet ruling. The §5.2 fairness constraint is untouched — one model still serves both stages identically across A/B/C. Quality was gated *before* the switch: an extraction probe over 10 real knowledge-update questions produced atomic, faithful claims capturing both the old and new value of a changed fact. **(2) Extraction becomes STRUCTURED and the shared linker keys on the supplied subject.** The same probe realised the central validity risk §7.3 names in its own words: **243 extracted records resolved to 243 unique lineages with zero `supersedes` edges**. The cause is mechanical — `default_subject_policy` derives a subject only from a trailing value token, and real claim phrasing varies between sessions, so no two phrasings of one fact ever met on one subject. Arm C would have degenerated to Arm B and M1/M3 could not have moved. The extractor now emits `{text, subject, value}` per claim; the linker keys lineages on `subject` and decides update-vs-restatement on `value`. The claim *sentence* still feeds retrieval and answering unchanged. **No gate ratio or threshold moves**, and the evidence was extraction-only diagnostics — no arm was run and no metric was seen — so this is a protocol-legal pre-registration amendment (§6.3).
 **Targets:** aphelion 0.6.0 · wire spec 0.4.0 · schema 2.0
 **Scope of this drive:** design only — no harness code, no benchmark execution.
 
@@ -305,9 +306,12 @@ internal-validity guard.
 
 **Pinned models, retriever & knobs (frozen 2026-07-19):**
 
-- **Answering model** = `gpt-oss:120b` @ GB10 ollama (`192.168.1.134:11434`).
-- **Extractor model** = `gpt-oss:120b` @ GB10 ollama (`192.168.1.134:11434`) — the
-  same model as answering.
+- **Answering model** = `qwen3.8` (upstream `Qwen/Qwen3.8-27B-FP8`) served over the
+  chat-completions dialect at `http://192.168.1.134:8000/v1` on GB10, with
+  `template_kwargs {enable_thinking: false}` *(re-pinned 2026-08-15; see the header
+  amendment. The template switch is part of the pin: without it the model spends its
+  completion budget on a reasoning preamble and returns empty content.)*
+- **Extractor model** = the same `qwen3.8` pin as answering.
 - **Judge model** = `claude-opus-4-8` via `claude -p` (subscription); fallback
   `gemini-2.5-pro`.
 - **Retriever** = shared deterministic BM25 (stdlib), identical across arms.
@@ -429,6 +433,36 @@ and M1/M3 cannot move — which is precisely the "M1 fail, M2/M3 pass" branch in
 §8 that triggers a retriever/linker-integration rerun before any spec retreat.
 The linker design is a next-drive concern; this document only fixes the contract
 that it is a shared, arm-independent stage.
+
+**Amendment 2026-08-15 (§6.3) — the risk above was measured and realised; the
+mechanism is fixed.** An extraction-only probe on 2026-08-15 (10 real
+knowledge-update questions, the newly re-pinned extractor, no arm run and no metric
+computed) produced **243 records resolving to 243 unique lineages, 0 `supersedes`
+edges, 0 restatement groups**. This is the §7.3 failure mode exactly: with no update
+edges Arm C degenerates to Arm B and M1/M3 cannot move. The cause is mechanical
+rather than a model deficiency — the claims themselves were atomic and faithful, and
+captured both values of a changed fact. `default_subject_policy` derives a subject
+only when a claim body *ends in a value-like token*, and real claim sentences do not:
+*"The user's highest score in Ticket to Ride is 124 points."* and *"The user reported
+achieving their highest score in Ticket to Ride, which was 132 points."* both end in
+the word `points.`, so both yield **no subject at all** and the two phrasings of one
+fact never meet.
+
+The shared stage therefore becomes **structured**. The extractor emits, per claim, a
+self-contained `text` sentence, a stable `subject` slug naming the fact
+(`user/ticket-to-ride/highest-score`), and the `value` that fact currently holds. The
+linker keys lineages on the normalised `subject` and decides update-versus-restatement
+on the `value`: a differing value on a standing subject mints the `supersedes` edge,
+while an equal value re-uses the standing lineage so a rephrasing is not mistaken for
+an update. Claims that carry no subject — the mechanical stub extractor the offline
+smokes bind — fall back to `default_subject_policy` unchanged.
+
+Two properties are deliberately preserved. The claim **sentence** is still what
+retrieval ranks and the answering model reads, so the arms see the context they would
+have seen; and the linker is still one shared, arm-independent stage, so this raises
+Arm C's *ceiling* without handing Arm C anything Arms A and B do not also receive.
+Raising that ceiling is not tuning the benchmark toward a result — with the ceiling at
+zero the benchmark could not produce a result at all, in either direction.
 
 ### 7.4 Reuse of existing repo assets
 

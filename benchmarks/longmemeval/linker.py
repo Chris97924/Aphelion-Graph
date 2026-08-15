@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from benchmarks.longmemeval.arms.naive_dedup import normalize_body
 from benchmarks.longmemeval.pipeline import Claim, Session
@@ -90,6 +90,23 @@ CLAIM_TYPE = "conversation_turn"
 # ("22:00"), dates ("2023/05/25"), counts ("12"), amounts ("$40.50") and units
 # ("5km", "80%") match; ordinary words do not.
 _VALUE_TOKEN_RE = re.compile(r"^[+-]?[$€£¥]?\d[\d.,:/\-]*[a-z%°]{0,4}[.!?]?$")
+
+
+# Session metadata key carrying the extractor's structured claims: a mapping from
+# the exact claim line to ``{"subject": ..., "value": ...}``. Absent for the
+# mechanical stub extractor, which is why the offline smokes are unaffected.
+STRUCTURED_KEY = "structured_claims"
+
+
+def normalize_subject(subject: str) -> str:
+    """The lineage key a provided subject collapses to.
+
+    Case and surrounding whitespace are not part of a subject's identity, and a
+    model asked for a stable slug will still vary on both. Nothing else is
+    touched: two subjects that differ in their words are different subjects, and
+    guessing otherwise is how a linker starts merging unrelated facts.
+    """
+    return " ".join(subject.split()).strip().lower()
 
 
 def default_subject_policy(text: str) -> str | None:
@@ -190,6 +207,10 @@ class SharedLinker:
         # Subject -> the claim_id currently at the head of its update chain.
         self._head_by_subject: dict[str, str] = {}
         self._subjects: list[str] = []
+        # Subject -> the frontmatter of the claim currently at its head. Only the
+        # structured path needs it: deciding update-vs-restatement requires the
+        # standing VALUE, which the head's claim_id alone does not carry.
+        self._head_meta_by_subject: dict[str, dict[str, Any]] = {}
         self._lineage_seq = 0
         self._supersedes_edges = 0
         self._updated_subjects: set[str] = set()
@@ -210,6 +231,17 @@ class SharedLinker:
         one shared linker over the same sessions.
         """
         occurred_at = session.metadata.get(self._occurred_at_key)
+        structured = session.metadata.get(STRUCTURED_KEY) or {}
+        if not isinstance(structured, Mapping):
+            # Raised rather than ignored. Falling back to the free-text policy
+            # would silently restore the very behaviour structured extraction
+            # replaced — 243 records resolving to 243 lineages with no update
+            # edges — and a run would look like it had linked nothing to link.
+            raise TypeError(
+                f"session {session.id!r} carries {STRUCTURED_KEY!r} as "
+                f"{type(structured).__name__}; it must be a mapping from claim "
+                "text to {'subject': ..., 'value': ...}."
+            )
         claims: list[Claim] = []
         for line_no, line in enumerate(session.text.split("\n")):
             if not line.strip():
@@ -221,7 +253,9 @@ class SharedLinker:
             # read a head that has since moved and mint a spurious revert.
             settled = self._claims.get(record_id)
             if settled is None:
-                settled = self._link(record_id, line, occurred_at)
+                settled = self._link(
+                    record_id, line, occurred_at, structured.get(line)
+                )
                 self._claims[record_id] = settled
             claims.append(settled)
         return claims
@@ -239,7 +273,13 @@ class SharedLinker:
         self._lineage_seq += 1
         return claim_id
 
-    def _link(self, record_id: str, line: str, occurred_at: object) -> Claim:
+    def _link(
+        self,
+        record_id: str,
+        line: str,
+        occurred_at: object,
+        structured: Mapping[str, Any] | None = None,
+    ) -> Claim:
         body = normalize_body(line)
         restatements = self._ids_by_body.setdefault(body, [])
         if record_id not in restatements:
@@ -247,7 +287,7 @@ class SharedLinker:
 
         known = self._meta_by_body.get(body)
         if known is None:
-            meta = self._new_lineage(body, occurred_at)
+            meta = self._new_lineage(body, occurred_at, structured)
         elif self._head_by_subject.get(known["subject"]) == known["claim_id"]:
             # The value this body carries is still the one standing on its
             # subject, so this is a plain restatement: re-emit verbatim.
@@ -293,8 +333,25 @@ class SharedLinker:
         self._head_by_subject[subject] = meta["claim_id"]
         return meta
 
-    def _new_lineage(self, body: str, occurred_at: object) -> dict[str, Any]:
-        """Mint the frontmatter for a body this scope has not seen before."""
+    def _new_lineage(
+        self,
+        body: str,
+        occurred_at: object,
+        structured: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Mint the frontmatter for a body this scope has not seen before.
+
+        When the extractor supplied a ``subject``/``value`` for this claim, the
+        subject is the lineage key and the **value** is what decides update from
+        restatement. That distinction is the whole point of structured
+        extraction: two sessions phrase the same fact differently, so a
+        body-keyed linker sees two unrelated claims, while a subject-keyed one
+        sees one fact whose value did — or did not — move.
+        """
+        provided_subject = str((structured or {}).get("subject") or "").strip()
+        if provided_subject:
+            return self._structured_lineage(provided_subject, structured, occurred_at)
+
         subject = self._subject_policy(body)
         claim_id = self._mint_claim_id()
 
@@ -326,6 +383,67 @@ class SharedLinker:
             self._supersedes_edges += 1
             self._updated_subjects.add(subject)
         self._head_by_subject[subject] = claim_id
+        return meta
+
+    def _structured_lineage(
+        self,
+        provided_subject: str,
+        structured: Mapping[str, Any] | None,
+        occurred_at: object,
+    ) -> dict[str, Any]:
+        """Link a claim whose subject and value the extractor supplied.
+
+        Three outcomes, decided by what already stands on the subject:
+
+        * nothing stands there yet — a new lineage, no edge;
+        * the standing value equals this one — a **restatement** in different
+          words, which re-uses the standing lineage verbatim so Arm C coalesces
+          the pair instead of treating a rephrasing as an update;
+        * the standing value differs — an **update**, which mints a new lineage
+          superseding the head and is the edge design doc §7.3 makes Arm C's
+          ceiling.
+
+        Comparing values rather than bodies is what makes the middle case
+        possible at all. Under the free-text policy the two probe phrasings of
+        one score ("The user's highest score in Ticket to Ride is 124 points" /
+        "The user reported achieving their highest score in Ticket to Ride, which
+        was 132 points") are simply two unrelated claims; here they are one
+        subject whose value moved.
+        """
+        subject = normalize_subject(provided_subject)
+        value = str((structured or {}).get("value") or "").strip()
+
+        head_meta = self._head_meta_by_subject.get(subject)
+        if head_meta is not None and str(head_meta.get("object", "")) == value:
+            # Same fact, same value, different wording: not an update.
+            return head_meta
+
+        claim_id = self._mint_claim_id()
+        if subject not in self._head_by_subject:
+            self._subjects.append(subject)
+
+        meta: dict[str, Any] = {
+            "claim_id": claim_id,
+            "subject": subject,
+            "predicate": CLAIM_PREDICATE,
+            # The value carries the identity, not the sentence: two phrasings of
+            # one value must project to one content_hash for Arm C to coalesce.
+            "object": value,
+            "state": CLAIM_STATE,
+            "type": CLAIM_TYPE,
+            "question_id": self._scope,
+        }
+
+        head = self._head_by_subject.get(subject)
+        if head is not None:
+            meta["supersedes"] = [head]
+            if isinstance(occurred_at, str) and occurred_at:
+                meta["valid_from"] = occurred_at
+            self._supersedes_edges += 1
+            self._updated_subjects.add(subject)
+
+        self._head_by_subject[subject] = claim_id
+        self._head_meta_by_subject[subject] = meta
         return meta
 
     # -- reporting ----------------------------------------------------------

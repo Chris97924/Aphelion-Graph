@@ -711,7 +711,20 @@ def test_no_hardcoded_model_or_endpoint_defaults_in_the_package() -> None:
     Scans the package's own sources. ``preregister.json`` is where the pinned
     identifiers legitimately live, and it is not Python.
     """
-    forbidden = ("gpt-", "claude-", "gemini-", "ollama", "11434", "192.168.")
+    # Extended 2026-08-15 with the newly pinned model family and its serving
+    # framework: the guard is about *which* names may appear in code, not about
+    # which model happens to be pinned today, so retiring a pin never retires
+    # its token.
+    forbidden = (
+        "gpt-",
+        "claude-",
+        "gemini-",
+        "qwen",
+        "ollama",
+        "vllm",
+        "11434",
+        "192.168.",
+    )
     offenders: list[str] = []
     for path in sorted(_BENCH_ROOT.rglob("*.py")):
         lowered = path.read_text(encoding="utf-8").lower()
