@@ -74,7 +74,79 @@ EXPECTED: dict = {
                 "the split and M1 still gates at N=78. Only M3's scoring "
                 "denominator is 72"
             ),
-        }
+        },
+        {
+            "date": "2026-08-15",
+            "authority": (
+                "design doc S6.3 pre-registration amendment window - legal "
+                "because no arm has run"
+            ),
+            "summary": (
+                "supplies M3's missing precondition and closes the two defects "
+                "that came with it: (1) the stale-value LABEL SOURCE is pinned - "
+                "benchmarks/longmemeval/m3_labels.json, 72 keys / 66 non-empty / "
+                "70 values, produced 2026-08-15 by a non-pinned model and "
+                "mechanically verified against the corpus "
+                "(docs/benchmark/m3-labels-methodology.md); (2) contamination "
+                "MATCHING is pinned as token-boundary case-sensitive rather than "
+                "raw substring; (3) the denominator is corrected 72 -> 66, "
+                "excluding the 6 knowledge-update questions whose evidence "
+                "carries no old->new update at all"
+            ),
+            "gates_moved": (
+                "none - M1 +3pp, M2 A+0.10 / epsilon=0.02, M3 C <= 0.5 * A, M4 "
+                "no-gate, M5 100/100 and AG +3pp are all unchanged, as are M3's "
+                "alpha=0.05 and its exact two-sided sign test. Defect 3 corrects "
+                "a denominator on the same factual-correction ground as the "
+                "2026-08-14 78 -> 72 step, and the C <= 0.5 * A ratio is "
+                "untouched because a common denominator cancels. Defect 2 is not "
+                "a threshold at all: it fixes HOW a labeled value is detected in "
+                "a retrieved context"
+            ),
+            "label_source": (
+                "m3_labels.json is committed to the repository and pinned by "
+                "sha256 (metrics.M3.labels_sha256, over CRLF-normalized bytes, "
+                "the same convention as design_doc_sha256). It was produced by "
+                "qwen3.6:latest at temperature 0 - deliberately NOT the pinned "
+                "answering/extractor model gpt-oss:120b, and never invoked by the "
+                "harness - and every candidate was mechanically verified to be a "
+                "verbatim substring of the question's own evidence sessions, to "
+                "differ from the gold answer, and to sit inside a quote that is "
+                "itself a corpus substring. The obvious automatic derivation, "
+                "reading old values off the harness's own shared-linker "
+                "supersedes edges, was REFUSED: those are the edges Arm C acts "
+                "on, so M3 would have scored Arm C against its own mechanism"
+            ),
+            "matching_rationale": (
+                "raw substring matching is not a conservative default, it is "
+                "systematically wrong on this label set: 23 of the 70 labels are "
+                "<= 4 characters ('4', '20', 'two'), so a substring test fires on "
+                "'42', '2024' and '14:30'. That inflates A and C by roughly the "
+                "same false-positive mass, and because M3's gate is a RATIO, "
+                "adding the same mass to both sides pushes C/A toward 1 and "
+                "biases the pinned C <= 0.5 * A gate toward FAIL. Pinned before "
+                "any arm has run, so the rule cannot be chosen to suit a result"
+            ),
+            "denominator_rationale": (
+                "the pinned M3 justification already restricts the metric to "
+                "questions where an update actually exists. The 2026-08-14 step "
+                "removed the 6 _abs variants on that ground structurally; this "
+                "step removes 6 more on the same ground empirically, after a "
+                "full-transcript labeling pass found no superseded value in their "
+                "evidence at all. Four of the six ASK for the earlier value "
+                "(their gold answer IS the historical fact, so nothing supersedes "
+                "it) and two state their value once and never revise it. Like the "
+                "_abs variants they are uncontaminable for every arm alike, so "
+                "leaving them in would deflate A and C by the same 6 questions "
+                "and bias the ratio toward FAIL"
+            ),
+            "scope_note": (
+                "split.knowledge_update stays 78 and M1 still gates at N=78; the "
+                "labels file still carries all 72 structural keys (6 with an "
+                "empty list) so the exclusion is auditable rather than invisible. "
+                "Only M3's scoring denominator moves, 72 -> 66"
+            ),
+        },
     ],
     "split": {
         "knowledge_update": 78,
@@ -107,9 +179,11 @@ EXPECTED: dict = {
         },
         "M3": {
             "gate": "C <= 0.5 * A",
-            "N": 72,
+            "N": 66,
             "denominator": (
-                "knowledge-update, excluding the 6 abstention (_abs) variants"
+                "knowledge-update, excluding the 6 abstention (_abs) variants "
+                "(structural) and the 6 questions whose evidence carries no "
+                "old->new update (empirical)"
             ),
             "denominator_amendment": (
                 "corrected 78 -> 72 on 2026-08-14 (design doc S4 M3 row): the 6 "
@@ -118,6 +192,63 @@ EXPECTED: dict = {
                 "update, so no stale-value label can exist for them. Factual "
                 "correction to the denominator; the C <= 0.5 * A ratio is "
                 "unchanged"
+            ),
+            "denominator_amendment_2": (
+                "corrected 72 -> 66 on 2026-08-15, same factual-correction class "
+                "as the _abs step and on the same pinned ground ('only where an "
+                "update actually exists'): the 2026-08-15 labeling pass read "
+                "every one of the 72 transcripts in full and found 6 questions "
+                "with no superseded value in their evidence at all (see "
+                "no_update_exclusions). Four of them ask FOR the earlier value, "
+                "so their gold answer is itself the historical fact and nothing "
+                "supersedes it; two state their value once and never revise it. "
+                "They are uncontaminable for every arm alike, so keeping them "
+                "would deflate A and C by the same 6 questions and bias the "
+                "C <= 0.5 * A ratio toward FAIL. The ratio is unchanged - a "
+                "common denominator cancels"
+            ),
+            "no_update_exclusions": [
+                "0977f2af",
+                "10e09553",
+                "22d2cb42",
+                "5c40ec5b",
+                "9bbe84a2",
+                "dfde3500",
+            ],
+            "labels_file": "benchmarks/longmemeval/m3_labels.json",
+            # ``labels_sha256`` is deliberately absent here and popped before the
+            # comparison, exactly as ``design_doc_sha256`` is: a digest asserted
+            # against a copy of itself proves nothing, so both are verified by
+            # recomputation from the file they pin instead.
+            "labels_sha256_normalization": (
+                "sha256 over the file's bytes with CRLF normalized to LF, so the "
+                "pin is checkout-line-ending independent - the same convention "
+                "design_doc_sha256 uses"
+            ),
+            "labels_provenance": (
+                "docs/benchmark/m3-labels-methodology.md; 72 keys (all structural "
+                "knowledge-update non-_abs ids, so the 6 no-update questions stay "
+                "visible as empty lists rather than vanishing), 66 non-empty, 70 "
+                "values; produced by qwen3.6:latest at temperature 0, which is "
+                "NOT a pinned benchmark model and is never invoked by the "
+                "harness; every value mechanically verified as a verbatim "
+                "substring of its own question's evidence sessions"
+            ),
+            "matching": (
+                "token-boundary, case-sensitive: a labeled old value counts as "
+                "surfaced iff it appears in a retrieved context string not "
+                "immediately flanked by word characters, i.e. the regex "
+                "(?<!\\w) re.escape(value) (?!\\w). Lookarounds rather than \\b "
+                "because many labels begin or end with a non-word character "
+                "('$350', '3-2', '7:00 pm'), which \\b cannot anchor. Pinned "
+                "2026-08-15, before any arm has run"
+            ),
+            "matching_superseded": (
+                "the skeleton's rule was raw case-sensitive substring "
+                "containment. It is superseded, not merely refined: 23 of the 70 "
+                "labels are <= 4 characters, so it fires on '42', '2024' and "
+                "'14:30' for a label of '4', inflating both arms and biasing the "
+                "ratio gate toward FAIL. Never exercised - no arm has run"
             ),
             "inconclusive_test": {
                 "method": (
@@ -237,6 +368,13 @@ def test_preregister_carries_exactly_the_pinned_values() -> None:
     recorded_hash = actual.pop("design_doc_sha256", None)
     assert recorded_hash is not None, "preregister.json is missing design_doc_sha256"
 
+    # Same treatment for the M3 labels digest: verified by recomputation in
+    # test_m3_labels_sha256_matches_recorded, never by comparison with a copy.
+    recorded_labels_hash = actual["metrics"]["M3"].pop("labels_sha256", None)
+    assert recorded_labels_hash is not None, (
+        "preregister.json is missing metrics.M3.labels_sha256"
+    )
+
     # Iterate the whole expected dict so a mismatch names the offending key...
     for key, value in EXPECTED.items():
         assert key in actual, f"preregister.json is missing pinned key: {key!r}"
@@ -275,3 +413,50 @@ def test_design_doc_sha256_matches_recorded() -> None:
         f"  recorded = {recorded_hash}\n"
         f"  computed = {computed}"
     )
+
+
+def test_m3_labels_sha256_matches_recorded() -> None:
+    """Recompute the M3 labels SHA-256 and assert it matches the recorded value.
+
+    The labels file *is* M3's sample: its keys are the denominator and its values
+    are what "contaminated" means. Pinning it by digest is what stops the metric
+    being redefined after the fact by editing the data it scores. Hashed with the
+    same CRLF -> LF normalization as the design doc, so the pin holds on a Windows
+    CRLF working tree and a Linux LF checkout alike.
+    """
+    record = _load_preregister()["metrics"]["M3"]
+    recorded_hash = record["labels_sha256"]
+    labels_path = REPO_ROOT / record["labels_file"]
+
+    assert labels_path.is_file(), f"pinned labels file not found at {labels_path}"
+    assert isinstance(recorded_hash, str) and len(recorded_hash) == 64, (
+        f"labels_sha256 must be 64 hex chars, got {recorded_hash!r}"
+    )
+    assert recorded_hash == recorded_hash.lower(), "labels_sha256 must be lowercase hex"
+
+    normalized = labels_path.read_bytes().replace(b"\r\n", b"\n")
+    computed = hashlib.sha256(normalized).hexdigest()
+    assert computed == recorded_hash, (
+        "M3 labels SHA-256 mismatch -- were the labels edited after pinning?\n"
+        f"  recorded = {recorded_hash}\n"
+        f"  computed = {computed}"
+    )
+
+
+def test_m3_denominator_is_consistent_with_the_labels_file() -> None:
+    """N, the label keyset and the no-update exclusions must agree with each other.
+
+    Three numbers in the pre-registration describe one sample; if they can drift
+    apart, the recorded N stops meaning what the labels actually score.
+    """
+    record = _load_preregister()["metrics"]["M3"]
+    labels = json.loads(
+        (REPO_ROOT / record["labels_file"]).read_text(encoding="utf-8")
+    )
+    excluded = record["no_update_exclusions"]
+
+    assert len(labels) == 72, "the labels file keeps every structural KU non-_abs id"
+    assert sorted(excluded) == sorted(
+        qid for qid, values in labels.items() if not values
+    ), "the pinned no-update ids must be exactly the empty-label questions"
+    assert record["N"] == len(labels) - len(excluded) == 66

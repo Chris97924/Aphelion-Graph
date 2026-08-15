@@ -52,7 +52,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -606,6 +606,9 @@ class RealRunConfig:
     top_k: int = DEFAULT_TOP_K
     samples_root: Path = SAMPLES_ROOT
     m3_labels: Path | None = None
+    # Set only to score M3 from a labels file that is not the pre-registered one.
+    # Mirrors judge_deviation_ack: the deviation is allowed, but never implicit.
+    m3_labels_deviation_ack: bool = False
     resamples: int = m1_qa.BOOTSTRAP_RESAMPLES
     # Which form the judge CLI is handed its prompt. Exposed as a run setting
     # because which form the installed build accepts is an operational fact about
@@ -683,6 +686,7 @@ def build_manifest(
     retriever_params: Mapping[str, Any],
     split_manifest: Mapping[str, Any],
     judge_standing: Mapping[str, Any],
+    label_source: M3LabelSource | None,
 ) -> dict[str, Any]:
     """The run's provenance record: what ran, against what, under which pins."""
     preregister = json.loads(cfg.preregister_path.read_text(encoding="utf-8"))
@@ -704,9 +708,24 @@ def build_manifest(
         "corpus_source_sha256": split_manifest.get("source_sha256", {}),
         "corpus_loaded_sha256": corpus_digests(cfg),
         "corpus_data_dir": str(cfg.directory()),
-        "m3_labels_path": str(cfg.m3_labels) if cfg.m3_labels else None,
-        "m3_labels_sha256": file_digest(cfg.m3_labels),
-        "samples_root": str(cfg.samples_root),
+        **(
+            label_source.as_record()
+            if label_source is not None
+            else {
+                "m3_labels_path": None,
+                "m3_labels_sha256": None,
+                "m3_labels_match_preregistered": None,
+                "m3_labels_pinned_file": None,
+                "m3_labels_deviation_acknowledged": False,
+            }
+        ),
+        # Resolved, so the manifest names where the bytes were actually read
+        # from. A symlinked samples root is a legitimate operator arrangement and
+        # the digest covers its target correctly — M5's own package discovery
+        # follows it identically — but a manifest that recorded the link rather
+        # than its destination would describe a corpus that is not the one
+        # measured.
+        "samples_root": str(Path(cfg.samples_root).resolve()),
         "samples_sha256": samples_digest(cfg.samples_root),
         "haystack": cfg.haystack,
         "split": cfg.split,
@@ -979,6 +998,9 @@ _IDENTITY_FIELDS = (
     "corpus_loaded_sha256",
     "corpus_data_dir",
     "m3_labels_sha256",
+    # Whether M3 was scored from the pre-registered sample. A resume that swapped
+    # a deviant label set in halfway would otherwise report one M3 over two.
+    "m3_labels_match_preregistered",
     # M5's inputs: its gate is a function of the sample corpus, which is often
     # untracked and therefore invisible to both git and the harness digest.
     "samples_sha256",
@@ -1620,26 +1642,72 @@ def m3_gate_verdict(
     }
 
 
-def m3_denominator_ids(
-    split_manifest: Mapping[str, Any], path: Path = PREREGISTER_PATH
-) -> tuple[list[str], int]:
-    """The knowledge-update ids M3 is defined over, and the pinned denominator.
+@dataclass(frozen=True)
+class M3Denominator:
+    """M3's two question sets, which are deliberately not the same set.
 
-    Derived structurally — the KU pool minus its abstention (``_abs``) variants —
-    rather than by transcribing the six ids out of the pin's prose, because the
-    pin states the *rule* ("the 6 KU ``_abs`` variants ... encode no old→new
-    update, so no stale-value label can exist for them") and a transcribed list
-    would silently rot if the split ever moved. The pinned ``N`` is returned
-    alongside so callers can report whether the derivation actually lands on it.
+    ``label_ids`` is the **structural** knowledge-update pool minus its
+    abstention variants — the keyset the labels file must cover exactly, so that
+    a question carrying no old value is visible as an empty list rather than
+    absent. ``scored_ids`` is the **pinned denominator**: those same questions
+    minus the ones the labeling pass found carry no old→new update at all.
+
+    Keeping them apart is the point. Validating the label file against the wider
+    set keeps the exclusion auditable in the data; scoring against the narrower
+    one keeps 6 structurally uncontaminable questions from deflating both arms
+    equally and biasing the pinned ``C <= 0.5 * A`` ratio toward FAIL.
+    """
+
+    label_ids: tuple[str, ...]
+    no_update_ids: tuple[str, ...]
+    scored_ids: tuple[str, ...]
+    pinned_n: int
+
+    @property
+    def matches_pin(self) -> bool:
+        """True when the derivation lands on the pre-registered denominator."""
+        return len(self.scored_ids) == self.pinned_n
+
+
+def m3_denominator(
+    split_manifest: Mapping[str, Any], path: Path = PREREGISTER_PATH
+) -> M3Denominator:
+    """Derive M3's label keyset and its pinned scoring denominator.
+
+    The ``_abs`` exclusion is derived **structurally** from the rule the pin
+    states ("the 6 KU ``_abs`` variants ... encode no old→new update"), never by
+    transcribing ids, because a transcribed list would silently rot if the split
+    moved. The no-update exclusion cannot be derived that way — it is an
+    empirical finding about six specific transcripts — so it is *read* from the
+    pre-registration's own ``no_update_exclusions`` list and never hardcoded
+    here.
     """
     # The pin is read FIRST and strictly. Deriving the ids first would let a
     # label-set mismatch raise before an unreadable ``N`` was ever noticed, so
     # the louder error would mask the one that says the pre-registration itself
     # cannot be read.
-    pinned_n = _pinned_int(preregistered_metric("M3", path), "N", "M3", path)
+    record = preregistered_metric("M3", path)
+    pinned_n = _pinned_int(record, "N", "M3", path)
+    excluded = record.get("no_update_exclusions")
+    if not isinstance(excluded, list) or not all(
+        isinstance(qid, str) for qid in excluded
+    ):
+        raise GatePinError(
+            f"{path}: pinned M3 'no_update_exclusions' must be a list of question "
+            f"ids, got {excluded!r}. The questions carrying no old->new update are "
+            "an empirical finding recorded in the pre-registration; this harness "
+            "will not re-derive or default them."
+        )
+
     ku = [str(qid) for qid in split_manifest.get("question_ids", {}).get("ku", [])]
-    ids = sorted(qid for qid in ku if not qid.endswith("_abs"))
-    return ids, pinned_n
+    label_ids = tuple(sorted(qid for qid in ku if not qid.endswith("_abs")))
+    no_update = tuple(sorted(excluded))
+    return M3Denominator(
+        label_ids=label_ids,
+        no_update_ids=no_update,
+        scored_ids=tuple(qid for qid in label_ids if qid not in set(no_update)),
+        pinned_n=pinned_n,
+    )
 
 
 class M3LabelError(ValueError):
@@ -1849,23 +1917,233 @@ def _pool_arm_perf(rows: Iterable[Mapping[str, Any]], arm: str) -> m4_perf.ArmPe
     )
 
 
-def load_m3_labels(path: Path | None) -> dict[str, list[str]]:
-    """Read an external stale-value label file, or return no labels.
+def digest_bytes(raw: bytes) -> str:
+    """Hex SHA-256 of ``raw`` with CRLF normalized to LF.
 
-    M3 needs, per knowledge-update question, the *old* value that must not reach
-    the answering model. LongMemEval ships no such annotation, and the harness
-    deliberately does not synthesise one: the obvious derivation — reading the old
-    value off the shared linker's own ``supersedes`` edges — would label M3 with
-    exactly the edges Arm C acts on, making the metric close to tautological.
-    Choosing a label source is a pre-registration-level decision (design doc §6.3)
-    for the maintainer, so it arrives as data or not at all.
+    The convention the pre-registration's own ``design_doc_sha256`` and
+    ``labels_sha256`` use, so a pin holds on a Windows CRLF working tree and a
+    Linux LF checkout of the same committed content alike. Raw-byte hashing would
+    make the pinned digest fail on exactly one of the two platforms.
+
+    Takes bytes rather than a path so a caller can hash *the same read* it will
+    use — see :func:`resolve_m3_labels`.
     """
-    if path is None:
-        return {}
-    return {
-        str(qid): [str(value) for value in values]
-        for qid, values in json.loads(path.read_text(encoding="utf-8")).items()
-    }
+    return hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def normalized_digest(path: Path) -> str:
+    """Hex SHA-256 of a file, CRLF-normalized. Convenience over :func:`digest_bytes`."""
+    return digest_bytes(path.read_bytes())
+
+
+def parse_m3_labels(raw: bytes, source: Path) -> dict[str, list[str]]:
+    """Parse a labels payload, raising :class:`M3LabelError` on anything unusable.
+
+    Parsed from bytes already in hand rather than from a path, so the labels a run
+    scores are provably the ones whose digest it verified.
+    """
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise M3LabelError(f"{source}: labels are not valid UTF-8 JSON ({exc})") from exc
+    if not isinstance(record, dict):
+        raise M3LabelError(
+            f"{source}: labels must be a JSON object mapping question_id -> "
+            f"[old value, ...], got {type(record).__name__}"
+        )
+    labels: dict[str, list[str]] = {}
+    for qid, values in record.items():
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) for value in values
+        ):
+            raise M3LabelError(
+                f"{source}: labels for {qid!r} must be a list of strings, got "
+                f"{values!r}"
+            )
+        labels[str(qid)] = list(values)
+    return labels
+
+
+@dataclass(frozen=True)
+class M3LabelSource:
+    """The labels a run will score M3 from — as a verified **snapshot**.
+
+    ``labels`` is parsed from the very bytes that were hashed, and is the only
+    thing scoring ever reads. The path is never re-opened after verification,
+    which closes the window where a file modified, repointed or deleted between
+    the check and the scoring pass would let a run score one label set while its
+    manifest attested another.
+
+    ``matches_preregistered`` is decided by **digest**, not by whether an override
+    path was passed: pointing ``--m3-labels`` at the pinned file itself is not a
+    deviation, and pointing it anywhere else is one even if the keys line up.
+    """
+
+    path: Path
+    sha256: str
+    labels: dict[str, list[str]]
+    matches_preregistered: bool
+    pinned_file: str | None
+    pinned_sha256: str | None
+    deviation_acknowledged: bool
+
+    def as_record(self) -> dict[str, Any]:
+        """The label-provenance fields a run records."""
+        return {
+            "m3_labels_path": str(self.path),
+            "m3_labels_sha256": self.sha256,
+            "m3_labels_match_preregistered": self.matches_preregistered,
+            "m3_labels_pinned_file": self.pinned_file,
+            "m3_labels_deviation_acknowledged": self.deviation_acknowledged,
+        }
+
+
+def resolve_m3_labels(
+    cfg: RealRunConfig, path: Path = PREREGISTER_PATH
+) -> M3LabelSource | None:
+    """Resolve, and *enforce*, the label source M3 will be scored from.
+
+    With a label pin in the pre-registration this is no longer an operator
+    choice. The labels file **is** M3's sample — its keys are the denominator and
+    its values are what "contaminated" means — so a run that scored some other
+    JSON, or quietly scored nothing because a flag was omitted, would publish an
+    M3 the pre-registration does not describe. Both were possible before this
+    check existed.
+
+    The pinned file is resolved repo-relative and its digest verified *before*
+    any scoring. A missing file or a digest mismatch is a stop
+    (:class:`M3LabelError`), never a downgrade to "no M3".
+
+    An operator file is still reachable, on the same terms the judge deviation
+    uses: it must be acknowledged explicitly, and the run records the deviant
+    path, its digest and ``m3_labels_match_preregistered: false`` in both the
+    manifest and the metrics, so a deviant run can never read as the pinned one.
+
+    Returns ``None`` only when the pre-registration carries no label pin *and* no
+    override was supplied — the pre-pin configuration, where M3 genuinely cannot
+    be scored.
+    """
+    record = preregistered_metric("M3", path)
+    pinned_file, pinned_sha = _read_label_pin(record, path)
+
+    if pinned_file is None:
+        # The legacy, pre-pin configuration: no label pin at all.
+        if cfg.m3_labels is None:
+            return None
+        return _snapshot_labels(
+            Path(cfg.m3_labels),
+            matches_preregistered=False,
+            pinned_file=None,
+            pinned_sha256=None,
+            acknowledged=cfg.m3_labels_deviation_ack,
+        )
+
+    resolved = Path(
+        cfg.m3_labels if cfg.m3_labels is not None else REPO_ROOT / pinned_file
+    )
+    if not resolved.is_file():
+        raise M3LabelError(
+            f"the pinned M3 labels file {pinned_file!r} was not found at "
+            f"{resolved}. M3's sample is pinned in preregister.json "
+            "(metrics.M3.labels_file / labels_sha256); a run cannot score M3 "
+            "without it, and will not silently report no M3 instead."
+        )
+
+    source = _snapshot_labels(
+        resolved,
+        matches_preregistered=False,
+        pinned_file=pinned_file,
+        pinned_sha256=pinned_sha,
+        acknowledged=cfg.m3_labels_deviation_ack,
+    )
+    matches = source.sha256 == pinned_sha
+    if not matches and not cfg.m3_labels_deviation_ack:
+        raise M3LabelError(
+            f"the M3 labels at {resolved} do not match the pre-registered "
+            f"labels file.\n  expected sha256 = {pinned_sha}\n  actual   sha256 = "
+            f"{source.sha256}\nThe labels file IS M3's sample - its keys are the "
+            "denominator and its values define contamination - so scoring a "
+            "different one would publish an M3 the pre-registration does not "
+            "describe. Restore the pinned file, or pass "
+            "--m3-labels-deviation-ack to record the deviation in the results."
+        )
+    return replace(source, matches_preregistered=matches)
+
+
+def _snapshot_labels(
+    path: Path,
+    *,
+    matches_preregistered: bool,
+    pinned_file: str | None,
+    pinned_sha256: str | None,
+    acknowledged: bool,
+) -> M3LabelSource:
+    """Read the labels file ONCE, then hash and parse that same read.
+
+    One read is the whole point. Hashing the path and later re-opening it to
+    parse leaves a window in which the file can change between the two, so the
+    run would score bytes it never verified while its manifest attested the
+    digest of bytes it no longer holds.
+    """
+    raw = path.read_bytes()
+    return M3LabelSource(
+        path=path,
+        sha256=digest_bytes(raw),
+        labels=parse_m3_labels(raw, path),
+        matches_preregistered=matches_preregistered,
+        pinned_file=pinned_file,
+        pinned_sha256=pinned_sha256,
+        deviation_acknowledged=acknowledged,
+    )
+
+
+def _read_label_pin(
+    record: Mapping[str, Any], path: Path
+) -> tuple[str | None, str | None]:
+    """Read the label pin, failing CLOSED on anything partial or malformed.
+
+    The legacy no-pin path is legal only when ``labels_file`` and
+    ``labels_sha256`` are *both entirely absent* — the genuine pre-pin
+    configuration. A half-written or mistyped pin is not a configuration without
+    a pin, and treating it as one would silently reopen exactly the hole the pin
+    was added to close: M3 skipped for a missing flag, or an override accepted
+    with no acknowledgement.
+    """
+    has_file = "labels_file" in record
+    has_sha = "labels_sha256" in record
+    if not has_file and not has_sha:
+        return None, None
+
+    if not has_file or not has_sha:
+        missing = "labels_file" if not has_file else "labels_sha256"
+        present = "labels_sha256" if not has_file else "labels_file"
+        raise GatePinError(
+            f"{path}: pinned M3 carries {present!r} but not {missing!r}. A label "
+            "pin is both fields or neither; half a pin cannot be verified, and "
+            "this harness will not fall back to the unpinned path to make it "
+            "usable."
+        )
+
+    pinned_file = record["labels_file"]
+    pinned_sha = record["labels_sha256"]
+    if not isinstance(pinned_file, str) or not pinned_file.strip():
+        raise GatePinError(
+            f"{path}: pinned M3 'labels_file' must be a non-empty string, got "
+            f"{pinned_file!r}."
+        )
+    if (
+        not isinstance(pinned_sha, str)
+        or len(pinned_sha) != 64
+        or pinned_sha != pinned_sha.lower()
+        or any(character not in "0123456789abcdef" for character in pinned_sha)
+    ):
+        raise GatePinError(
+            f"{path}: pinned M3 'labels_sha256' must be 64 lowercase hex "
+            f"characters, got {pinned_sha!r}. Reported as a malformed pin rather "
+            "than left to surface later as a digest mismatch, which would blame "
+            "the labels file for a defect in the pre-registration."
+        )
+    return pinned_file, pinned_sha
 
 
 def compute_metrics(
@@ -1876,6 +2154,7 @@ def compute_metrics(
     phase: AnswerPhase,
     claim_rows: Sequence[Mapping[str, Any]],
     split_manifest: Mapping[str, Any],
+    label_source: M3LabelSource | None,
 ) -> dict[str, Any]:
     """Reduce the run's durable rows to the §4 metrics.
 
@@ -1973,42 +2252,68 @@ def compute_metrics(
     }
 
     # -- M3 ---------------------------------------------------------------
-    labels = load_m3_labels(cfg.m3_labels)
-    if labels:
-        expected_ids, pinned_n = m3_denominator_ids(split_manifest, path)
-        validate_m3_labels(labels, expected_ids)
+    # The verified snapshot, never a re-read of the path: between verification
+    # and here the file may have been modified, repointed or deleted, and a run
+    # that scored those bytes while its manifest attested the earlier digest
+    # would be unattributable.
+    labels = label_source.labels if label_source else {}
+    if label_source and labels:
+        denominator = m3_denominator(split_manifest, path)
+        validate_m3_labels(labels, denominator.label_ids)
+        # Scored over the pinned denominator, NOT over every labeled key: the
+        # 6 no-update questions carry no stale value any arm could surface, so
+        # including them would add the same uncontaminable mass to every arm and
+        # push the C <= 0.5 * A ratio toward 1.
+        scored_ids = set(denominator.scored_ids)
         contexts: dict[str, dict[str, list[str]]] = {arm: {} for arm in ARM_STORES}
         for row in answer_rows:
-            if row["question_id"] in labels:
+            if row["question_id"] in scored_ids:
                 contexts[row["arm"]][row["question_id"]] = row["retrieved_texts"]
         scores = {
             arm: m3_contamination.contamination_rate(per_arm, labels)
             for arm, per_arm in sorted(contexts.items())
         }
         contaminated = {arm: set(score.contaminated_ids) for arm, score in scores.items()}
-        labelled_ids = sorted(set(labels) & set(question_ids))
-        readability = m3_readability(contaminated, labelled_ids, path)
+        scored_here = sorted(scored_ids & set(question_ids))
+        readability = m3_readability(contaminated, scored_here, path)
         rate = {arm: score.rate for arm, score in scores.items()}
         metrics["m3"] = {
             "rate": rate,
             "contaminated": {arm: score.contaminated for arm, score in scores.items()},
             "total": {arm: score.total for arm, score in scores.items()},
             "readability": readability,
-            "gate": m3_gate_verdict(rate, readability, len(labelled_ids), path),
-            "denominator_ids": len(expected_ids),
-            "denominator_matches_pin": len(expected_ids) == pinned_n,
-            "labels_source": str(cfg.m3_labels),
-            "labels_sha256": file_digest(cfg.m3_labels),
+            "gate": m3_gate_verdict(rate, readability, len(scored_here), path),
+            "label_keyset_ids": len(denominator.label_ids),
+            "denominator_ids": len(denominator.scored_ids),
+            "denominator_matches_pin": denominator.matches_pin,
+            "no_update_excluded": list(denominator.no_update_ids),
+            "matching": preregistered_metric("M3", path).get("matching"),
+            "labels_source": str(label_source.path),
+            "labels_sha256": label_source.sha256,
+            "labels_match_preregistered": label_source.matches_preregistered,
+            "labels_deviation_acknowledged": label_source.deviation_acknowledged,
         }
+    elif label_source:
+        # A resolved-but-empty label file. Not reachable with the pinned file
+        # (66 of its 72 keys carry values), so this means an operator file that
+        # labels nothing — reported as a stop rather than as a zero rate.
+        metrics["m3"] = None
+        metrics["m3_reason"] = (
+            f"the labels file at {label_source.path} carries no values, so there "
+            "is nothing for M3 to detect. A rate of 0.0 from an empty label set "
+            "would read as 'no arm surfaced a stale value' rather than 'nothing "
+            "was looked for'."
+        )
     else:
         metrics["m3"] = None
         metrics["m3_reason"] = (
-            "no stale-value labels supplied (--m3-labels). The corpus ships no "
-            "old-value annotation and this harness will not derive one from the "
-            "shared linker's supersedes edges, because those are the very edges "
-            "Arm C acts on: M3 would then score Arm C against its own mechanism. "
-            "Choosing a label source is a maintainer decision under design doc "
-            "§6.3."
+            "this pre-registration carries no M3 label pin "
+            "(metrics.M3.labels_file / labels_sha256), and no override was "
+            "supplied. The corpus ships no old-value annotation and this harness "
+            "will not derive one from the shared linker's supersedes edges, "
+            "because those are the very edges Arm C acts on: M3 would then score "
+            "Arm C against its own mechanism. Choosing a label source is a "
+            "maintainer decision under design doc §6.3."
         )
 
     # -- M4 ---------------------------------------------------------------
@@ -2185,6 +2490,11 @@ def execute(
     require_judge_acknowledged(standing, cfg.judge_deviation_ack)
     standing["judge_deviation_acknowledged"] = cfg.judge_deviation_ack
 
+    # Resolved and digest-verified here, before a single model call: M3's sample
+    # is pinned, so a missing or altered labels file must stop the run rather
+    # than surface hours later as a metric nobody can attribute.
+    label_source = resolve_m3_labels(cfg, cfg.preregister_path)
+
     pins = {
         "answering": clients.answering_pin(cfg.preregister_path),
         "extractor": clients.extractor_pin(cfg.preregister_path),
@@ -2204,6 +2514,7 @@ def execute(
             retriever_params=retriever.params,
             split_manifest=split_manifest,
             judge_standing=standing,
+            label_source=label_source,
         ),
     )
 
@@ -2270,6 +2581,7 @@ def execute(
         phase=phase,
         claim_rows=read_jsonl(cfg.out_dir / CLAIMS_NAME),
         split_manifest=split_manifest,
+        label_source=label_source,
     )
     metrics["manifest"] = {
         key: manifest.get(key)
@@ -2283,6 +2595,9 @@ def execute(
             "judge_matches_preregistered_pin",
             "judge_deviation_acknowledged",
             "samples_sha256",
+            "m3_labels_path",
+            "m3_labels_sha256",
+            "m3_labels_match_preregistered",
         )
     }
     # Surfaced at the top level too: whether the judge was the pre-registered one
