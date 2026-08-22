@@ -40,6 +40,35 @@ jobs:
         run: |
           pytest --cov=src --cov-report=term-missing --cov-fail-under=80
 
+      # Report-only, and deliberately a SECOND run rather than more --cov flags
+      # on the one above: adding them would fold benchmarks/ and scripts/ into
+      # the same total the 80% floor is measured against, which would silently
+      # redefine what that floor means. The floor stays scoped to src/; this step
+      # exists so the harness and the scripts stop being invisible.
+      #
+      # --cov-fail-under=0 is what makes it report-only: these packages are not
+      # gated, and a number nobody can see is not a number. Baseline at the time
+      # this step was added: benchmarks/ + scripts/ = 85% (3427 statements, 514
+      # uncovered); lowest benchmark modules were corpus.py 84%, run.py 85%,
+      # metrics/_stats.py 93%. scripts/check_forbidden_terms.py and
+      # scripts/generate_samples.py report 0% — the former only ever runs as a
+      # subprocess, so coverage cannot see it.
+      #
+      # No test paths are passed. `pytest ... benchmarks scripts` collects
+      # nothing (neither directory holds tests), reports a uniform 0% and exits
+      # 5, which would fail the job while measuring nothing.
+      #
+      # continue-on-error because "report-only" has to mean it. This step
+      # re-runs the whole suite to collect a different coverage scope, so
+      # without it an unrelated flake here — the Hypothesis deadline in
+      # tests/test_diff_fuzz_hardening.py is a live example — would fail a job
+      # whose gating test step had already passed. Real failures are still
+      # caught: they fail the gated step above first.
+      - name: Report coverage for benchmarks and scripts (not gated)
+        continue-on-error: true
+        run: |
+          pytest --cov=benchmarks --cov=scripts --cov-report=term --cov-fail-under=0 -q
+
       - name: Smoke test init -> validate -> verify (bash)
         if: runner.os != 'Windows'
         shell: bash
