@@ -1000,18 +1000,37 @@ class StructuredClaim:
     value: str
 
 
-def _strip_fence_delimiters(completion: str) -> str:
-    """Drop standalone code-fence delimiter lines, keeping everything else.
+# JSON's own inter-token whitespace, and only it. ``str.isspace`` is wider — it
+# is true for NBSP, form feed, vertical tab and the Unicode separators — so
+# skipping on it would have this reader accept, between claim objects, bytes the
+# JSON grammar rejects inside one. That is precisely the quiet tolerance this
+# parser exists not to have.
+_JSON_WHITESPACE = " \t\n\r"
+
+
+def _blank_fence_delimiters(completion: str) -> str:
+    """Blank standalone code-fence delimiter lines, preserving every offset.
 
     A model that wraps correct output in a fence has still answered correctly, so
-    a line that is *only* a delimiter carries no claim and is removed. A fence
-    with content on the same line is left in place deliberately: it is malformed,
-    and the parser below will refuse it rather than let a claim vanish.
+    a line that is *only* a delimiter carries no claim. It is overwritten with
+    spaces rather than deleted, and that distinction is the whole point:
+
+    * Spaces are :data:`_JSON_WHITESPACE`, so a blanked line is skipped between
+      objects and tolerated between one object's members. A delimiter line that
+      lands in the middle of a broken object therefore cannot take that object's
+      members with it — the parse either succeeds with every member intact, or
+      fails, and the members are still there to be seen in the error.
+    * Deleting the line would shift every offset after it, so the offsets this
+      module reports would index a payload the model never sent. Blanking keeps
+      the text's geometry exactly: every reported offset indexes the completion
+      as received.
+
+    A fence with content on the same line is left in place deliberately: it is
+    malformed, and the parser below refuses it rather than let a claim vanish.
     """
     return "\n".join(
-        line
+        " " * len(line) if _FENCE_DELIMITER_RE.fullmatch(line.strip()) else line
         for line in completion.split("\n")
-        if not _FENCE_DELIMITER_RE.fullmatch(line.strip())
     )
 
 
@@ -1026,30 +1045,46 @@ def extracted_claims(completion: str) -> list[StructuredClaim]:
     valid output, and no prompt wording closes a layout difference that varies
     with the input rather than with the instruction.
 
-    Whitespace between objects is skipped; **anything else between or after them
-    is not**. Strictness is unchanged where it matters: the schema is still
-    exactly :data:`CLAIM_FIELDS`, unknown fields still raise, a non-object still
-    raises, and a completion carrying no claims at all still raises rather than
-    returning an empty list — see :class:`ExtractionFormatError` for why a lost
-    claim may not be salvaged into silence.
+    JSON's own whitespace between objects is skipped; **anything else between or
+    after them is not**, and that includes whitespace JSON does not recognise
+    (see :data:`_JSON_WHITESPACE`). Strictness is unchanged where it matters: the
+    schema is still exactly :data:`CLAIM_FIELDS`, unknown fields still raise, a
+    non-object still raises, and a completion carrying no claims at all still
+    raises rather than returning an empty list — see
+    :class:`ExtractionFormatError` for why a lost claim may not be salvaged into
+    silence.
+
+    Every offset in a raised message indexes ``completion`` itself, because the
+    fence handling preserves offsets (:func:`_blank_fence_delimiters`). An
+    operator reading the error can count to the reported byte in the output they
+    actually received.
     """
-    payload = _strip_fence_delimiters(completion)
+    payload = _blank_fence_delimiters(completion)
     decoder = json.JSONDecoder()
     claims: list[StructuredClaim] = []
     index, length = 0, len(payload)
 
     while True:
-        while index < length and payload[index].isspace():
+        while index < length and payload[index] in _JSON_WHITESPACE:
             index += 1
         if index >= length:
             break
 
+        # ``index`` is the first byte of an object, and stays that way on
+        # failure: ``raw_decode`` rebinds it only when it returns. The object's
+        # start is what the message leads with, because that is where an
+        # operator has to start reading to see what the model actually emitted;
+        # the decoder's own position is reported beside it, never instead of it.
+        start = index
         try:
-            record, index = decoder.raw_decode(payload, index)
+            record, index = decoder.raw_decode(payload, start)
         except json.JSONDecodeError as exc:
             raise ExtractionFormatError(
-                f"extractor output is not a stream of JSON objects ({exc}) at "
-                f"offset {index}: {payload[index : index + 160]!r}"
+                f"extractor output is not a stream of JSON objects: {exc.msg}. "
+                f"The object beginning at offset {start} does not parse; the "
+                f"decoder stopped at offset {exc.pos}. Offsets index the "
+                f"completion as received. From offset {start}: "
+                f"{completion[start : start + 160]!r}"
             ) from exc
 
         if not isinstance(record, dict):

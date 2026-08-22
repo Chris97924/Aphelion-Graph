@@ -1066,6 +1066,116 @@ def test_a_fence_prefixed_line_carrying_content_is_not_silently_dropped(
         clients.extracted_claims(line)
 
 
+# --------------------------------------------------------------------------- #
+# PR #27's ticketed P3 strictness nits                                          #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("whitespace", [" ", "\t", "\n", "\r", " \t\r\n "])
+def test_json_whitespace_between_objects_is_skipped(whitespace: str) -> None:
+    """The four characters the JSON grammar calls whitespace, and they work."""
+    record = json.dumps({"text": "t", "subject": "s", "value": "v"})
+    claims = clients.extracted_claims(f"{record}{whitespace}{record}")
+    assert len(claims) == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "separator",
+    [
+        " ",  # no-break space
+        "\x0b",  # vertical tab
+        "\x0c",  # form feed
+        " ",  # line separator
+        "　",  # ideographic space
+    ],
+)
+def test_whitespace_json_does_not_recognise_is_refused(separator: str) -> None:
+    """``str.isspace`` is wider than JSON, and the difference is not tolerance.
+
+    Every character here answers ``True`` to ``str.isspace`` and is rejected by
+    the JSON grammar. Skipping them would let this reader accept, between two
+    claim objects, bytes it would refuse inside one — a strictness hole whose
+    only effect is to make malformed extractor output look well formed.
+    """
+    record = json.dumps({"text": "t", "subject": "s", "value": "v"})
+    assert separator.isspace(), "the fixture must be isspace-but-not-JSON"
+    with pytest.raises(clients.ExtractionFormatError):
+        clients.extracted_claims(f"{record}{separator}{record}")
+
+
+@pytest.mark.unit
+def test_a_parse_error_reports_the_object_start_in_the_original_completion() -> None:
+    """The offset must index what the model sent, fences and all.
+
+    The fence handling blanks delimiter lines instead of deleting them precisely
+    so this holds: a deleted line would shift every offset after it, and the
+    operator would be told to look at a byte that is not the one that failed.
+    """
+    good = json.dumps({"text": "a", "subject": "s", "value": "v"})
+    bad = '{"text": "b", "subject": "s" "value": "v"}'
+    completion = f"```json\n{good}\n{bad}\n```"
+    start = completion.index(bad)
+
+    with pytest.raises(clients.ExtractionFormatError) as caught:
+        clients.extracted_claims(completion)
+
+    message = str(caught.value)
+    assert f"beginning at offset {start}" in message
+    # The excerpt is taken from the completion at that offset, so the two agree.
+    assert completion[start : start + len(bad)] == bad
+    assert bad in message
+    # The fence sits before the failure, so a delete-based heal would have
+    # reported an offset eight characters short of the real one.
+    assert start != completion.replace("```json\n", "", 1).index(bad)
+
+
+@pytest.mark.unit
+def test_a_fence_between_an_objects_members_does_not_take_them_with_it() -> None:
+    """The ticketed fence-heal edge, on a concrete malformed object.
+
+    A delimiter line sitting between two members of a BROKEN object must not be
+    dropped: dropping it would splice the halves together and could turn a
+    malformed object into a plausible one, or make the error point past the
+    members that are still sitting there. Blanked to whitespace, the object is
+    refused with both of its halves intact and visible in the message.
+    """
+    broken = '{\n  "text": "a",\n  "subject": "s"\n```\n  "value": "v"\n}'
+
+    with pytest.raises(clients.ExtractionFormatError) as caught:
+        clients.extracted_claims(broken)
+
+    message = str(caught.value)
+    assert "beginning at offset 0" in message
+    # Neither half vanished: both are still in the excerpt the operator is shown.
+    assert '\\n  "subject": "s"' in message
+    assert '\\n  "value": "v"' in message
+
+
+@pytest.mark.unit
+def test_a_fence_between_an_objects_members_parses_when_the_object_is_whole() -> None:
+    """Same shape, comma restored: the members survive the delimiter line.
+
+    This is the other half of the required outcome — a delimiter between members
+    either leaves a parseable object with every member intact, or fails at the
+    original offset. Here it parses, and nothing is lost.
+    """
+    whole = '{\n  "text": "a",\n  "subject": "s",\n```\n  "value": "v"\n}'
+    claims = clients.extracted_claims(whole)
+    assert claims == [clients.StructuredClaim(text="a", subject="s", value="v")]
+
+
+@pytest.mark.unit
+def test_blanking_a_fence_keeps_the_completions_length() -> None:
+    """The offset-preserving property, stated directly."""
+    completion = '```json\n{"text": "a", "subject": "s", "value": "v"}\n```'
+    blanked = clients._blank_fence_delimiters(completion)
+    assert len(blanked) == len(completion)
+    assert blanked.splitlines()[0].strip() == ""
+    assert blanked.splitlines()[1] == completion.splitlines()[1]
+
+
 _REAL_COMPLETION_SAMPLE = Path(
     "E:/Workspace/.agents/lme-real-run-20260815/real-qwen-completion-sample.txt"
 )

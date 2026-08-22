@@ -235,7 +235,7 @@ def _complete_rows(raw: bytes) -> tuple[list[dict], int]:
     offset = 0
     position = 0
     for chunk in raw.split(b"\n"):
-        start, position = position, position + len(chunk) + 1
+        position += len(chunk) + 1
         if not chunk.strip():
             # A blank line carries no row, but it is still complete input: an
             # append may resume after it.
