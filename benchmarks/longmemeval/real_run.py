@@ -145,6 +145,17 @@ ANSWERS_NAME = "answers.jsonl"
 VERDICTS_NAME = "verdicts.jsonl"
 METRICS_NAME = "metrics.json"
 
+# The extraction-only pass records its provenance under its OWN name rather than
+# sharing manifest.json. The graded run's manifest is keyed on things an
+# extraction pass has no opinion about — which judge ran, which M3 label set was
+# scored — so writing this pass's record into that file would make the very
+# ``--real`` resume the pass exists to prepare fail its identity check.
+EXTRACT_MANIFEST_NAME = "extract-manifest.json"
+
+# What a manifest's ``mode`` says produced it.
+MODE_REAL = "real"
+MODE_EXTRACT_ONLY = "extract-only"
+
 
 class RunManifestMismatchError(ValueError):
     """A resume was attempted against a run of a different shape.
@@ -518,17 +529,47 @@ class ExtractionCache:
         question_id: str,
         session_id: str,
         records: Sequence[Mapping[str, str]],
+        *,
+        instrumentation: Mapping[str, Any] | None = None,
     ) -> None:
+        """Memoise one session's claims, optionally annotated with call costs.
+
+        ``instrumentation`` rides *beside* the four fields that define the row,
+        never inside them: a reader replaying this cache takes ``claims`` and
+        ignores the rest, so an annotated row and a bare one are the same input
+        to every arm. The pinned ``--real`` path passes nothing, which keeps its
+        rows byte-identical to the ones it has always written.
+        """
         stored = [dict(record) for record in records]
         self._records[(question_id, session_id)] = stored
-        self._writer.append(
-            {
-                "format": EXTRACTION_CACHE_FORMAT,
-                "question_id": question_id,
-                "session_id": session_id,
-                "claims": stored,
-            }
-        )
+        row: dict[str, Any] = {
+            "format": EXTRACTION_CACHE_FORMAT,
+            "question_id": question_id,
+            "session_id": session_id,
+            "claims": stored,
+        }
+        for key, value in sorted(dict(instrumentation or {}).items()):
+            # Never allowed to shadow the fields the replay reads.
+            if key not in row:
+                row[key] = value
+        self._writer.append(row)
+
+
+def _call_instrumentation(
+    wall_ms: float, usage: Mapping[str, int] | None
+) -> dict[str, Any]:
+    """What one extraction call cost, in the fields a cache row carries.
+
+    ``wall_ms`` is always present — it is measured here, so it cannot be
+    missing. The token counts are prefixed ``usage_`` and appear only when the
+    endpoint reported them: a served model that says nothing about tokens must
+    leave the fields absent rather than record a zero that reads as a
+    measurement.
+    """
+    record: dict[str, Any] = {"wall_ms": wall_ms}
+    for name, value in sorted(dict(usage or {}).items()):
+        record[f"usage_{name}"] = value
+    return record
 
 
 @dataclass
@@ -548,6 +589,11 @@ class RealExtractor:
     cache: ExtractionCache
     question_id: str
     calls: int = 0
+    # When set, every FRESH extraction annotates its cache row with what the call
+    # cost — wall time here, tokens as the endpoint reported them. Off for the
+    # pinned run, whose cache rows are an input to three arms and are therefore
+    # kept to the fields a replay reads.
+    instrument: bool = False
     # Session ids in first-seen (pinned occurrence) order, and their claims. The
     # priming vocabulary for a session is derived from these rather than
     # accumulated as the run goes, so it is a pure function of the pinned order
@@ -579,16 +625,28 @@ class RealExtractor:
 
         records = self.cache.get(self.question_id, session.id)
         if records is None:
-            completion = self.client.chat(
+            started = time.perf_counter()
+            result = clients.chat_result(
+                self.client,
                 clients.extract_structured_messages(
                     session.text, self.vocabulary_before(session.id)
-                )
+                ),
             )
+            wall_ms = (time.perf_counter() - started) * 1000.0
             records = [
                 {"text": claim.text, "subject": claim.subject, "value": claim.value}
-                for claim in clients.extracted_claims(completion)
+                for claim in clients.extracted_claims(result.text)
             ]
-            self.cache.put(self.question_id, session.id, records)
+            self.cache.put(
+                self.question_id,
+                session.id,
+                records,
+                instrumentation=(
+                    _call_instrumentation(wall_ms, result.usage)
+                    if self.instrument
+                    else None
+                ),
+            )
             self.calls += 1
 
         # Recorded whether the claims came from the model or from the memo: the
@@ -791,14 +849,21 @@ def build_manifest(
     judge_standing: Mapping[str, Any],
     label_source: M3LabelSource | None,
     model_config: Mapping[str, Any],
+    mode: str = MODE_REAL,
 ) -> dict[str, Any]:
-    """The run's provenance record: what ran, against what, under which pins."""
+    """The run's provenance record: what ran, against what, under which pins.
+
+    ``mode`` names which pass produced the record. It is deliberately *not* one
+    of :data:`_IDENTITY_FIELDS`: the two modes write to different manifest files
+    (see :data:`EXTRACT_MANIFEST_NAME`), so it is a label for a reader rather
+    than a resume key.
+    """
     preregister = json.loads(cfg.preregister_path.read_text(encoding="utf-8"))
     git = git_provenance()
     return {
         **dict(judge_standing),
         "benchmark": preregister.get("benchmark"),
-        "mode": "real",
+        "mode": mode,
         "arms": sorted(ARM_STORES),
         "pins": dict(pins),
         # Beyond the four fields pipeline.py's fairness checks compare: the chat
@@ -2594,6 +2659,131 @@ def preflight(
     report["ready"] = ready and not errors
     report["errors"] = errors
     return report
+
+
+def extract_only(
+    cfg: RealRunConfig,
+    *,
+    client_factory: Callable[[Any], Any] = default_client_factory,
+    progress: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    """Run the shared extraction stage alone, and write nothing else.
+
+    This is the answering phase's first pass with the arms taken away. Every
+    question's sessions go through one :class:`RealExtractor` in pinned
+    occurrence order, strictly serially, so each session is primed by exactly the
+    vocabulary its predecessors minted — the same prompts, in the same order, as
+    the pass ``--real`` would perform. What lands in ``extractions.jsonl`` is
+    therefore the cache a later ``--real`` run resumes from rather than a
+    lookalike of it.
+
+    Nothing is answered, scored or judged here, and no answer, verdict, claim or
+    metrics file is created: the extraction is the *shared* input to all three
+    arms, and separating it lets its cost be measured — and paid — before the
+    graded run starts. The pinned run's own manifest is left untouched for the
+    same reason (:data:`EXTRACT_MANIFEST_NAME`).
+    """
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    split_manifest = load_split(cfg.split_manifest_path)
+
+    # Only the extraction cache is repaired, because it is the only file this
+    # pass appends to. Repairing the graded run's artefacts here would be this
+    # mode reaching into a run it does not participate in.
+    dropped = repair_jsonl(cfg.out_dir / EXTRACTIONS_NAME)
+    if dropped:
+        progress(f"repaired {EXTRACTIONS_NAME}: dropped {dropped} torn byte(s)")
+
+    specs = load_questions(
+        split=cfg.split,
+        limit=cfg.limit,
+        haystack=cfg.haystack,
+        data_directory=cfg.directory(),
+        split_manifest=split_manifest,
+    )
+    if not specs:
+        raise ValueError(
+            f"the {cfg.split!r} split with limit {cfg.limit!r} selects no questions"
+        )
+
+    chat_pin = clients.extractor_pin(cfg.preregister_path)
+    manifest_path = cfg.out_dir / EXTRACT_MANIFEST_NAME
+    manifest = reconcile_manifest(
+        manifest_path,
+        build_manifest(
+            cfg,
+            specs,
+            {"extractor": chat_pin.pin.as_record()},
+            # No judge and no M3 labels take part in an extraction pass: nothing
+            # here is scored, so requiring either would be a gate on a stage that
+            # cannot reach them.
+            judge_fallback=None,
+            retriever_params={},
+            split_manifest=split_manifest,
+            judge_standing={},
+            label_source=None,
+            model_config={"extractor": chat_pin.as_record()},
+            mode=MODE_EXTRACT_ONLY,
+        ),
+    )
+
+    cache = ExtractionCache(cfg.out_dir / EXTRACTIONS_NAME)
+    client = client_factory(chat_pin)
+    calls = 0
+    sessions_seen = 0
+    questions_skipped = 0
+
+    for position, spec in enumerate(specs, 1):
+        # A question is skipped only when EVERY one of its sessions is already
+        # memoised. A partially-extracted question is replayed from its first
+        # session, because the priming vocabulary for a pending session is
+        # derived from the ones before it — resuming into the middle would prime
+        # it from nothing and send a prompt the original run never sent.
+        pending = [
+            session
+            for session in spec.sessions
+            if cache.get(spec.question_id, session.id) is None
+        ]
+        if not pending:
+            questions_skipped += 1
+            progress(
+                f"  [{position}/{len(specs)}] {spec.question_id} ({spec.split}): "
+                f"{len(spec.sessions)} session(s) already cached, skipped"
+            )
+            continue
+
+        extractor = RealExtractor(
+            client=client,
+            linker=SharedLinker(spec.question_id),
+            cache=cache,
+            question_id=spec.question_id,
+            instrument=True,
+        )
+        for session in spec.sessions:
+            extractor(session, pin=chat_pin.pin)
+            sessions_seen += 1
+
+        calls += extractor.calls
+        progress(
+            f"  [{position}/{len(specs)}] {spec.question_id} ({spec.split}): "
+            f"{len(spec.sessions)} sessions, {extractor.calls} extraction call(s)"
+        )
+
+    finalize_manifest(manifest_path, manifest)
+    summary = {
+        "mode": MODE_EXTRACT_ONLY,
+        "questions": len(specs),
+        "questions_skipped": questions_skipped,
+        "sessions_extracted": sessions_seen,
+        "extraction_calls": calls,
+        "cache_rows": len(cache),
+        "extractions_path": str(cfg.out_dir / EXTRACTIONS_NAME),
+        "manifest_path": str(manifest_path),
+    }
+    progress(
+        f"extract-only: {calls} model call(s) over {sessions_seen} session(s); "
+        f"{questions_skipped} question(s) already cached"
+    )
+    return summary
 
 
 def execute(

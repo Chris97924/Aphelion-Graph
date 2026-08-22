@@ -39,6 +39,7 @@ import pytest
 
 from benchmarks.longmemeval import clients, corpus, real_run
 from benchmarks.longmemeval import linker as linker_mod
+from benchmarks.longmemeval import run as run_mod
 from benchmarks.longmemeval.arms import ARM_STORES
 from benchmarks.longmemeval.metrics import m3_contamination
 from benchmarks.longmemeval.pipeline import (
@@ -3721,3 +3722,421 @@ def test_preflight_reports_failures_instead_of_raising() -> None:
 
     assert report["ready"] is False
     assert len(report["errors"]) == 3
+
+
+# --------------------------------------------------------------------------- #
+# --extract-only: the shared extraction stage, on its own                      #
+# --------------------------------------------------------------------------- #
+
+
+# The graded run's durable artefacts. An extraction pass writes none of them.
+_GRADED_ARTEFACTS = (
+    real_run.MANIFEST_NAME,
+    real_run.CLAIMS_NAME,
+    real_run.ANSWERS_NAME,
+    real_run.VERDICTS_NAME,
+    real_run.METRICS_NAME,
+)
+
+
+def _without_instrumentation(row: Mapping[str, Any]) -> dict:
+    """A cache row stripped of what the call cost, leaving what it *is*."""
+    return {
+        key: value
+        for key, value in row.items()
+        if key != "wall_ms" and not key.startswith("usage_")
+    }
+
+
+class MeteredChat(FakeChat):
+    """A FakeChat that also reports token counts, as a served endpoint does."""
+
+    USAGE = {"prompt_tokens": 40, "completion_tokens": 7, "total_tokens": 47}
+
+    def chat_detailed(self, messages: Sequence[dict]) -> clients.ChatResult:
+        return clients.ChatResult(text=self.chat(messages), usage=dict(self.USAGE))
+
+
+class RecordingChat(FakeChat):
+    """A FakeChat that keeps every extraction prompt it was sent, in order."""
+
+    def __init__(self, pin) -> None:
+        super().__init__(pin)
+        self.extract_prompts: list[list[dict]] = []
+
+    def chat(self, messages: Sequence[dict]) -> str:
+        if messages[0]["content"].startswith(clients.EXTRACT_STRUCTURED_SYSTEM_PROMPT):
+            self.extract_prompts.append([dict(message) for message in messages])
+        return super().chat(messages)
+
+
+def _recording_factory(created: list[RecordingChat]):
+    def factory(chat_pin) -> RecordingChat:
+        client = RecordingChat(chat_pin)
+        created.append(client)
+        return client
+
+    return factory
+
+
+@pytest.mark.integration
+def test_extract_only_writes_the_cache_rows_the_graded_run_writes(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The whole point: the pass produces the cache, not a lookalike of it.
+
+    Compared on every field except the instrumentation this mode adds, because a
+    row that differed anywhere else would mean a ``--real`` run resuming from
+    this cache replayed claims its own extractor would not have produced.
+    """
+    graded = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "graded")
+    real_run.execute(graded, client_factory=_factory([]), judge_client=FakeJudge())
+
+    extraction = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    summary = real_run.extract_only(extraction, client_factory=_factory([]))
+
+    graded_rows = real_run.read_jsonl(graded.out_dir / real_run.EXTRACTIONS_NAME)
+    extract_rows = real_run.read_jsonl(extraction.out_dir / real_run.EXTRACTIONS_NAME)
+
+    assert graded_rows, "the graded run extracted nothing to compare against"
+    # Same rows, same order — the order is the pinned occurrence order both
+    # passes walk, and a reordering would mean different priming.
+    assert [_without_instrumentation(row) for row in extract_rows] == graded_rows
+    assert summary["extraction_calls"] == len(extract_rows)
+    assert summary["questions"] == len(_QUESTIONS)
+    assert summary["questions_skipped"] == 0
+
+
+@pytest.mark.integration
+def test_extract_only_sends_the_prompts_the_graded_run_sends(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Identical prompts, in identical order — so the priming is identical.
+
+    Equal cache rows would still be equal if this mode primed differently and the
+    stub happened not to care. The prompts are where priming is visible, so they
+    are what is compared: the same sessions, strictly serial within a question,
+    each carrying the vocabulary its predecessors minted.
+    """
+    graded_clients: list[RecordingChat] = []
+    graded = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "graded")
+    real_run.execute(
+        graded,
+        client_factory=_recording_factory(graded_clients),
+        judge_client=FakeJudge(),
+    )
+
+    extract_clients: list[RecordingChat] = []
+    extraction = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(
+        extraction, client_factory=_recording_factory(extract_clients)
+    )
+
+    graded_prompts = [p for c in graded_clients for p in c.extract_prompts]
+    extract_prompts = [p for c in extract_clients for p in c.extract_prompts]
+
+    assert graded_prompts, "the graded run sent no extraction prompt"
+    assert extract_prompts == graded_prompts
+
+
+@pytest.mark.integration
+def test_extract_only_resume_skips_questions_already_cached(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A second pass over a full cache calls no model and appends no row."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    before = path.read_bytes()
+
+    resumed: list[FakeChat] = []
+    summary = real_run.extract_only(cfg, client_factory=_factory(resumed))
+
+    assert summary["extraction_calls"] == 0
+    assert summary["questions_skipped"] == summary["questions"] == len(_QUESTIONS)
+    assert summary["sessions_extracted"] == 0
+    assert sum(client.extract_calls for client in resumed) == 0
+    # Byte-unchanged, not merely equivalent: the resume appended nothing at all.
+    assert path.read_bytes() == before
+
+
+@pytest.mark.integration
+def test_extract_only_replays_a_partly_cached_question_from_its_first_session(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A half-done question is re-walked, because priming is positional.
+
+    Resuming into the middle of a question would prime the pending session from
+    an empty vocabulary and send a prompt the interrupted run never sent. The
+    earlier sessions are therefore replayed — from the memo, costing no call —
+    and only the genuinely missing one reaches the model.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    rows = real_run.read_jsonl(path)
+    # Drop the LAST row of one question, leaving its earlier session cached.
+    dropped = rows[-1]
+    _rewrite(path, rows[:-1])
+
+    resumed: list[RecordingChat] = []
+    summary = real_run.extract_only(cfg, client_factory=_recording_factory(resumed))
+
+    assert summary["extraction_calls"] == 1
+    assert summary["questions_skipped"] == len(_QUESTIONS) - 1
+    prompts = [p for client in resumed for p in client.extract_prompts]
+    assert len(prompts) == 1, "only the missing session may reach the model"
+
+    # And what it re-extracted is what was there before.
+    replayed = real_run.read_jsonl(path)[-1]
+    assert _without_instrumentation(replayed) == _without_instrumentation(dropped)
+
+
+@pytest.mark.integration
+def test_extract_only_records_what_every_call_cost(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Wall time always, token counts whenever the endpoint reports them."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+
+    def factory(chat_pin) -> MeteredChat:
+        return MeteredChat(chat_pin)
+
+    real_run.extract_only(cfg, client_factory=factory)
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+
+    assert rows
+    for row in rows:
+        assert isinstance(row["wall_ms"], float)
+        assert row["wall_ms"] >= 0.0
+        assert row["usage_prompt_tokens"] == MeteredChat.USAGE["prompt_tokens"]
+        assert row["usage_completion_tokens"] == MeteredChat.USAGE["completion_tokens"]
+        assert row["usage_total_tokens"] == MeteredChat.USAGE["total_tokens"]
+        # The instrumentation never displaces what a replay reads.
+        assert row["format"] == real_run.EXTRACTION_CACHE_FORMAT
+        assert row["claims"]
+
+
+@pytest.mark.integration
+def test_a_silent_endpoint_records_timing_and_no_invented_token_counts(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A server that reports no usage leaves the fields absent, never zero."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+
+    assert rows
+    for row in rows:
+        assert "wall_ms" in row
+        assert not [key for key in row if key.startswith("usage_")]
+
+
+@pytest.mark.integration
+def test_extract_only_creates_no_graded_artefact(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Nothing is answered or judged, so no answer or verdict file appears."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).is_file()
+    assert (cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME).is_file()
+    for name in _GRADED_ARTEFACTS:
+        assert not (cfg.out_dir / name).exists(), f"{name} must not be created"
+
+
+@pytest.mark.integration
+def test_extract_only_leaves_existing_graded_artefacts_byte_unchanged(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Run beside a graded run's output, it touches none of that output."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    before = {}
+    for name in _GRADED_ARTEFACTS:
+        path = cfg.out_dir / name
+        path.write_bytes(f"sentinel bytes for {name}\n".encode("utf-8"))
+        before[name] = path.read_bytes()
+
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    for name in _GRADED_ARTEFACTS:
+        assert (cfg.out_dir / name).read_bytes() == before[name], name
+
+
+@pytest.mark.integration
+def test_a_graded_run_resumes_the_cache_an_extract_only_pass_primed(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The two modes share one output directory, which is the reason for both.
+
+    The extraction pass pays for the extractor up front; the graded run that
+    follows must then spend zero extraction calls and find the cache exactly as
+    it was left. This is also what forces the two provenance records into
+    separate files: a shared manifest.json would fail its own identity check
+    here, because an extraction pass names no judge.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    primed = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+    assert primed
+
+    graded: list[FakeChat] = []
+    real_run.execute(cfg, client_factory=_factory(graded), judge_client=FakeJudge())
+
+    assert sum(client.extract_calls for client in graded) == 0, (
+        "the graded run re-extracted sessions the extraction pass had memoised"
+    )
+    assert real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME) == primed
+    assert (cfg.out_dir / real_run.MANIFEST_NAME).is_file()
+
+    extract_manifest = json.loads(
+        (cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    graded_manifest = json.loads(
+        (cfg.out_dir / real_run.MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert extract_manifest["mode"] == real_run.MODE_EXTRACT_ONLY
+    assert graded_manifest["mode"] == real_run.MODE_REAL
+
+
+@pytest.mark.integration
+def test_the_extract_manifest_records_the_mode_and_refuses_a_reshaped_resume(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """It is a real provenance record, with the same resume guard as the run's."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    manifest = json.loads(
+        (cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert manifest["mode"] == real_run.MODE_EXTRACT_ONLY
+    assert manifest["haystack"] == cfg.haystack
+    assert manifest["split"] == cfg.split
+    assert set(manifest["pins"]) == {"extractor"}
+    assert manifest["question_count"] == len(_QUESTIONS)
+    assert manifest["completed_at"]
+
+    # A different question set in the same directory is a different pass.
+    reshaped = _config(tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, limit=1)
+    with pytest.raises(real_run.RunManifestMismatchError):
+        real_run.extract_only(reshaped, client_factory=_factory([]))
+
+
+@pytest.mark.unit
+def test_extract_only_is_mutually_exclusive_with_the_other_modes() -> None:
+    """One mode per invocation, or an output directory holds two experiments."""
+    with pytest.raises(SystemExit):
+        run_mod.main(["--extract-only", "--real", "--haystack", "oracle"])
+    with pytest.raises(SystemExit):
+        run_mod.main(["--extract-only", "--smoke"])
+
+
+@pytest.mark.unit
+def test_extract_only_requires_a_haystack() -> None:
+    """Same reason ``--real`` does: the corpus decides what is extracted."""
+    with pytest.raises(SystemExit):
+        run_mod.main(["--extract-only"])
+
+
+# --------------------------------------------------------------------------- #
+# Reported usage                                                               #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        (
+            {"prompt_eval_count": 12, "eval_count": 5},
+            {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17},
+        ),
+        (
+            {"usage": {"prompt_tokens": 30, "completion_tokens": 8, "total_tokens": 38}},
+            {"prompt_tokens": 30, "completion_tokens": 8, "total_tokens": 38},
+        ),
+        # A server's own total is kept rather than recomputed.
+        (
+            {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 99}},
+            {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 99},
+        ),
+        ({"message": {"content": "hi"}}, None),
+        # Counts this harness cannot add up are absent, not coerced.
+        ({"prompt_eval_count": "12", "eval_count": 1.5}, None),
+        ({"prompt_eval_count": True, "eval_count": 3}, {"completion_tokens": 3}),
+        ({"usage": None}, None),
+        ("not a body", None),
+    ],
+)
+def test_usage_is_read_from_either_dialect(body: Any, expected: Any) -> None:
+    assert clients.usage_record(body) == expected
+
+
+@pytest.mark.unit
+def test_the_lan_client_reports_usage_beside_its_completion() -> None:
+    """``chat`` and ``chat_detailed`` are one request path, not two."""
+    seen: list[tuple[str, dict]] = []
+    client = clients.LocalChatClient(
+        pin=_PIN,
+        transport=_transport(
+            [{"message": {"content": "hello"}, "prompt_eval_count": 9, "eval_count": 4}],
+            seen,
+        ),
+    )
+
+    result = client.chat_detailed([{"role": "user", "content": "hi"}])
+    assert result.text == "hello"
+    assert result.usage == {
+        "prompt_tokens": 9,
+        "completion_tokens": 4,
+        "total_tokens": 13,
+    }
+    assert client.chat([{"role": "user", "content": "hi"}]) == "hello"
+    # Both calls sent the same request: the projection adds nothing of its own.
+    assert seen[0][1] == seen[1][1]
+
+
+@pytest.mark.unit
+def test_the_completions_client_reports_usage_beside_its_completion() -> None:
+    """The dialect the pinned extractor actually speaks, on the same contract."""
+    seen: list[tuple[str, dict]] = []
+    chat_pin = clients.ChatPin(pin=_PIN, api=clients.API_CHAT_COMPLETIONS)
+    client = clients.client_for(
+        chat_pin,
+        transport=_transport(
+            [
+                {
+                    "choices": [{"message": {"content": "hello"}}],
+                    "usage": {"prompt_tokens": 6, "completion_tokens": 2},
+                }
+            ],
+            seen,
+        ),
+    )
+
+    result = client.chat_detailed([{"role": "user", "content": "hi"}])
+    assert result.text == "hello"
+    # No total was reported, so one is derived from the two counts that were.
+    assert result.usage == {
+        "prompt_tokens": 6,
+        "completion_tokens": 2,
+        "total_tokens": 8,
+    }
+
+
+@pytest.mark.unit
+def test_a_client_without_usage_support_still_extracts() -> None:
+    """``chat_result`` degrades to ``chat``: a plain double is still a client."""
+
+    class PlainChat:
+        def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
+            return "plain"
+
+    result = clients.chat_result(PlainChat(), [{"role": "user", "content": "hi"}])
+    assert result.text == "plain"
+    assert result.usage is None

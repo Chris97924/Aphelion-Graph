@@ -482,6 +482,84 @@ def _urlget_transport(url: str, payload: bytes, timeout: float) -> bytes:
         return response.read()
 
 
+# The token-count fields each dialect reports, mapped onto one vocabulary. Both
+# names per slot are read because the two clients here speak different dialects
+# and an endpoint may implement either spelling.
+_USAGE_FIELDS = (
+    ("prompt_tokens", ("prompt_tokens", "prompt_eval_count")),
+    ("completion_tokens", ("completion_tokens", "eval_count")),
+    ("total_tokens", ("total_tokens",)),
+)
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    """One completion, plus what the endpoint said the call cost.
+
+    ``usage`` is ``None`` when the endpoint reported nothing — which is a real
+    and common case, not an error. It is kept distinct from ``{}`` so a consumer
+    can tell "the server does not report usage" from "the server reported zero".
+    """
+
+    text: str
+    usage: dict[str, int] | None = None
+
+
+def usage_record(body: Mapping[str, Any]) -> dict[str, int] | None:
+    """Prompt/completion token counts from a response body, in either dialect.
+
+    The chat-completions dialect nests them under ``usage``; the native dialect
+    :class:`LocalChatClient` speaks puts ``prompt_eval_count``/``eval_count`` at
+    the top level. Both are normalised onto one vocabulary so a reader of the
+    recorded numbers does not have to know which server produced them.
+
+    Only integers are taken. A server that reports a token count as a string or
+    a float is reporting something this harness cannot add up, and a silently
+    coerced number would be worse than an absent one.
+    """
+    if not isinstance(body, Mapping):
+        return None
+    nested = body.get("usage")
+    sources: tuple[Mapping[str, Any], ...] = (
+        (body, nested) if isinstance(nested, Mapping) else (body,)
+    )
+    record: dict[str, int] = {}
+    for name, spellings in _USAGE_FIELDS:
+        for source in sources:
+            for spelling in spellings:
+                value = source.get(spelling)
+                # bool is an int subclass, and a boolean token count is a bug in
+                # the server rather than a count worth recording.
+                if isinstance(value, int) and not isinstance(value, bool):
+                    record[name] = value
+                    break
+            if name in record:
+                break
+    if "total_tokens" not in record and {"prompt_tokens", "completion_tokens"} <= set(
+        record
+    ):
+        record["total_tokens"] = record["prompt_tokens"] + record["completion_tokens"]
+    return record or None
+
+
+def chat_result(client: Any, messages: Sequence[Mapping[str, str]]) -> ChatResult:
+    """One completion from ``client``, carrying usage when the client reports it.
+
+    The clients in this module answer ``chat_detailed``; a test double or a
+    future client that only implements ``chat`` still works and simply reports
+    no usage. Written as a free function so the extraction stage can be
+    instrumented without every caller having to know which kind of client it
+    holds.
+    """
+    detailed = getattr(client, "chat_detailed", None)
+    if callable(detailed):
+        result = detailed(messages)
+        if isinstance(result, ChatResult):
+            return result
+        return ChatResult(text=str(result))
+    return ChatResult(text=client.chat(messages))
+
+
 @dataclass(frozen=True)
 class LocalChatClient:
     """Chat completions from the pinned LAN model, at the pinned knobs.
@@ -540,11 +618,20 @@ class LocalChatClient:
             ) from exc
 
     def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
-        """Return the assistant's final content for ``messages``.
+        """Return the assistant's final content for ``messages``."""
+        return self.chat_detailed(messages).text
+
+    def chat_detailed(self, messages: Sequence[Mapping[str, str]]) -> ChatResult:
+        """Return the assistant's final content, plus any reported usage.
 
         ``stream`` is off so one request yields one complete body, and the pinned
         temperature and seed travel in ``options`` — the two knobs design doc §6
         guard 2 requires every generation to run under.
+
+        This is the one request path; :meth:`chat` is a projection of it. Keeping
+        a single implementation is what lets an instrumented pass and a pinned
+        run send byte-identical requests — a second code path would be free to
+        drift, and a drifted extraction prompt is a different measurement.
         """
         payload = json.dumps(
             {
@@ -583,7 +670,7 @@ class LocalChatClient:
                 "rather than recorded, because an empty answer scored as wrong is "
                 "a plumbing failure entering the results as a measurement."
             )
-        return content
+        return ChatResult(text=content, usage=usage_record(body))
 
     def available_models(self) -> list[str]:
         """Every model the server currently reports, sorted."""
@@ -666,6 +753,14 @@ class ChatCompletionsClient:
 
     def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
         """Return the assistant's content, refusing an empty or absent one."""
+        return self.chat_detailed(messages).text
+
+    def chat_detailed(self, messages: Sequence[Mapping[str, str]]) -> ChatResult:
+        """Return the assistant's content, plus any reported usage.
+
+        As with :class:`LocalChatClient`, this is the single request path and
+        :meth:`chat` is a projection of it.
+        """
         body: dict[str, Any] = {
             "model": self.pin.model,
             "messages": list(messages),
@@ -706,7 +801,7 @@ class ChatCompletionsClient:
                 "template_kwargs reached the request. Nothing is substituted for a "
                 "missing answer."
             )
-        return content
+        return ChatResult(text=content, usage=usage_record(response))
 
     def available_models(self) -> list[str]:
         """Every model the endpoint advertises, sorted."""
