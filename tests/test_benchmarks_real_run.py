@@ -4137,6 +4137,172 @@ def test_the_extract_manifest_records_the_mode_and_refuses_a_reshaped_resume(
         real_run.extract_only(reshaped, client_factory=_factory([]))
 
 
+# --------------------------------------------------------------------------- #
+# The extraction cache's own identity                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _with_another_extractor(record: dict) -> None:
+    """Point the extractor at another served model, leaving everything else."""
+    record["extractor_model"]["model"] = "qwen3.9-not-the-pinned-one"
+
+
+def _retext_one_session(corpus_dir: Path) -> None:
+    """Change what a session SAYS while keeping every id it is keyed by.
+
+    A cache row is keyed on ``(question_id, session_id)`` and a session id is
+    ``f"{question_id}::{corpus session id}"`` — derived from ids alone, never
+    from the text. Rewritten session bytes therefore land on exactly the rows an
+    earlier pass wrote: with nothing to compare, the new corpus is reported as
+    already cached and every arm answers from claims about the old text.
+    """
+    path = corpus_dir / corpus.ORACLE_FILENAME
+    records = json.loads(path.read_text(encoding="utf-8"))
+    records[0]["haystack_sessions"][0][0]["content"] = "my 5k personal best is 19:59"
+    path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+
+
+@pytest.mark.integration
+def test_the_extraction_identity_names_what_decides_a_row_and_nothing_else(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The projection is the extraction's own identity, not the run's.
+
+    Everything in it changes what a cache row would contain; everything left out
+    cannot. The graded run's identity is a superset — it covers scoring — and
+    keying the cache on that would refuse resumes that are perfectly safe.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    identity = json.loads(
+        (cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME).read_text(encoding="utf-8")
+    )
+    assert identity["extraction_cache_format"] == real_run.EXTRACTION_CACHE_FORMAT
+    assert identity["haystack"] == cfg.haystack
+    assert identity["split"] == cfg.split
+    assert identity["harness_sha256"] == real_run.harness_digest()
+    assert (
+        identity["extractor_pin"]
+        == clients.extractor_pin(cfg.preregister_path).pin.as_record()
+    )
+    assert (
+        identity["extractor_model_config"]
+        == clients.extractor_pin(cfg.preregister_path).as_record()
+    )
+    assert identity["corpus_loaded_sha256"] == real_run.corpus_digests(cfg)
+    # Nothing an extraction row is independent of.
+    assert not set(identity) & {
+        "arms",
+        "limit",
+        "question_count",
+        "questions_sha256",
+        "samples_sha256",
+        "top_k",
+        "judge_model",
+        "m3_labels_sha256",
+    }
+
+    # The same record rides in the manifest, so one file explains the other.
+    manifest = json.loads(
+        (cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert manifest["extraction_identity"] == identity
+
+
+@pytest.mark.integration
+def test_a_graded_run_refuses_a_cache_extracted_under_another_extractor(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """extract-only, then ``--real`` under a different pin, in one directory.
+
+    The two modes keep their provenance in separate files, so neither manifest
+    can see the other's; what they share is ``extractions.jsonl``. The cache's
+    own identity record is what makes the graded run refuse rows the pinned
+    extractor would not have produced, rather than replay them as its own.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    forged = _preregister_with(tmp_path, _with_another_extractor)
+    graded = _config(
+        tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, preregister_path=forged
+    )
+    chats: list[FakeChat] = []
+    with pytest.raises(real_run.ExtractionIdentityMismatchError, match="extractor_pin"):
+        real_run.execute(
+            graded, client_factory=_factory(chats), judge_client=FakeJudge()
+        )
+
+    # Refused before the run spent a call or wrote a record of its own.
+    assert sum(client.extract_calls for client in chats) == 0
+    assert not (cfg.out_dir / real_run.MANIFEST_NAME).exists()
+
+
+@pytest.mark.integration
+def test_an_extraction_pass_refuses_a_cache_extracted_from_another_corpus(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """``--real`` first, then extract-only over rewritten corpus bytes.
+
+    The direction the graded manifest cannot catch: an extraction pass writes
+    only its own manifest, so without the cache's identity record it would find
+    every row already present and report the new corpus as fully extracted.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+    before = (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    _retext_one_session(corpus_dir)
+
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError, match="corpus_loaded_sha256"
+    ):
+        real_run.extract_only(cfg, client_factory=_factory([]))
+
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
+
+
+@pytest.mark.integration
+def test_an_extraction_pass_resumes_the_cache_a_graded_run_left(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Matching identity resumes: the guard refuses mismatches, not resumes."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+    before = (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    resumed: list[FakeChat] = []
+    summary = real_run.extract_only(cfg, client_factory=_factory(resumed))
+
+    assert summary["extraction_calls"] == 0
+    assert summary["questions_skipped"] == summary["questions"] == len(_QUESTIONS)
+    assert sum(client.extract_calls for client in resumed) == 0
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
+
+
+@pytest.mark.integration
+def test_a_cache_with_no_identity_record_is_refused_rather_than_adopted(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Rows nobody can attribute are not adopted on the strength of their keys.
+
+    A cache whose identity record is missing was written by something this
+    harness cannot question — an older revision, a hand-assembled file, another
+    directory's rows copied in. Adopting it would mint provenance for bytes
+    whose provenance is exactly what is unknown.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    (cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME).unlink()
+
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError,
+        match=real_run.EXTRACTION_IDENTITY_NAME,
+    ):
+        real_run.extract_only(cfg, client_factory=_factory([]))
+
+
 @pytest.mark.unit
 def test_extract_only_is_mutually_exclusive_with_the_other_modes() -> None:
     """One mode per invocation, or an output directory holds two experiments."""
