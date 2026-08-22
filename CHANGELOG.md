@@ -1,5 +1,131 @@
 # Changelog
 
+## [Unreleased]
+
+Everything below has landed on `main` since the 0.6.0 release. No version has
+been bumped: the release number is a maintainer decision, and this section is
+the record of what a bump would carry.
+
+### Added
+
+- **LongMemEval 3-arm benchmark harness** (`benchmarks/longmemeval/`) — the
+  measurement rig for the G2 kill-gate, built pre-registered so its result is
+  reportable whichever way it comes out.
+  - **Three arms, one independent variable.** Arm A (`PlainStore`) keeps every
+    claim, duplicates included; Arm B (`NaiveDedupStore`) is the honest middle
+    control, exact-string dedup after whitespace collapse; Arm C
+    (`AphelionStore`) is the machinery under test — lineage-gated
+    `content_hash` coalescing, event state-machine suppression, and R4
+    conflict resolution. The answering model, the extractor model and the
+    shared deterministic BM25 retriever are identical across all three, so the
+    memory layer is the only thing that varies.
+  - **Six metrics.** M1 QA accuracy on knowledge-update (the gated one), M2
+    deduplication precision/recall/F1 over labeled pairs, M3 knowledge-update
+    contamination rate, M4 storage/latency sanity with a non-gating 10x
+    tripwire, M5 cross-tool round-trip determinism, and AG, the adversarial
+    slice.
+  - **`preregister.json`** — the pinned protocol: seed, split sizes and
+    sampling algorithm, model pins, retriever, per-metric gates, and a
+    `design_doc_sha256` over `docs/benchmark/longmemeval-3arm-design.md`. Four
+    §6.3 amendments are recorded in it rather than applied silently.
+  - **Offline smokes** that need no model and no network, and a resumable
+    real-model execution layer whose every durable artefact is append-only.
+- **`--extract-only` run mode** — runs the shared extraction stage alone for a
+  chosen split/limit/haystack, filling `extractions.jsonl` with the rows the
+  graded run would write, so the extractor can be paid for and measured before
+  the graded run starts. It answers nothing and judges nothing, writes its own
+  provenance record (`extract-manifest.json`) so a later `--real` run in the
+  same directory resumes cleanly, and annotates each fresh cache row with the
+  call's wall time and the endpoint's token counts where reported.
+- **Canonical serialization layer in `scripts/external_reader.py`** — the
+  stdlib-only reader grew a second, fully independent implementation of
+  canonical JSON, NFC, `claims[].hash` recomputation and POSIX ustar framing.
+  `tarfile` is never imported and `json.dumps` is never called, because the
+  reference writer is built on both and reusing them would collapse the
+  comparison into an implementation checked against itself. This is what
+  unblocks the pinned M5 gate: 30/30 packages in a deterministic stress corpus
+  and 6/6 packable committed samples are byte-identical to `aphelion.packer.pack`.
+
+### Changed
+
+- **`verify_package` no longer re-reads the archive once per envelope.**
+  Signer-manifest extraction was called inside the notary-resolution loop,
+  re-reading the whole tar and re-parsing each signer manifest with an
+  unguarded `json.loads` — work `validate_signatures` had already done once
+  behind typed-error guards. `validator._validate_signatures_full()` now
+  returns the parsed `SignerManifest` objects alongside the envelopes and
+  `verify_package` reuses that mapping. Extraction is O(1) rather than O(N) in
+  the envelope count, the duplicate unprotected parse is gone, and the public
+  `validate_signatures()` signature is unchanged.
+- **`spec/canonical-serialization.md` 1.0 → 1.1** — Rule 5 §10 and §7
+  corrected to describe what conformant tar writers actually emit. §10 as
+  written ("No extra trailing bytes") matched no tar writer in existence, and
+  §7 admitted two byte-different encodings of zero. Both gaps were found by
+  building the independent implementation above and byte-comparing it against
+  the reference. **No producer or consumer behaviour changes** — the reference
+  already emitted the now-documented form; the document was what was wrong.
+
+### Fixed
+
+- **Content-hash object keys are sorted by UTF-16 code unit, per RFC 8785
+  §3.2.3** — not by Unicode code point. See Compatibility below.
+- **`external_reader._LEGAL_TRANSITIONS` accepted an illegal lifecycle
+  transition.** A spurious `("active", "publish") -> active` entry let the
+  independent reader accept a `create -> publish` stream the reference
+  validator correctly rejects with `ERR-SEM-LIFECYCLE-ILLEGAL`; per
+  `spec/lifecycle-state-machine.md`, `publish` may only *reach* `active` from
+  `(new)`/`draft`, never *from* `active`. Found by the differential test suite
+  below — the first real bug it caught.
+- **Extractor-output parsing no longer reports offsets into a payload the
+  model never sent.** Standalone code-fence delimiter lines were deleted before
+  parsing, which shifted every offset after them and could splice out a
+  delimiter line sitting between two members of a broken object. They are now
+  blanked to spaces of equal width: spaces are JSON whitespace, so the line is
+  still skipped, while the text keeps its geometry and every reported offset
+  indexes the completion as received. Parse errors now lead with the failing
+  object's start offset and report the decoder's own position beside it.
+- **Whitespace between extractor claim objects is JSON's four characters,**
+  not `str.isspace`, which is also true for NBSP, form feed, vertical tab and
+  the Unicode separators. Skipping those let the reader accept, between two
+  claim objects, bytes it would refuse inside one.
+
+### Compatibility
+
+- **Content hashes change only for payloads with non-BMP object keys.** RFC
+  8785 sorts object members by UTF-16 code unit, and that order coincides with
+  code-point order for every BMP key — a BMP character's UTF-16 encoding is a
+  single code unit equal to its code point — so BMP-only payloads are
+  byte-identical to the previous code-point-sorted output and their hashes are
+  unchanged. The orders diverge only when a key contains a supplementary-plane
+  character (U+10000..U+10FFFF), whose leading UTF-16 surrogate unit
+  (0xD800..0xDBFF) sorts below U+E000..U+FFFF: a `U+1F600` key now precedes a
+  `U+FFFF` key. A package whose manifest carries such a key hashes differently
+  than it did before this change. `spec/content-hash.md` records the rule as
+  Rule 0.
+- The benchmark harness is additive and imports nothing into the shipped
+  package; `src/aphelion/` is untouched by it.
+
+### Tests
+
+- **Differential and fuzz hardening for the package format**
+  (`tests/test_diff_fuzz_hardening.py`), in three families:
+  1. **Differential** — generated and mutated single-claim packages, schema-valid
+     by construction, asserting the reference validator and the stdlib-only
+     `scripts/external_reader.py` agree on the lifecycle classification. A
+     hand-picked scenario matrix, a Hypothesis biconditional over random event
+     streams, and the soundness invariant *reference-valid ⇒ external-valid*.
+  2. **Canonical-byte / hash stability** — identical logical input yields
+     identical canonical bytes and content/package hashes across NFC-vs-NFD
+     Unicode, CRLF-vs-LF frontmatter, and JSON/YAML key-order perturbation.
+  3. **Security-surface fuzz** — path traversal, hostile member types,
+     archive-bomb budgets, malformed signer/notary envelopes,
+     `signatures.jsonl` order and trailing-newline invariants, and
+     non-canonical YAML, each asserted to be a typed rejection with a
+     deterministic error code, identical on repeated runs.
+- Regression test asserting `extract_signer_manifests` is called at most once
+  for a two-envelope package (it was called three times before).
+- UTF-16 code-unit key-order tests, including the non-BMP divergence.
+
 ## [0.6.0] — 2026-06-27
 
 ### Added
