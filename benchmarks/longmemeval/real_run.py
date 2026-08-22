@@ -2878,7 +2878,16 @@ def extract_only(
     # intends to do, and the cache's identity says whether it may. A pass that
     # may not touch these rows must be refused without first writing a manifest
     # claiming it did.
-    existing = check_manifest(manifest_path, fresh)
+    #
+    # The manifest is reconciled on the EXTRACTION projection rather than the
+    # whole run's identity. It records a great deal this pass has an opinion
+    # about — how many questions it walked, which slice, which M5 sample corpus
+    # was on disk — but none of that reaches an extraction row, and requiring it
+    # to match made a changed --top-k, a re-pointed samples root or a narrower
+    # --limit refuse a resume that could not be unsafe. What the record then
+    # describes is the pass that FIRST wrote it, and what has to agree is what
+    # decides a row.
+    existing = check_manifest(manifest_path, fresh, identity=extraction_identity)
     reconcile_extraction_identity(
         cfg.out_dir / EXTRACTION_IDENTITY_NAME,
         extraction_identity(fresh),

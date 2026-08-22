@@ -4175,9 +4175,13 @@ def test_the_extract_manifest_records_the_mode_and_refuses_a_reshaped_resume(
     assert manifest["question_count"] == len(_QUESTIONS)
     assert manifest["completed_at"]
 
-    # A different question set in the same directory is a different pass.
-    reshaped = _config(tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, limit=1)
-    with pytest.raises(real_run.RunManifestMismatchError):
+    # A pass that would extract different bytes is a different pass. The guard is
+    # the extraction projection, not the graded run's identity: what must agree
+    # is what decides a row, and the haystack decides which sessions exist at all.
+    reshaped = _config(
+        tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, haystack=real_run.HAYSTACK_S
+    )
+    with pytest.raises(real_run.RunManifestMismatchError, match="haystack"):
         real_run.extract_only(reshaped, client_factory=_factory([]))
 
 
@@ -4321,6 +4325,46 @@ def test_an_extraction_pass_resumes_the_cache_a_graded_run_left(
 
     assert summary["extraction_calls"] == 0
     assert summary["questions_skipped"] == summary["questions"] == len(_QUESTIONS)
+    assert sum(client.extract_calls for client in resumed) == 0
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
+
+
+@pytest.mark.integration
+def test_an_extraction_resume_is_not_blocked_by_state_it_cannot_depend_on(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Retrieval depth, the M5 sample corpus and a narrower slice are irrelevant.
+
+    An extraction row is what the pinned extractor said about one session's
+    bytes. ``top_k`` re-ranks retrieval *of* those claims and cannot move one;
+    the M5 sample corpus is read by a metric that scores the run's output; a
+    narrower ``--limit`` asks for a strict subset of the rows already on disk,
+    each produced exactly as this pass would produce it. Gating the extraction
+    manifest on the whole run's identity made every one of them refuse an
+    otherwise-safe resume — and an extraction pass exists precisely so its cost
+    is paid once.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    before = (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    samples = tmp_path / "other-samples"
+    (samples / "pkg").mkdir(parents=True)
+    (samples / "pkg" / "manifest.json").write_text("{}", encoding="utf-8")
+
+    retuned = _config(
+        tmp_path,
+        corpus_dir,
+        split_path,
+        out_dir=cfg.out_dir,
+        top_k=cfg.top_k + 3,
+        limit=1,
+        samples_root=samples,
+    )
+    resumed: list[FakeChat] = []
+    summary = real_run.extract_only(retuned, client_factory=_factory(resumed))
+
+    assert summary["extraction_calls"] == 0
     assert sum(client.extract_calls for client in resumed) == 0
     assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
 
