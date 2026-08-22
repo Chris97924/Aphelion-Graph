@@ -882,6 +882,16 @@ def _add_real_run_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help=(
+            "run ONLY the shared extraction stage for the selected "
+            "split/limit/haystack, filling extractions.jsonl with the same rows "
+            "--real would write (resumable; answers nothing and judges nothing, "
+            "and records per-call latency and token usage)"
+        ),
+    )
+    parser.add_argument(
         "--preflight",
         action="store_true",
         help=(
@@ -896,8 +906,8 @@ def _add_real_run_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "which corpus the extractor ingests (design doc §3.4): 's' is the "
             "distractor-heavy primary retrieval corpus, 'oracle' is evidence "
-            "sessions only. Required with --real - there is no default, because "
-            "the choice decides what the benchmark measures"
+            "sessions only. Required with --real and --extract-only - there is "
+            "no default, because the choice decides what the benchmark measures"
         ),
     )
     parser.add_argument(
@@ -983,16 +993,59 @@ def _run_preflight() -> int:
     return 0 if report["ready"] else 1
 
 
+def _require_haystack(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, flag: str
+) -> None:
+    """Refuse a corpus-reading mode that did not say which corpus.
+
+    Shared by ``--real`` and ``--extract-only`` because the reason is the same
+    for both: the haystack decides which sessions are extracted at all, so a
+    default would let the two modes fill one output directory from two different
+    corpora.
+    """
+    if args.haystack is None:
+        parser.error(
+            f"{flag} requires --haystack: design doc §3.4 makes 's' the corpus the "
+            "extractor ingests and 'oracle' the evidence-only source, and running "
+            "the wrong one silently measures a different benchmark"
+        )
+
+
+def _run_extract_only(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Run the shared extraction stage alone and report what it cost."""
+    from benchmarks.longmemeval import real_run
+
+    _require_haystack(parser, args, "--extract-only")
+
+    config = real_run.RealRunConfig(
+        out_dir=args.out_dir,
+        split=args.split,
+        limit=args.limit,
+        haystack=args.haystack,
+        data_dir=args.data_dir,
+        top_k=args.top_k,
+    )
+    summary = real_run.extract_only(config, progress=print)
+
+    print(f"extract-only: wrote {summary['extractions_path']}")
+    print(f"  manifest: {summary['manifest_path']}")
+    print(
+        f"  questions: {summary['questions']} "
+        f"({summary['questions_skipped']} already cached)"
+    )
+    print(
+        f"  extraction calls: {summary['extraction_calls']} over "
+        f"{summary['sessions_extracted']} session(s)"
+    )
+    print(f"  cache rows: {summary['cache_rows']}")
+    return 0
+
+
 def _run_real(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Execute the pinned real-model run and print its headline numbers."""
     from benchmarks.longmemeval import real_run
 
-    if args.haystack is None:
-        parser.error(
-            "--real requires --haystack: design doc §3.4 makes 's' the corpus the "
-            "extractor ingests and 'oracle' the evidence-only source, and running "
-            "the wrong one silently measures a different benchmark"
-        )
+    _require_haystack(parser, args, "--real")
 
     config = real_run.RealRunConfig(
         out_dir=args.out_dir,
@@ -1072,18 +1125,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     _add_real_run_arguments(parser)
     args = parser.parse_args(argv)
 
-    modes = [args.smoke, args.smoke_3arm, args.real, args.preflight]
+    modes = [
+        args.smoke,
+        args.smoke_3arm,
+        args.real,
+        args.extract_only,
+        args.preflight,
+    ]
     if sum(bool(mode) for mode in modes) > 1:
         parser.error(
-            "pass exactly one of --smoke, --smoke-3arm, --real or --preflight"
+            "pass exactly one of --smoke, --smoke-3arm, --real, --extract-only "
+            "or --preflight"
         )
     if not any(modes):
         parser.error(
-            "nothing to do: pass --smoke, --smoke-3arm, --preflight or --real"
+            "nothing to do: pass --smoke, --smoke-3arm, --preflight, "
+            "--extract-only or --real"
         )
 
     if args.preflight:
         return _run_preflight()
+    if args.extract_only:
+        return _run_extract_only(parser, args)
     if args.real:
         return _run_real(parser, args)
 
