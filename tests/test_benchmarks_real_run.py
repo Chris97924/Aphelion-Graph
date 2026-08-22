@@ -1106,6 +1106,50 @@ def test_whitespace_json_does_not_recognise_is_refused(separator: str) -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "padding",
+    [
+        " ",  # no-break space
+        "\x0b",  # vertical tab
+        "\x0c",  # form feed
+        " ",  # line separator
+        "　",  # ideographic space
+    ],
+)
+@pytest.mark.parametrize("fence", ["```", "```json"])
+@pytest.mark.parametrize("where", ["before", "after", "both"])
+def test_a_fence_padded_with_whitespace_json_does_not_recognise_is_refused(
+    padding: str, fence: str, where: str
+) -> None:
+    """The fence heal may not be a way back in for the bytes JSON refuses.
+
+    Deciding what is *only* a delimiter with ``str.strip()`` would read this line
+    on the wider Unicode definition and blank it to spaces — and spaces are
+    skipped between objects, so a separator the parser one step later refuses
+    would arrive already laundered. The two decisions have to be made on the same
+    definition of whitespace, or the stricter one is decorative.
+    """
+    assert padding.isspace(), "the fixture must be isspace-but-not-JSON"
+    record = json.dumps({"text": "t", "subject": "s", "value": "v"})
+    before = padding if where in ("before", "both") else ""
+    after = padding if where in ("after", "both") else ""
+
+    with pytest.raises(clients.ExtractionFormatError):
+        clients.extracted_claims(f"{record}\n{before}{fence}{after}\n{record}")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("padding", [" ", "\t", " \t ", ""])
+def test_a_fence_padded_with_json_whitespace_is_still_only_a_delimiter(
+    padding: str,
+) -> None:
+    """The tolerance that was intended: JSON's own whitespace around a fence."""
+    record = json.dumps({"text": "t", "subject": "s", "value": "v"})
+    claims = clients.extracted_claims(f"{record}\n{padding}```{padding}\n{record}")
+    assert len(claims) == 2
+
+
+@pytest.mark.unit
 def test_a_parse_error_reports_the_object_start_in_the_original_completion() -> None:
     """The offset must index what the model sent, fences and all.
 

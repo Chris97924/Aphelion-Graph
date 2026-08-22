@@ -1027,9 +1027,18 @@ def _blank_fence_delimiters(completion: str) -> str:
 
     A fence with content on the same line is left in place deliberately: it is
     malformed, and the parser below refuses it rather than let a claim vanish.
+
+    What counts as padding around the delimiter is :data:`_JSON_WHITESPACE`, the
+    same definition the parser skips on. ``str.strip()`` would be the wider
+    Unicode one, and the difference is not cosmetic: a line reading
+    ``NBSP``-fence-``NBSP`` would be blanked to spaces and therefore *skipped*,
+    letting a separator the next step refuses arrive already laundered. Both
+    decisions are made on JSON's whitespace, or the stricter one is decorative.
     """
     return "\n".join(
-        " " * len(line) if _FENCE_DELIMITER_RE.fullmatch(line.strip()) else line
+        " " * len(line)
+        if _FENCE_DELIMITER_RE.fullmatch(line.strip(_JSON_WHITESPACE))
+        else line
         for line in completion.split("\n")
     )
 
