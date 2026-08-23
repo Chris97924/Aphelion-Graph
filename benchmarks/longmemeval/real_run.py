@@ -51,6 +51,7 @@ import math
 import os
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -328,19 +329,40 @@ class JsonlWriter:
 
     The file is repaired on construction, so an append can never land on top of a
     torn row (see :func:`repair_jsonl`).
+
+    **One row, one write, one thread at a time.** The extraction scheduler runs
+    questions concurrently against a single cache file, so appends arrive from
+    many threads. The row is serialised to bytes *before* the lock and handed to
+    one ``write`` call inside it, which makes the failure this guards against
+    impossible rather than unlikely: two interleaved appends do not produce a
+    *torn* row — the tolerance above is for those, and they are only ever at the
+    end of a file — they produce a spliced row in the MIDDLE of one, which
+    :func:`read_jsonl` refuses permanently and correctly, leaving the run
+    unresumable with its model work already paid for.
+
+    The guarantee is in-process, which is the whole of what is claimed. Two
+    processes appending to one directory were never supported and are not now;
+    what stops them is the manifest and extraction-identity gates, which refuse a
+    second run over another pass's rows before a byte is written.
     """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self.repaired_bytes = repair_jsonl(path)
 
     def append(self, row: Mapping[str, Any]) -> None:
-        line = json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n"
-        with self.path.open("ab") as handle:
-            handle.write(line.encode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
+        # Encoded outside the lock: it is pure CPU on a private row, and holding
+        # the lock across it would serialise formatting as well as writing.
+        payload = (json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        )
+        with self._lock:
+            with self.path.open("ab") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
 
 
 def _sha256_text(text: str) -> str:
@@ -519,11 +541,19 @@ class ExtractionCache:
     longer a measurement of the memory layer (design doc §7.3). Memoising makes
     the extraction a fixed input to all three arms — and, because the memo is on
     disk, keeps it fixed across a restart too.
+
+    Shared by every question the extraction scheduler has in flight, so the
+    in-memory index and the durable row behind it are updated under one lock. The
+    two halves must not be observable out of step: a row on disk the index does
+    not know about is a session re-extracted and paid for twice, and an index
+    entry with no row behind it is a session that silently disappears on the next
+    resume. Under the lock they are one operation, so a key is in both or neither.
     """
 
     def __init__(self, path: Path) -> None:
         self._writer = JsonlWriter(path)
         self._records: dict[tuple[str, str], list[dict]] = {}
+        self._lock = threading.Lock()
         for row in read_jsonl(path):
             if row.get("format") != EXTRACTION_CACHE_FORMAT:
                 raise ExtractionCacheVersionError(
@@ -540,11 +570,15 @@ class ExtractionCache:
             self._records[(row["question_id"], row["session_id"])] = list(row["claims"])
 
     def __len__(self) -> int:
-        return len(self._records)
+        with self._lock:
+            return len(self._records)
 
     def get(self, question_id: str, session_id: str) -> list[dict] | None:
-        records = self._records.get((question_id, session_id))
-        return [dict(record) for record in records] if records is not None else None
+        with self._lock:
+            records = self._records.get((question_id, session_id))
+            return (
+                [dict(record) for record in records] if records is not None else None
+            )
 
     def put(
         self,
@@ -563,7 +597,6 @@ class ExtractionCache:
         rows byte-identical to the ones it has always written.
         """
         stored = [dict(record) for record in records]
-        self._records[(question_id, session_id)] = stored
         row: dict[str, Any] = {
             "format": EXTRACTION_CACHE_FORMAT,
             "question_id": question_id,
@@ -574,7 +607,13 @@ class ExtractionCache:
             # Never allowed to shadow the fields the replay reads.
             if key not in row:
                 row[key] = value
-        self._writer.append(row)
+        # Index and row together — see the class docstring. The append is inside
+        # the lock rather than after it because "durable, then visible" is the
+        # order a resume depends on: a caller that saw the memo entry has to be
+        # able to assume the bytes behind it survive the process.
+        with self._lock:
+            self._records[(question_id, session_id)] = stored
+            self._writer.append(row)
 
 
 def _call_instrumentation(

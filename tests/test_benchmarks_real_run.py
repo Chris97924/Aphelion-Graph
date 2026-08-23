@@ -29,11 +29,12 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import types
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import pytest
 
@@ -2491,6 +2492,153 @@ def test_repairing_a_clean_file_changes_nothing(tmp_path: Path) -> None:
     path.write_bytes(b'{"a": 1}\n{"b": 2}\n')
     assert real_run.repair_jsonl(path) == 0
     assert real_run.repair_jsonl(tmp_path / "absent.jsonl") == 0
+
+
+# --------------------------------------------------------------------------- #
+# The durable writer and the extraction memo, under many threads at once       #
+# --------------------------------------------------------------------------- #
+
+# Enough threads that the OS actually has to interleave them, and enough rows
+# each that a missing lock loses the race rather than merely being able to.
+_HAMMER_THREADS = 8
+_HAMMER_ROWS = 40
+_HAMMER_TOTAL = _HAMMER_THREADS * _HAMMER_ROWS
+
+# Long enough to cross the buffered writer's boundary, and non-ASCII so a spliced
+# row is a broken UTF-8 sequence as well as broken JSON — which is the shape the
+# torn-tail tolerance above exists for, and the shape it must never see here.
+_HAMMER_FILLER = "中文" * 200
+
+
+def _run_hammer(work: Callable[[int], None]) -> None:
+    """Run ``work(worker)`` on :data:`_HAMMER_THREADS` threads, released together.
+
+    The barrier is the point: threads started in a loop tend to finish in the
+    order they were started, which is exactly the schedule a missing lock
+    survives. Releasing them at once is what makes the append window overlap.
+    """
+    barrier = threading.Barrier(_HAMMER_THREADS)
+    errors: list[BaseException] = []
+
+    def entry(worker: int) -> None:
+        try:
+            barrier.wait(timeout=60)
+            work(worker)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+            errors.append(exc)
+            barrier.abort()
+
+    threads = [
+        threading.Thread(target=entry, args=(worker,), name=f"hammer-{worker}")
+        for worker in range(_HAMMER_THREADS)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=180)
+
+    stuck = [thread.name for thread in threads if thread.is_alive()]
+    assert not stuck, f"worker(s) never finished: {stuck}"
+    assert not errors, f"worker(s) raised: {errors!r}"
+
+
+@pytest.mark.unit
+def test_concurrent_appends_never_tear_or_interleave_a_row(tmp_path: Path) -> None:
+    """Every row arrives whole, exactly once, and the tear path never opens.
+
+    A per-question extraction scheduler has many threads appending to one cache
+    file. Without serialisation two appends can interleave inside one line, and
+    the result is not a *torn* row the repair path can drop — it is a spliced row
+    in the middle of the file, which :func:`real_run.read_jsonl` correctly refuses
+    forever. So the assertion is not "mostly fine": it is that the file is
+    byte-for-byte what a serial writer would have produced, modulo row order.
+    """
+    path = tmp_path / "rows.jsonl"
+    writer = real_run.JsonlWriter(path)
+
+    def hammer(worker: int) -> None:
+        for index in range(_HAMMER_ROWS):
+            writer.append(
+                {
+                    "id": f"w{worker}-r{index}",
+                    # The id restated inside the payload: a row assembled from
+                    # two writers' bytes can still parse, and would still carry
+                    # one id. It cannot also carry a payload that agrees with it.
+                    "payload": f"{worker}:{index}:{_HAMMER_FILLER}",
+                }
+            )
+
+    _run_hammer(hammer)
+
+    raw = path.read_bytes()
+    # Decoded as strict UTF-8 over the whole file: a splice inside a multi-byte
+    # character fails here, before any per-line parse gets a chance to be lenient.
+    lines = raw.decode("utf-8").splitlines()
+    assert len(lines) == _HAMMER_TOTAL
+
+    rows = [json.loads(line) for line in lines]
+    ids = [row["id"] for row in rows]
+    assert sorted(ids) == sorted(
+        f"w{worker}-r{index}"
+        for worker in range(_HAMMER_THREADS)
+        for index in range(_HAMMER_ROWS)
+    )
+    for row in rows:
+        worker, index, filler = row["payload"].split(":", 2)
+        assert row["id"] == f"w{worker}-r{index}"
+        assert filler == _HAMMER_FILLER
+
+    # The torn-tail path was never entered: nothing to repair, and a writer
+    # reopening the file finds no residue to truncate.
+    assert real_run.repair_jsonl(path) == 0
+    assert real_run.JsonlWriter(path).repaired_bytes == 0
+    # And a reader after the fact sees every row the writers returned from.
+    assert real_run.read_jsonl(path) == rows
+
+
+@pytest.mark.unit
+def test_the_extraction_memo_is_consistent_under_concurrent_puts(
+    tmp_path: Path,
+) -> None:
+    """The in-memory index and the file agree, whichever thread wrote which row.
+
+    ``put`` updates a dict *and* appends a durable row. Concurrent callers must
+    not be able to observe those two halves out of step — a row on disk that the
+    memo does not know about would be re-extracted (paid for twice), and a memo
+    entry with no row behind it would vanish on the next resume.
+    """
+    path = tmp_path / real_run.EXTRACTIONS_NAME
+    cache = real_run.ExtractionCache(path)
+
+    def claims(worker: int, index: int) -> list[dict[str, str]]:
+        return [
+            {
+                "text": f"worker {worker} session {index} says {_HAMMER_FILLER}",
+                "subject": f"w{worker} s{index}",
+                "value": str(index),
+            }
+        ]
+
+    def hammer(worker: int) -> None:
+        for index in range(_HAMMER_ROWS):
+            cache.put(f"q{worker}", f"s{index}", claims(worker, index))
+            # Read-after-write, from the writing thread, while others are mid-put.
+            assert cache.get(f"q{worker}", f"s{index}") == claims(worker, index)
+
+    _run_hammer(hammer)
+
+    assert len(cache) == _HAMMER_TOTAL
+    assert real_run.repair_jsonl(path) == 0
+
+    # Reopened from the file alone: every row is there, under the right key, with
+    # the claims its writer put — which is what a resume actually depends on.
+    reopened = real_run.ExtractionCache(path)
+    assert len(reopened) == _HAMMER_TOTAL
+    for worker in range(_HAMMER_THREADS):
+        for index in range(_HAMMER_ROWS):
+            expected = claims(worker, index)
+            assert cache.get(f"q{worker}", f"s{index}") == expected
+            assert reopened.get(f"q{worker}", f"s{index}") == expected
 
 
 @pytest.mark.unit
