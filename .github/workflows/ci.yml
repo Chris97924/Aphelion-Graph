@@ -64,7 +64,23 @@ jobs:
       # tests/test_diff_fuzz_hardening.py is a live example — would fail a job
       # whose gating test step had already passed. Real failures are still
       # caught: they fail the gated step above first.
+      #
+      # One matrix cell, not nine. Re-running the whole suite in all 3x3 cells
+      # roughly doubles CI wall time to print nine copies of one number.
+      # Coverage of benchmarks/ and scripts/ is a property of the code, not of
+      # the OS or the interpreter, and the two things that could make the cells
+      # differ — a platform-skipped test and a real failure — are both already
+      # reported per-cell by the gated step above. ubuntu-latest / 3.11 is the
+      # cell that draws it: 3.11 is the matrix's primary interpreter (listed
+      # first) and ubuntu is the cheapest runner.
+      #
+      # Narrowing it costs no signal because this step cannot fail the job BY
+      # DESIGN — --cov-fail-under=0 means it asserts nothing, and
+      # continue-on-error swallows whatever is left. A step that can only ever
+      # print is a step that only has to print once. If this ever becomes a
+      # gate, the single cell is no longer defensible and this `if:` has to go.
       - name: Report coverage for benchmarks and scripts (not gated)
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         continue-on-error: true
         run: |
           pytest --cov=benchmarks --cov=scripts --cov-report=term --cov-fail-under=0 -q
