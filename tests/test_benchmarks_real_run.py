@@ -4551,6 +4551,85 @@ def test_a_cache_with_no_identity_record_is_refused_rather_than_adopted(
 
 
 @pytest.mark.unit
+def test_an_identity_record_over_an_empty_cache_is_replaced_not_enforced(
+    tmp_path: Path,
+) -> None:
+    """A record with no rows beneath it attests to nothing, so it cannot refuse.
+
+    Both modes write the sidecar before extracting, so a pass that dies at its
+    first model call leaves one behind over an absent or empty cache. Enforcing
+    it would pin the output directory to an identity that never produced a byte,
+    and the only remedy the message offers is a fresh ``--out-dir``.
+    """
+    sidecar = tmp_path / real_run.EXTRACTION_IDENTITY_NAME
+    cache_path = tmp_path / real_run.EXTRACTIONS_NAME
+    stale = {
+        "extraction_cache_format": real_run.EXTRACTION_CACHE_FORMAT,
+        "extractor_pin": {"model": "the-one-that-never-ran"},
+    }
+    sidecar.write_text(json.dumps(stale), encoding="utf-8")
+    fresh = {
+        "extraction_cache_format": real_run.EXTRACTION_CACHE_FORMAT,
+        "extractor_pin": {"model": "the-one-running-now"},
+    }
+
+    # No cache file at all.
+    assert (
+        real_run.reconcile_extraction_identity(sidecar, fresh, cache_path=cache_path)
+        == fresh
+    )
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == fresh
+
+    # A cache file that exists and is empty is the same claim.
+    sidecar.write_text(json.dumps(stale), encoding="utf-8")
+    cache_path.write_bytes(b"")
+    assert (
+        real_run.reconcile_extraction_identity(sidecar, fresh, cache_path=cache_path)
+        == fresh
+    )
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == fresh
+
+    # One row is enough for the refusal to stand: now there is something to
+    # misattribute, which is the whole point of the record.
+    cache_path.write_bytes(b'{"question_id": "ku-one", "session_id": "ku-one::s1"}\n')
+    with pytest.raises(real_run.ExtractionIdentityMismatchError, match="extractor_pin"):
+        real_run.reconcile_extraction_identity(sidecar, stale, cache_path=cache_path)
+
+
+@pytest.mark.integration
+def test_a_pass_that_died_before_its_first_row_does_not_pin_the_directory(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The end-to-end shape of the same thing: a stillborn extraction pass."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "stillborn")
+
+    def dead_factory(pin: Any) -> FakeChat:
+        client = FakeChat(pin)
+        client.fail_after = 0
+        return client
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        real_run.extract_only(cfg, client_factory=dead_factory)
+
+    sidecar = cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME
+    cache_path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    assert sidecar.is_file(), "the pass never got as far as writing its identity"
+    assert not (cache_path.is_file() and cache_path.stat().st_size)
+
+    # The graded run's manifest was never written by that pass, so the only thing
+    # standing between this directory and a different extractor is the sidecar.
+    forged = _preregister_with(tmp_path, _with_another_extractor)
+    retooled = _config(
+        tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, preregister_path=forged
+    )
+    real_run.execute(retooled, client_factory=_factory([]), judge_client=FakeJudge())
+
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == real_run.extraction_identity(
+        json.loads((cfg.out_dir / real_run.MANIFEST_NAME).read_text(encoding="utf-8"))
+    )
+
+
+@pytest.mark.unit
 def test_extract_only_is_mutually_exclusive_with_the_other_modes() -> None:
     """One mode per invocation, or an output directory holds two experiments."""
     with pytest.raises(SystemExit):

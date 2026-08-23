@@ -1345,22 +1345,35 @@ def reconcile_extraction_identity(
 ) -> dict[str, Any]:
     """Write the extraction cache's identity, or check it against the one there.
 
-    Called by both modes before either reads or appends a row. Three states:
+    Called by both modes before either reads or appends a row. What decides the
+    outcome is whether there are ROWS to misattribute — the record exists to
+    vouch for bytes, so with no bytes it has nothing to say:
 
     * No identity record and no rows — this pass owns the cache; the record is
       written and it is now attributable.
     * A record that agrees — the rows on disk were produced by this exact
       extraction, and replaying or extending them is what resume means.
-    * A record that disagrees, **or rows with no record at all** — refused. The
-      second case is not the benign one it looks like: rows whose provenance is
-      missing are precisely the rows nothing can vouch for, and writing this
-      pass's identity over them would mint an attestation for bytes it never
-      produced.
+    * A record that disagrees **over rows on disk** — refused: replaying them
+      would answer from claims this configuration's extractor never made.
+    * A record that disagrees over an absent or empty cache — replaced. Both
+      modes write the sidecar *before* extracting, so a pass that died at its
+      first model call leaves one behind with nothing beneath it; enforcing that
+      would pin an output directory to an identity that never produced a byte.
+    * Rows with no record at all — refused, and this is not the benign case it
+      looks like: rows whose provenance is missing are precisely the rows nothing
+      can vouch for, and writing this pass's identity over them would mint an
+      attestation for bytes it never produced.
     """
+    # Checked before anything is read or written, and deliberately on size rather
+    # than on parsed rows: a torn trailing row is still a row somebody paid for.
+    rows_on_disk = cache_path.is_file() and bool(cache_path.stat().st_size)
+
     if path.is_file():
         existing = json.loads(path.read_text(encoding="utf-8"))
         differences = _identity_differences(existing, fresh)
-        if differences:
+        if not differences:
+            return existing
+        if rows_on_disk:
             raise ExtractionIdentityMismatchError(
                 f"{cache_path} holds extractions produced under a different "
                 "identity, so replaying them would answer from claims this "
@@ -1368,9 +1381,7 @@ def reconcile_extraction_identity(
                 "re-run with the recorded settings. Differences:\n  "
                 + "\n  ".join(differences)
             )
-        return existing
-
-    if cache_path.is_file() and cache_path.stat().st_size:
+    elif rows_on_disk:
         raise ExtractionIdentityMismatchError(
             f"{cache_path} holds extraction rows but {path.name} is missing, so "
             "nothing says which extractor, corpus or harness revision produced "
