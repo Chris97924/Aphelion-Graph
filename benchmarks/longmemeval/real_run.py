@@ -349,10 +349,14 @@ class JsonlWriter:
     :func:`read_jsonl` refuses permanently and correctly, leaving the run
     unresumable with its model work already paid for.
 
-    The guarantee is in-process, which is the whole of what is claimed. Two
-    processes appending to one directory were never supported and are not now;
-    what stops them is the manifest and extraction-identity gates, which refuse a
-    second run over another pass's rows before a byte is written.
+    The lock belongs to the *instance*, which is the whole of what is claimed.
+    Two writers over one path hold two different locks and do not serialise
+    against each other, so a phase that opens its own writer must not overlap
+    another that has one — as things stand none do: a graded run's pre-extraction
+    finishes before the answering phase opens the cache again. Two *processes*
+    were never supported either; what stops those is the manifest and
+    extraction-identity gates, which refuse a second run over another pass's rows
+    before a byte is written.
     """
 
     def __init__(self, path: Path) -> None:
