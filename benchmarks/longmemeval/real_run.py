@@ -2838,13 +2838,6 @@ def extract_only(
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     split_manifest = load_split(cfg.split_manifest_path)
 
-    # Only the extraction cache is repaired, because it is the only file this
-    # pass appends to. Repairing the graded run's artefacts here would be this
-    # mode reaching into a run it does not participate in.
-    dropped = repair_jsonl(cfg.out_dir / EXTRACTIONS_NAME)
-    if dropped:
-        progress(f"repaired {EXTRACTIONS_NAME}: dropped {dropped} torn byte(s)")
-
     specs = load_questions(
         split=cfg.split,
         limit=cfg.limit,
@@ -2894,6 +2887,18 @@ def extract_only(
         cache_path=cfg.out_dir / EXTRACTIONS_NAME,
     )
     manifest = existing if existing is not None else write_manifest(manifest_path, fresh)
+
+    # Repaired only now, once the cache is known to be this pass's to append to.
+    # A truncate-and-fsync is a write, and a pass that has just been refused must
+    # leave the directory exactly as it found it — including a torn trailing row,
+    # which is evidence about the interrupted run that owns these bytes, not
+    # litter for the next caller to sweep up. Only the extraction cache is
+    # repaired at all, because it is the only file this pass appends to;
+    # repairing the graded run's artefacts here would be this mode reaching into
+    # a run it does not participate in.
+    dropped = repair_jsonl(cfg.out_dir / EXTRACTIONS_NAME)
+    if dropped:
+        progress(f"repaired {EXTRACTIONS_NAME}: dropped {dropped} torn byte(s)")
 
     cache = ExtractionCache(cfg.out_dir / EXTRACTIONS_NAME)
     client = client_factory(chat_pin)
@@ -2985,7 +2990,13 @@ def execute(
     # has to be truncated rather than merely tolerated: the writers append, so
     # residue left in place would have the next row concatenated onto it and
     # become permanently unparseable in the middle of the file.
-    for name in (EXTRACTIONS_NAME, CLAIMS_NAME, ANSWERS_NAME, VERDICTS_NAME):
+    #
+    # The extraction cache is deliberately NOT in this list. It is the one
+    # durable file this run may be *refused* over — it can carry rows another
+    # extraction pass produced — and a refused run may not write into the
+    # directory at all, truncate-and-fsync included. It is repaired below, once
+    # its identity record has said these rows are ours.
+    for name in (CLAIMS_NAME, ANSWERS_NAME, VERDICTS_NAME):
         dropped = repair_jsonl(cfg.out_dir / name)
         if dropped:
             progress(f"repaired {name}: dropped {dropped} torn byte(s)")
@@ -3060,6 +3071,11 @@ def execute(
         cache_path=cfg.out_dir / EXTRACTIONS_NAME,
     )
     manifest = existing if existing is not None else write_manifest(manifest_path, fresh)
+
+    # Now that the cache is ours to append to (see the repair loop above).
+    dropped = repair_jsonl(cfg.out_dir / EXTRACTIONS_NAME)
+    if dropped:
+        progress(f"repaired {EXTRACTIONS_NAME}: dropped {dropped} torn byte(s)")
 
     progress(f"answering {len(specs)} questions x {len(ARM_STORES)} arms")
     phase = load_answer_phase(cfg.out_dir)

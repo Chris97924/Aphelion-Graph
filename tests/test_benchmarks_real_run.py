@@ -4323,6 +4323,97 @@ def test_an_extraction_pass_refuses_a_cache_extracted_from_another_corpus(
     assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
 
 
+def _tear_last_row(cache_path: Path) -> bytes:
+    """Append an unterminated row, as an interrupted write would leave behind.
+
+    Returned bytes are what the file must still hold after a refusal: a pass that
+    may not touch these rows may not tidy them either. Truncating first and
+    refusing afterwards would hand back a file the operator never asked anyone to
+    edit — and, when the torn row is the only one, an *empty* file, which then
+    looks like a cache no identity record has to vouch for.
+    """
+    with cache_path.open("ab") as handle:
+        handle.write(b'{"question_id": "torn", "session_id": "s9", "claims": [')
+    return cache_path.read_bytes()
+
+
+@pytest.mark.integration
+def test_an_extraction_pass_leaves_a_torn_row_alone_when_it_refuses_the_cache(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The identity gate runs before the repair, not after it.
+
+    Repairing first truncates and fsyncs a file belonging to another identity —
+    a write into an output directory this pass has just been told it may not
+    touch. The byte-for-byte guarantee the refusal is supposed to give is only
+    real if it holds for a cache that needs repairing.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+    cache_path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    before = _tear_last_row(cache_path)
+
+    _retext_one_session(corpus_dir)
+
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError, match="corpus_loaded_sha256"
+    ):
+        real_run.extract_only(cfg, client_factory=_factory([]))
+
+    assert cache_path.read_bytes() == before
+
+
+@pytest.mark.integration
+def test_a_graded_run_leaves_a_torn_row_alone_when_it_refuses_the_cache(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The same guarantee on the ``--real`` side, whose repair covers four files.
+
+    ``extractions.jsonl`` is the one file in that list a graded run may be
+    refused over, so it is the one that has to wait for the gate; the run's own
+    answers, claims and verdicts are still repaired up front.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    cache_path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    before = _tear_last_row(cache_path)
+
+    forged = _preregister_with(tmp_path, _with_another_extractor)
+    graded = _config(
+        tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, preregister_path=forged
+    )
+    with pytest.raises(real_run.ExtractionIdentityMismatchError, match="extractor_pin"):
+        real_run.execute(graded, client_factory=_factory([]), judge_client=FakeJudge())
+
+    assert cache_path.read_bytes() == before
+
+
+@pytest.mark.integration
+def test_a_cache_torn_down_to_nothing_is_still_refused_without_a_record(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A cache that is *only* a torn row must not be adopted by emptying it.
+
+    Repairing before the gate truncates such a file to zero bytes, and the
+    "rows but no identity record" refusal keys on size — so the pass would write
+    its own identity beside a file it had just erased, and call that attributable.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "orphan")
+    cfg.out_dir.mkdir(parents=True)
+    cache_path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    cache_path.write_bytes(b'{"question_id": "ku-one", "session_id": "ku-one::s1"')
+    before = cache_path.read_bytes()
+
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError,
+        match=real_run.EXTRACTION_IDENTITY_NAME,
+    ):
+        real_run.extract_only(cfg, client_factory=_factory([]))
+
+    assert cache_path.read_bytes() == before
+    assert not (cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME).exists()
+
+
 @pytest.mark.integration
 def test_an_extraction_pass_resumes_the_cache_a_graded_run_left(
     tmp_path: Path, corpus_dir: Path, split_path: Path
