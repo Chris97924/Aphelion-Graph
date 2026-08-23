@@ -482,6 +482,98 @@ def _urlget_transport(url: str, payload: bytes, timeout: float) -> bytes:
         return response.read()
 
 
+# The token-count fields each dialect reports, mapped onto one vocabulary. Both
+# names per slot are read because the two clients here speak different dialects
+# and an endpoint may implement either spelling.
+_USAGE_FIELDS = (
+    ("prompt_tokens", ("prompt_tokens", "prompt_eval_count")),
+    ("completion_tokens", ("completion_tokens", "eval_count")),
+    ("total_tokens", ("total_tokens",)),
+)
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    """One completion, plus what the endpoint said the call cost.
+
+    ``usage`` is ``None`` when the endpoint reported nothing — which is a real
+    and common case, not an error. It is kept distinct from ``{}`` so a consumer
+    can tell "the server does not report usage" from "the server reported zero".
+    """
+
+    text: str
+    usage: dict[str, int] | None = None
+
+
+def usage_record(body: Mapping[str, Any]) -> dict[str, int] | None:
+    """Prompt/completion token counts from a response body, in either dialect.
+
+    The chat-completions dialect nests them under ``usage``; the native dialect
+    :class:`LocalChatClient` speaks puts ``prompt_eval_count``/``eval_count`` at
+    the top level. Both are normalised onto one vocabulary so a reader of the
+    recorded numbers does not have to know which server produced them.
+
+    Only integers are taken. A server that reports a token count as a string or
+    a float is reporting something this harness cannot add up, and a silently
+    coerced number would be worse than an absent one.
+    """
+    if not isinstance(body, Mapping):
+        return None
+    nested = body.get("usage")
+    sources: tuple[Mapping[str, Any], ...] = (
+        (body, nested) if isinstance(nested, Mapping) else (body,)
+    )
+    record: dict[str, int] = {}
+    for name, spellings in _USAGE_FIELDS:
+        for source in sources:
+            for spelling in spellings:
+                value = source.get(spelling)
+                # bool is an int subclass, and a boolean token count is a bug in
+                # the server rather than a count worth recording.
+                if isinstance(value, int) and not isinstance(value, bool):
+                    record[name] = value
+                    break
+            if name in record:
+                break
+    if "total_tokens" not in record and {"prompt_tokens", "completion_tokens"} <= set(
+        record
+    ):
+        record["total_tokens"] = record["prompt_tokens"] + record["completion_tokens"]
+    return record or None
+
+
+def chat_result(client: Any, messages: Sequence[Mapping[str, str]]) -> ChatResult:
+    """One completion from ``client``, carrying usage when the client reports it.
+
+    The clients in this module answer ``chat_detailed``; a test double or a
+    future client that only implements ``chat`` still works and simply reports
+    no usage. Written as a free function so the extraction stage can be
+    instrumented without every caller having to know which kind of client it
+    holds.
+
+    A client that *has* ``chat_detailed`` and returns something else is a broken
+    client, and is reported as one. Coercing the value with ``str()`` would turn
+    a dict or a raw HTTP response into its own repr, which reaches the extractor
+    as unparseable model output and raises :class:`ExtractionFormatError` — a
+    diagnosis about the model, aimed at whoever is bringing up a new client for a
+    fault in their own return statement. Failing loud rather than salvaging is
+    this module's rule (see :class:`ExtractionFormatError`), and it applies to
+    the client contract too.
+    """
+    detailed = getattr(client, "chat_detailed", None)
+    if callable(detailed):
+        result = detailed(messages)
+        if not isinstance(result, ChatResult):
+            raise TypeError(
+                f"{type(client).__name__}.chat_detailed returned "
+                f"{type(result).__name__}, not a ChatResult. A client that "
+                "implements chat_detailed must return one — text plus optional "
+                "usage — or implement only chat and let usage go unreported."
+            )
+        return result
+    return ChatResult(text=client.chat(messages))
+
+
 @dataclass(frozen=True)
 class LocalChatClient:
     """Chat completions from the pinned LAN model, at the pinned knobs.
@@ -540,11 +632,20 @@ class LocalChatClient:
             ) from exc
 
     def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
-        """Return the assistant's final content for ``messages``.
+        """Return the assistant's final content for ``messages``."""
+        return self.chat_detailed(messages).text
+
+    def chat_detailed(self, messages: Sequence[Mapping[str, str]]) -> ChatResult:
+        """Return the assistant's final content, plus any reported usage.
 
         ``stream`` is off so one request yields one complete body, and the pinned
         temperature and seed travel in ``options`` — the two knobs design doc §6
         guard 2 requires every generation to run under.
+
+        This is the one request path; :meth:`chat` is a projection of it. Keeping
+        a single implementation is what lets an instrumented pass and a pinned
+        run send byte-identical requests — a second code path would be free to
+        drift, and a drifted extraction prompt is a different measurement.
         """
         payload = json.dumps(
             {
@@ -583,7 +684,7 @@ class LocalChatClient:
                 "rather than recorded, because an empty answer scored as wrong is "
                 "a plumbing failure entering the results as a measurement."
             )
-        return content
+        return ChatResult(text=content, usage=usage_record(body))
 
     def available_models(self) -> list[str]:
         """Every model the server currently reports, sorted."""
@@ -666,6 +767,14 @@ class ChatCompletionsClient:
 
     def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
         """Return the assistant's content, refusing an empty or absent one."""
+        return self.chat_detailed(messages).text
+
+    def chat_detailed(self, messages: Sequence[Mapping[str, str]]) -> ChatResult:
+        """Return the assistant's content, plus any reported usage.
+
+        As with :class:`LocalChatClient`, this is the single request path and
+        :meth:`chat` is a projection of it.
+        """
         body: dict[str, Any] = {
             "model": self.pin.model,
             "messages": list(messages),
@@ -706,7 +815,7 @@ class ChatCompletionsClient:
                 "template_kwargs reached the request. Nothing is substituted for a "
                 "missing answer."
             )
-        return content
+        return ChatResult(text=content, usage=usage_record(response))
 
     def available_models(self) -> list[str]:
         """Every model the endpoint advertises, sorted."""
@@ -905,18 +1014,46 @@ class StructuredClaim:
     value: str
 
 
-def _strip_fence_delimiters(completion: str) -> str:
-    """Drop standalone code-fence delimiter lines, keeping everything else.
+# JSON's own inter-token whitespace, and only it. ``str.isspace`` is wider — it
+# is true for NBSP, form feed, vertical tab and the Unicode separators — so
+# skipping on it would have this reader accept, between claim objects, bytes the
+# JSON grammar rejects inside one. That is precisely the quiet tolerance this
+# parser exists not to have.
+_JSON_WHITESPACE = " \t\n\r"
+
+
+def _blank_fence_delimiters(completion: str) -> str:
+    """Blank standalone code-fence delimiter lines, preserving every offset.
 
     A model that wraps correct output in a fence has still answered correctly, so
-    a line that is *only* a delimiter carries no claim and is removed. A fence
-    with content on the same line is left in place deliberately: it is malformed,
-    and the parser below will refuse it rather than let a claim vanish.
+    a line that is *only* a delimiter carries no claim. It is overwritten with
+    spaces rather than deleted, and that distinction is the whole point:
+
+    * Spaces are :data:`_JSON_WHITESPACE`, so a blanked line is skipped between
+      objects and tolerated between one object's members. A delimiter line that
+      lands in the middle of a broken object therefore cannot take that object's
+      members with it — the parse either succeeds with every member intact, or
+      fails, and the members are still there to be seen in the error.
+    * Deleting the line would shift every offset after it, so the offsets this
+      module reports would index a payload the model never sent. Blanking keeps
+      the text's geometry exactly: every reported offset indexes the completion
+      as received.
+
+    A fence with content on the same line is left in place deliberately: it is
+    malformed, and the parser below refuses it rather than let a claim vanish.
+
+    What counts as padding around the delimiter is :data:`_JSON_WHITESPACE`, the
+    same definition the parser skips on. ``str.strip()`` would be the wider
+    Unicode one, and the difference is not cosmetic: a line reading
+    ``NBSP``-fence-``NBSP`` would be blanked to spaces and therefore *skipped*,
+    letting a separator the next step refuses arrive already laundered. Both
+    decisions are made on JSON's whitespace, or the stricter one is decorative.
     """
     return "\n".join(
-        line
+        " " * len(line)
+        if _FENCE_DELIMITER_RE.fullmatch(line.strip(_JSON_WHITESPACE))
+        else line
         for line in completion.split("\n")
-        if not _FENCE_DELIMITER_RE.fullmatch(line.strip())
     )
 
 
@@ -931,30 +1068,46 @@ def extracted_claims(completion: str) -> list[StructuredClaim]:
     valid output, and no prompt wording closes a layout difference that varies
     with the input rather than with the instruction.
 
-    Whitespace between objects is skipped; **anything else between or after them
-    is not**. Strictness is unchanged where it matters: the schema is still
-    exactly :data:`CLAIM_FIELDS`, unknown fields still raise, a non-object still
-    raises, and a completion carrying no claims at all still raises rather than
-    returning an empty list — see :class:`ExtractionFormatError` for why a lost
-    claim may not be salvaged into silence.
+    JSON's own whitespace between objects is skipped; **anything else between or
+    after them is not**, and that includes whitespace JSON does not recognise
+    (see :data:`_JSON_WHITESPACE`). Strictness is unchanged where it matters: the
+    schema is still exactly :data:`CLAIM_FIELDS`, unknown fields still raise, a
+    non-object still raises, and a completion carrying no claims at all still
+    raises rather than returning an empty list — see
+    :class:`ExtractionFormatError` for why a lost claim may not be salvaged into
+    silence.
+
+    Every offset in a raised message indexes ``completion`` itself, because the
+    fence handling preserves offsets (:func:`_blank_fence_delimiters`). An
+    operator reading the error can count to the reported byte in the output they
+    actually received.
     """
-    payload = _strip_fence_delimiters(completion)
+    payload = _blank_fence_delimiters(completion)
     decoder = json.JSONDecoder()
     claims: list[StructuredClaim] = []
     index, length = 0, len(payload)
 
     while True:
-        while index < length and payload[index].isspace():
+        while index < length and payload[index] in _JSON_WHITESPACE:
             index += 1
         if index >= length:
             break
 
+        # ``index`` is the first byte of an object, and stays that way on
+        # failure: ``raw_decode`` rebinds it only when it returns. The object's
+        # start is what the message leads with, because that is where an
+        # operator has to start reading to see what the model actually emitted;
+        # the decoder's own position is reported beside it, never instead of it.
+        start = index
         try:
-            record, index = decoder.raw_decode(payload, index)
+            record, index = decoder.raw_decode(payload, start)
         except json.JSONDecodeError as exc:
             raise ExtractionFormatError(
-                f"extractor output is not a stream of JSON objects ({exc}) at "
-                f"offset {index}: {payload[index : index + 160]!r}"
+                f"extractor output is not a stream of JSON objects: {exc.msg}. "
+                f"The object beginning at offset {start} does not parse; the "
+                f"decoder stopped at offset {exc.pos}. Offsets index the "
+                f"completion as received. From offset {start}: "
+                f"{completion[start : start + 160]!r}"
             ) from exc
 
         if not isinstance(record, dict):

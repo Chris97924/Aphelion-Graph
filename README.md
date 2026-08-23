@@ -195,3 +195,94 @@ python scripts/external_reader.py samples/architecture-claim/
 Exit code is `0` on agreement, `1` on mismatch.
 `tests/test_external_reader.py` guards the stdlib-only contract via an
 AST scan that forbids any `aphelion` / `parallax` / `memory` imports.
+
+## Benchmarks
+
+`benchmarks/longmemeval/` holds a pre-registered 3-arm benchmark over the
+LongMemEval corpus. It exists to answer one question: does Aphelion's
+claim-semantics machinery convert into better *answers*, or only into a tidier
+store?
+
+Three arms ingest the same sessions, are asked the same questions by the same
+answering model, and retrieve through the same deterministic BM25 index. The
+memory layer is the only thing that differs:
+
+- **Arm A** — the floor: every claim is kept, duplicates included.
+- **Arm B** — the honest middle control: exact-string dedup after whitespace
+  collapse.
+- **Arm C** — the machinery under test: lineage-gated `content_hash`
+  coalescing, event state-machine suppression, and R4 conflict resolution.
+
+Six metrics are scored: **M1** QA accuracy on knowledge-update questions (the
+gated one), **M2** deduplication precision/recall/F1 over labeled pairs, **M3**
+knowledge-update contamination rate, **M4** storage and latency sanity with a
+non-gating tripwire, **M5** cross-tool round-trip determinism, and **AG**, the
+adversarial slice.
+
+### Offline smokes
+
+Both smokes are fully deterministic and need no model, no network and no API
+key. They exercise the orchestration, not the models:
+
+```bash
+# Arms A and B over 5 stub questions:
+python -m benchmarks.longmemeval.run --smoke --out /tmp/results.jsonl
+
+# All three arms, with metrics M2, M3 and M5:
+python -m benchmarks.longmemeval.run --smoke-3arm --out /tmp/results-3arm.jsonl
+```
+
+`--out` chooses where the rows land; `--data-dir` points at a LongMemEval
+corpus directory if you have one. Omit `--out` and the rows are written beside
+the harness.
+
+### Extraction pass
+
+All three arms ingest the same sessions, so the extractor's claims are a
+*shared* input to the measurement rather than part of it. `--extract-only` runs
+that stage alone, against a real model, so its cost can be paid and measured
+before the graded run starts:
+
+```bash
+python -m benchmarks.longmemeval.run \
+    --extract-only --haystack s --out-dir runs/extract
+```
+
+`--haystack` is required and has no default — it decides which sessions exist at
+all. `--split` and `--limit` select the slice; `--data-dir` points at the corpus.
+
+Into `--out-dir` it writes exactly three things and nothing else:
+
+- `extractions.jsonl` — the claim cache, in the same format `--real` writes, each
+  fresh row annotated with the call's wall time and the endpoint's token counts
+  where the server reports them.
+- `extract-manifest.json` — this pass's provenance, kept separate from the graded
+  run's `manifest.json`, with a `resumes` entry per pass naming the slice it
+  extracted.
+- `extractions-identity.json` — what the rows may be replayed under: the
+  extractor pin and model config, the haystack, the split, and digests of the
+  corpus, the split manifest and the harness. Both modes reconcile against it
+  before touching a row, and a mismatch is refused rather than merged.
+
+Nothing is answered, scored or judged, and no answers, claims, verdicts or
+metrics file is created. A later `--real` run against the same `--out-dir`
+resumes the cache instead of re-extracting it — that is the point of the mode —
+and re-running `--extract-only` at a wider `--limit` tops the cache up rather
+than starting over.
+
+### Pre-registration
+
+`benchmarks/longmemeval/preregister.json` pins the protocol — seed, split sizes
+and sampling algorithm, the model pins, the retriever, and the per-metric gates
+— and carries a SHA-256 of the design doc
+(`docs/benchmark/longmemeval-3arm-design.md`) so the two cannot drift apart.
+Amendments are recorded in that file under §6.3 rather than applied quietly;
+there are four so far.
+
+The point of pinning the analysis before the run is that the result is
+reportable whichever way it comes out. A gate chosen after seeing the numbers
+is not a gate.
+
+**There are no numbers yet, and none will be quoted until the pinned run
+happens.** Anything the smokes print is stub output over fixture questions: it
+demonstrates that the harness runs, and it measures nothing about Aphelion.

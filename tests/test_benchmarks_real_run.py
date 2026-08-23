@@ -39,6 +39,7 @@ import pytest
 
 from benchmarks.longmemeval import clients, corpus, real_run
 from benchmarks.longmemeval import linker as linker_mod
+from benchmarks.longmemeval import run as run_mod
 from benchmarks.longmemeval.arms import ARM_STORES
 from benchmarks.longmemeval.metrics import m3_contamination
 from benchmarks.longmemeval.pipeline import (
@@ -1063,6 +1064,160 @@ def test_a_fence_prefixed_line_carrying_content_is_not_silently_dropped(
     """
     with pytest.raises(clients.ExtractionFormatError):
         clients.extracted_claims(line)
+
+
+# --------------------------------------------------------------------------- #
+# PR #27's ticketed P3 strictness nits                                          #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("whitespace", [" ", "\t", "\n", "\r", " \t\r\n "])
+def test_json_whitespace_between_objects_is_skipped(whitespace: str) -> None:
+    """The four characters the JSON grammar calls whitespace, and they work."""
+    record = json.dumps({"text": "t", "subject": "s", "value": "v"})
+    claims = clients.extracted_claims(f"{record}{whitespace}{record}")
+    assert len(claims) == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "separator",
+    [
+        " ",  # no-break space
+        "\x0b",  # vertical tab
+        "\x0c",  # form feed
+        " ",  # line separator
+        "　",  # ideographic space
+    ],
+)
+def test_whitespace_json_does_not_recognise_is_refused(separator: str) -> None:
+    """``str.isspace`` is wider than JSON, and the difference is not tolerance.
+
+    Every character here answers ``True`` to ``str.isspace`` and is rejected by
+    the JSON grammar. Skipping them would let this reader accept, between two
+    claim objects, bytes it would refuse inside one — a strictness hole whose
+    only effect is to make malformed extractor output look well formed.
+    """
+    record = json.dumps({"text": "t", "subject": "s", "value": "v"})
+    assert separator.isspace(), "the fixture must be isspace-but-not-JSON"
+    with pytest.raises(clients.ExtractionFormatError):
+        clients.extracted_claims(f"{record}{separator}{record}")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "padding",
+    [
+        " ",  # no-break space
+        "\x0b",  # vertical tab
+        "\x0c",  # form feed
+        " ",  # line separator
+        "　",  # ideographic space
+    ],
+)
+@pytest.mark.parametrize("fence", ["```", "```json"])
+@pytest.mark.parametrize("where", ["before", "after", "both"])
+def test_a_fence_padded_with_whitespace_json_does_not_recognise_is_refused(
+    padding: str, fence: str, where: str
+) -> None:
+    """The fence heal may not be a way back in for the bytes JSON refuses.
+
+    Deciding what is *only* a delimiter with ``str.strip()`` would read this line
+    on the wider Unicode definition and blank it to spaces — and spaces are
+    skipped between objects, so a separator the parser one step later refuses
+    would arrive already laundered. The two decisions have to be made on the same
+    definition of whitespace, or the stricter one is decorative.
+    """
+    assert padding.isspace(), "the fixture must be isspace-but-not-JSON"
+    record = json.dumps({"text": "t", "subject": "s", "value": "v"})
+    before = padding if where in ("before", "both") else ""
+    after = padding if where in ("after", "both") else ""
+
+    with pytest.raises(clients.ExtractionFormatError):
+        clients.extracted_claims(f"{record}\n{before}{fence}{after}\n{record}")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("padding", [" ", "\t", " \t ", ""])
+def test_a_fence_padded_with_json_whitespace_is_still_only_a_delimiter(
+    padding: str,
+) -> None:
+    """The tolerance that was intended: JSON's own whitespace around a fence."""
+    record = json.dumps({"text": "t", "subject": "s", "value": "v"})
+    claims = clients.extracted_claims(f"{record}\n{padding}```{padding}\n{record}")
+    assert len(claims) == 2
+
+
+@pytest.mark.unit
+def test_a_parse_error_reports_the_object_start_in_the_original_completion() -> None:
+    """The offset must index what the model sent, fences and all.
+
+    The fence handling blanks delimiter lines instead of deleting them precisely
+    so this holds: a deleted line would shift every offset after it, and the
+    operator would be told to look at a byte that is not the one that failed.
+    """
+    good = json.dumps({"text": "a", "subject": "s", "value": "v"})
+    bad = '{"text": "b", "subject": "s" "value": "v"}'
+    completion = f"```json\n{good}\n{bad}\n```"
+    start = completion.index(bad)
+
+    with pytest.raises(clients.ExtractionFormatError) as caught:
+        clients.extracted_claims(completion)
+
+    message = str(caught.value)
+    assert f"beginning at offset {start}" in message
+    # The excerpt is taken from the completion at that offset, so the two agree.
+    assert completion[start : start + len(bad)] == bad
+    assert bad in message
+    # The fence sits before the failure, so a delete-based heal would have
+    # reported an offset eight characters short of the real one.
+    assert start != completion.replace("```json\n", "", 1).index(bad)
+
+
+@pytest.mark.unit
+def test_a_fence_between_an_objects_members_does_not_take_them_with_it() -> None:
+    """The ticketed fence-heal edge, on a concrete malformed object.
+
+    A delimiter line sitting between two members of a BROKEN object must not be
+    dropped: dropping it would splice the halves together and could turn a
+    malformed object into a plausible one, or make the error point past the
+    members that are still sitting there. Blanked to whitespace, the object is
+    refused with both of its halves intact and visible in the message.
+    """
+    broken = '{\n  "text": "a",\n  "subject": "s"\n```\n  "value": "v"\n}'
+
+    with pytest.raises(clients.ExtractionFormatError) as caught:
+        clients.extracted_claims(broken)
+
+    message = str(caught.value)
+    assert "beginning at offset 0" in message
+    # Neither half vanished: both are still in the excerpt the operator is shown.
+    assert '\\n  "subject": "s"' in message
+    assert '\\n  "value": "v"' in message
+
+
+@pytest.mark.unit
+def test_a_fence_between_an_objects_members_parses_when_the_object_is_whole() -> None:
+    """Same shape, comma restored: the members survive the delimiter line.
+
+    This is the other half of the required outcome — a delimiter between members
+    either leaves a parseable object with every member intact, or fails at the
+    original offset. Here it parses, and nothing is lost.
+    """
+    whole = '{\n  "text": "a",\n  "subject": "s",\n```\n  "value": "v"\n}'
+    claims = clients.extracted_claims(whole)
+    assert claims == [clients.StructuredClaim(text="a", subject="s", value="v")]
+
+
+@pytest.mark.unit
+def test_blanking_a_fence_keeps_the_completions_length() -> None:
+    """The offset-preserving property, stated directly."""
+    completion = '```json\n{"text": "a", "subject": "s", "value": "v"}\n```'
+    blanked = clients._blank_fence_delimiters(completion)
+    assert len(blanked) == len(completion)
+    assert blanked.splitlines()[0].strip() == ""
+    assert blanked.splitlines()[1] == completion.splitlines()[1]
 
 
 _REAL_COMPLETION_SAMPLE = Path(
@@ -3721,3 +3876,964 @@ def test_preflight_reports_failures_instead_of_raising() -> None:
 
     assert report["ready"] is False
     assert len(report["errors"]) == 3
+
+
+# --------------------------------------------------------------------------- #
+# --extract-only: the shared extraction stage, on its own                      #
+# --------------------------------------------------------------------------- #
+
+
+# The graded run's durable artefacts. An extraction pass writes none of them.
+_GRADED_ARTEFACTS = (
+    real_run.MANIFEST_NAME,
+    real_run.CLAIMS_NAME,
+    real_run.ANSWERS_NAME,
+    real_run.VERDICTS_NAME,
+    real_run.METRICS_NAME,
+)
+
+
+def _without_instrumentation(row: Mapping[str, Any]) -> dict:
+    """A cache row stripped of what the call cost, leaving what it *is*."""
+    return {
+        key: value
+        for key, value in row.items()
+        if key != "wall_ms" and not key.startswith("usage_")
+    }
+
+
+class MeteredChat(FakeChat):
+    """A FakeChat that also reports token counts, as a served endpoint does."""
+
+    USAGE = {"prompt_tokens": 40, "completion_tokens": 7, "total_tokens": 47}
+
+    def chat_detailed(self, messages: Sequence[dict]) -> clients.ChatResult:
+        return clients.ChatResult(text=self.chat(messages), usage=dict(self.USAGE))
+
+
+class RecordingChat(FakeChat):
+    """A FakeChat that keeps every extraction prompt it was sent, in order."""
+
+    def __init__(self, pin) -> None:
+        super().__init__(pin)
+        self.extract_prompts: list[list[dict]] = []
+
+    def chat(self, messages: Sequence[dict]) -> str:
+        if messages[0]["content"].startswith(clients.EXTRACT_STRUCTURED_SYSTEM_PROMPT):
+            self.extract_prompts.append([dict(message) for message in messages])
+        return super().chat(messages)
+
+
+def _recording_factory(created: list[RecordingChat]):
+    def factory(chat_pin) -> RecordingChat:
+        client = RecordingChat(chat_pin)
+        created.append(client)
+        return client
+
+    return factory
+
+
+@pytest.mark.integration
+def test_extract_only_writes_the_cache_rows_the_graded_run_writes(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The whole point: the pass produces the cache, not a lookalike of it.
+
+    Compared on every field except the instrumentation this mode adds, because a
+    row that differed anywhere else would mean a ``--real`` run resuming from
+    this cache replayed claims its own extractor would not have produced.
+    """
+    graded = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "graded")
+    real_run.execute(graded, client_factory=_factory([]), judge_client=FakeJudge())
+
+    extraction = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    summary = real_run.extract_only(extraction, client_factory=_factory([]))
+
+    graded_rows = real_run.read_jsonl(graded.out_dir / real_run.EXTRACTIONS_NAME)
+    extract_rows = real_run.read_jsonl(extraction.out_dir / real_run.EXTRACTIONS_NAME)
+
+    assert graded_rows, "the graded run extracted nothing to compare against"
+    # Same rows, same order — the order is the pinned occurrence order both
+    # passes walk, and a reordering would mean different priming.
+    assert [_without_instrumentation(row) for row in extract_rows] == graded_rows
+    assert summary["extraction_calls"] == len(extract_rows)
+    assert summary["questions"] == len(_QUESTIONS)
+    assert summary["questions_skipped"] == 0
+    # Nothing was cached, so every session replayed was also a session extracted.
+    assert summary["sessions_extracted"] == len(extract_rows)
+    assert summary["sessions_processed"] == len(extract_rows)
+
+
+@pytest.mark.integration
+def test_extract_only_sends_the_prompts_the_graded_run_sends(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Identical prompts, in identical order — so the priming is identical.
+
+    Equal cache rows would still be equal if this mode primed differently and the
+    stub happened not to care. The prompts are where priming is visible, so they
+    are what is compared: the same sessions, strictly serial within a question,
+    each carrying the vocabulary its predecessors minted.
+    """
+    graded_clients: list[RecordingChat] = []
+    graded = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "graded")
+    real_run.execute(
+        graded,
+        client_factory=_recording_factory(graded_clients),
+        judge_client=FakeJudge(),
+    )
+
+    extract_clients: list[RecordingChat] = []
+    extraction = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(
+        extraction, client_factory=_recording_factory(extract_clients)
+    )
+
+    graded_prompts = [p for c in graded_clients for p in c.extract_prompts]
+    extract_prompts = [p for c in extract_clients for p in c.extract_prompts]
+
+    assert graded_prompts, "the graded run sent no extraction prompt"
+    assert extract_prompts == graded_prompts
+
+
+@pytest.mark.integration
+def test_extract_only_resume_skips_questions_already_cached(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A second pass over a full cache calls no model and appends no row."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    before = path.read_bytes()
+
+    resumed: list[FakeChat] = []
+    summary = real_run.extract_only(cfg, client_factory=_factory(resumed))
+
+    assert summary["extraction_calls"] == 0
+    assert summary["questions_skipped"] == summary["questions"] == len(_QUESTIONS)
+    assert summary["sessions_extracted"] == 0
+    # Every question was skipped whole, so no session was even replayed.
+    assert summary["sessions_processed"] == 0
+    assert sum(client.extract_calls for client in resumed) == 0
+    # Byte-unchanged, not merely equivalent: the resume appended nothing at all.
+    assert path.read_bytes() == before
+
+
+@pytest.mark.integration
+def test_extract_only_replays_a_partly_cached_question_from_its_first_session(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A half-done question is re-walked, because priming is positional.
+
+    Resuming into the middle of a question would prime the pending session from
+    an empty vocabulary and send a prompt the interrupted run never sent. The
+    earlier sessions are therefore replayed — from the memo, costing no call —
+    and only the genuinely missing one reaches the model.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    rows = real_run.read_jsonl(path)
+    # Drop the LAST row of one question, leaving its earlier session cached.
+    dropped = rows[-1]
+    _rewrite(path, rows[:-1])
+
+    resumed: list[RecordingChat] = []
+    summary = real_run.extract_only(cfg, client_factory=_recording_factory(resumed))
+
+    assert summary["extraction_calls"] == 1
+    assert summary["questions_skipped"] == len(_QUESTIONS) - 1
+    prompts = [p for client in resumed for p in client.extract_prompts]
+    assert len(prompts) == 1, "only the missing session may reach the model"
+
+    # What the pass EXTRACTED is what it paid for: the one missing session. The
+    # other session of that question was replayed from the memo, and counting it
+    # as extracted would report a cost of two calls for a run that made one —
+    # exactly the reading an operator uses to decide whether extraction is done.
+    assert summary["sessions_extracted"] == 1
+    assert summary["sessions_processed"] == 2
+
+    # And what it re-extracted is what was there before.
+    replayed = real_run.read_jsonl(path)[-1]
+    assert _without_instrumentation(replayed) == _without_instrumentation(dropped)
+
+
+@pytest.mark.integration
+def test_extract_only_records_what_every_call_cost(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Wall time always, token counts whenever the endpoint reports them."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+
+    def factory(chat_pin) -> MeteredChat:
+        return MeteredChat(chat_pin)
+
+    real_run.extract_only(cfg, client_factory=factory)
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+
+    assert rows
+    for row in rows:
+        assert isinstance(row["wall_ms"], float)
+        assert row["wall_ms"] >= 0.0
+        assert row["usage_prompt_tokens"] == MeteredChat.USAGE["prompt_tokens"]
+        assert row["usage_completion_tokens"] == MeteredChat.USAGE["completion_tokens"]
+        assert row["usage_total_tokens"] == MeteredChat.USAGE["total_tokens"]
+        # The instrumentation never displaces what a replay reads.
+        assert row["format"] == real_run.EXTRACTION_CACHE_FORMAT
+        assert row["claims"]
+
+
+@pytest.mark.integration
+def test_a_silent_endpoint_records_timing_and_no_invented_token_counts(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A server that reports no usage leaves the fields absent, never zero."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+
+    assert rows
+    for row in rows:
+        assert "wall_ms" in row
+        assert not [key for key in row if key.startswith("usage_")]
+
+
+@pytest.mark.integration
+def test_extract_only_creates_no_graded_artefact(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Nothing is answered or judged, so no answer or verdict file appears."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).is_file()
+    assert (cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME).is_file()
+    for name in _GRADED_ARTEFACTS:
+        assert not (cfg.out_dir / name).exists(), f"{name} must not be created"
+
+
+@pytest.mark.integration
+def test_extract_only_leaves_existing_graded_artefacts_byte_unchanged(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Run beside a graded run's output, it touches none of that output."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    before = {}
+    for name in _GRADED_ARTEFACTS:
+        path = cfg.out_dir / name
+        path.write_bytes(f"sentinel bytes for {name}\n".encode("utf-8"))
+        before[name] = path.read_bytes()
+
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    for name in _GRADED_ARTEFACTS:
+        assert (cfg.out_dir / name).read_bytes() == before[name], name
+
+
+@pytest.mark.integration
+def test_a_graded_run_resumes_the_cache_an_extract_only_pass_primed(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The two modes share one output directory, which is the reason for both.
+
+    The extraction pass pays for the extractor up front; the graded run that
+    follows must then spend zero extraction calls and find the cache exactly as
+    it was left. This is also what forces the two provenance records into
+    separate files: a shared manifest.json would fail its own identity check
+    here, because an extraction pass names no judge.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    primed = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+    assert primed
+
+    graded: list[FakeChat] = []
+    real_run.execute(cfg, client_factory=_factory(graded), judge_client=FakeJudge())
+
+    assert sum(client.extract_calls for client in graded) == 0, (
+        "the graded run re-extracted sessions the extraction pass had memoised"
+    )
+    assert real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME) == primed
+    assert (cfg.out_dir / real_run.MANIFEST_NAME).is_file()
+
+    extract_manifest = json.loads(
+        (cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    graded_manifest = json.loads(
+        (cfg.out_dir / real_run.MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert extract_manifest["mode"] == real_run.MODE_EXTRACT_ONLY
+    assert graded_manifest["mode"] == real_run.MODE_REAL
+
+
+@pytest.mark.integration
+def test_the_extract_manifest_records_the_mode_and_refuses_a_reshaped_resume(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """It is a real provenance record, with the same resume guard as the run's."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    manifest = json.loads(
+        (cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert manifest["mode"] == real_run.MODE_EXTRACT_ONLY
+    assert manifest["haystack"] == cfg.haystack
+    assert manifest["split"] == cfg.split
+    assert set(manifest["pins"]) == {"extractor"}
+    assert manifest["question_count"] == len(_QUESTIONS)
+    assert manifest["completed_at"]
+
+    # A pass that would extract different bytes is a different pass. The guard is
+    # the extraction projection, not the graded run's identity: what must agree
+    # is what decides a row, and the haystack decides which sessions exist at all.
+    reshaped = _config(
+        tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, haystack=real_run.HAYSTACK_S
+    )
+    with pytest.raises(real_run.RunManifestMismatchError, match="haystack"):
+        real_run.extract_only(reshaped, client_factory=_factory([]))
+
+
+@pytest.mark.integration
+def test_the_extract_manifest_records_every_pass_that_resumed_it(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A resumed pass appends to a ledger instead of only re-stamping the header.
+
+    Reconciling on the extraction projection is what lets a wider ``--limit``
+    resume a narrow pilot — the rows a pilot wrote are a strict subset, produced
+    exactly as the wider pass would produce them. The cost is that the record
+    still describes the pass that FIRST wrote it, so an operator reading
+    ``extract-manifest.json`` to learn what the directory holds is told about a
+    slice that is no longer the whole story. The ledger is what closes that gap.
+    """
+    cfg = _config(
+        tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract", limit=1
+    )
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    manifest_path = cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME
+    first = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert first["limit"] == 1
+    assert first["question_count"] == 1
+    assert [entry["limit"] for entry in first["resumes"]] == [1]
+    assert first["resumes"][0]["question_count"] == 1
+    assert first["resumes"][0]["finished_at"] == first["completed_at"]
+
+    widened = _config(tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, limit=None)
+    real_run.extract_only(widened, client_factory=_factory([]))
+
+    second = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # The header still describes the pass that minted it — rewriting it would be
+    # claiming the first pass had done work it never did.
+    assert second["limit"] == 1
+    assert second["question_count"] == 1
+    # The ledger is what says what the directory actually holds now.
+    assert [entry["limit"] for entry in second["resumes"]] == [1, None]
+    assert second["resumes"][-1]["question_count"] == len(_QUESTIONS)
+    assert second["resumes"][-1]["finished_at"] == second["completed_at"]
+    assert second["resumes"][0] == first["resumes"][0]
+
+
+# --------------------------------------------------------------------------- #
+# The extraction cache's own identity                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _with_another_extractor(record: dict) -> None:
+    """Point the extractor at another served model, leaving everything else."""
+    record["extractor_model"]["model"] = "qwen3.9-not-the-pinned-one"
+
+
+def _retext_one_session(corpus_dir: Path) -> None:
+    """Change what a session SAYS while keeping every id it is keyed by.
+
+    A cache row is keyed on ``(question_id, session_id)`` and a session id is
+    ``f"{question_id}::{corpus session id}"`` — derived from ids alone, never
+    from the text. Rewritten session bytes therefore land on exactly the rows an
+    earlier pass wrote: with nothing to compare, the new corpus is reported as
+    already cached and every arm answers from claims about the old text.
+    """
+    path = corpus_dir / corpus.ORACLE_FILENAME
+    records = json.loads(path.read_text(encoding="utf-8"))
+    records[0]["haystack_sessions"][0][0]["content"] = "my 5k personal best is 19:59"
+    path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+
+
+@pytest.mark.integration
+def test_the_extraction_identity_names_what_decides_a_row_and_nothing_else(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The projection is the extraction's own identity, not the run's.
+
+    Everything in it changes what a cache row would contain; everything left out
+    cannot. The graded run's identity is a superset — it covers scoring — and
+    keying the cache on that would refuse resumes that are perfectly safe.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    identity = json.loads(
+        (cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME).read_text(encoding="utf-8")
+    )
+    assert identity["extraction_cache_format"] == real_run.EXTRACTION_CACHE_FORMAT
+    assert identity["haystack"] == cfg.haystack
+    assert identity["split"] == cfg.split
+    assert identity["extraction_harness_sha256"] == real_run.harness_digest(
+        real_run._EXTRACTION_HARNESS_ROOTS
+    )
+    assert (
+        identity["extractor_pin"]
+        == clients.extractor_pin(cfg.preregister_path).pin.as_record()
+    )
+    assert (
+        identity["extractor_model_config"]
+        == clients.extractor_pin(cfg.preregister_path).as_record()
+    )
+    assert identity["corpus_loaded_sha256"] == real_run.corpus_digests(cfg)
+    # Nothing an extraction row is independent of — the run-wide harness digest
+    # included, because it spans the shipped package and the M5 reader.
+    assert not set(identity) & {
+        "arms",
+        "limit",
+        "question_count",
+        "questions_sha256",
+        "samples_sha256",
+        "top_k",
+        "judge_model",
+        "m3_labels_sha256",
+        "harness_sha256",
+    }
+
+    # The same record rides in the manifest, so one file explains the other.
+    manifest = json.loads(
+        (cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert manifest["extraction_identity"] == identity
+
+
+@pytest.mark.unit
+def test_an_edit_to_the_shipped_package_cannot_invalidate_an_extraction_cache() -> None:
+    """The cache is keyed on the harness's own digest, not the run-wide one.
+
+    ``harness_sha256`` spans ``benchmarks/longmemeval/``, ``src/aphelion/`` and
+    ``scripts/external_reader.py``, because all three decide what a *run*
+    reports. Neither of the last two can move an extraction row: Arm C's store
+    and M5's independent reader consume the cache's OUTPUT. Keying the cache on
+    the wide digest threw away paid extraction work on every edit to the shipped
+    package — exactly the class of false refusal the projection drops ``top_k``
+    and ``arms`` to avoid.
+    """
+    record = {
+        "pins": {"extractor": {"model": "pinned-extractor"}},
+        "model_config": {"extractor": {"chat_dialect": "openai"}},
+        "haystack": real_run.HAYSTACK_ORACLE,
+        "split": real_run.SPLIT_ALL,
+        "corpus_data_dir": "/corpus",
+        "corpus_loaded_sha256": {corpus.ORACLE_FILENAME: "c0"},
+        "split_manifest_sha256": "s0",
+        "harness_sha256": "run-wide-0",
+        "extraction_harness_sha256": "harness-0",
+    }
+
+    repackaged = {**record, "harness_sha256": "run-wide-1"}
+    assert real_run.extraction_identity(record) == real_run.extraction_identity(
+        repackaged
+    )
+    # The run's own identity still moves with it: a graded resume is a different
+    # claim, and src/aphelion is code its results depend on.
+    assert real_run.manifest_identity(record) != real_run.manifest_identity(repackaged)
+
+    retooled = {**record, "extraction_harness_sha256": "harness-1"}
+    assert real_run.extraction_identity(record) != real_run.extraction_identity(retooled)
+
+
+@pytest.mark.unit
+def test_the_extraction_harness_digest_covers_exactly_the_harness_package() -> None:
+    """What the projection's docstring claims, asserted rather than described."""
+    harness = Path(real_run.__file__).resolve().parent
+
+    assert real_run._EXTRACTION_HARNESS_ROOTS == (harness,)
+    assert real_run.REPO_ROOT / "src" / "aphelion" in real_run._HARNESS_ROOTS
+    assert (
+        real_run.REPO_ROOT / "scripts" / "external_reader.py" in real_run._HARNESS_ROOTS
+    )
+    # Two digests over two different trees: the narrow one cannot be the wide one.
+    assert real_run.harness_digest() != real_run.harness_digest(
+        real_run._EXTRACTION_HARNESS_ROOTS
+    )
+
+
+@pytest.mark.integration
+def test_a_graded_run_refuses_a_cache_extracted_under_another_extractor(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """extract-only, then ``--real`` under a different pin, in one directory.
+
+    The two modes keep their provenance in separate files, so neither manifest
+    can see the other's; what they share is ``extractions.jsonl``. The cache's
+    own identity record is what makes the graded run refuse rows the pinned
+    extractor would not have produced, rather than replay them as its own.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    forged = _preregister_with(tmp_path, _with_another_extractor)
+    graded = _config(
+        tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, preregister_path=forged
+    )
+    chats: list[FakeChat] = []
+    with pytest.raises(real_run.ExtractionIdentityMismatchError, match="extractor_pin"):
+        real_run.execute(
+            graded, client_factory=_factory(chats), judge_client=FakeJudge()
+        )
+
+    # Refused before the run spent a call or wrote a record of its own.
+    assert sum(client.extract_calls for client in chats) == 0
+    assert not (cfg.out_dir / real_run.MANIFEST_NAME).exists()
+
+
+@pytest.mark.integration
+def test_an_extraction_pass_refuses_a_cache_extracted_from_another_corpus(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """``--real`` first, then extract-only over rewritten corpus bytes.
+
+    The direction the graded manifest cannot catch: an extraction pass writes
+    only its own manifest, so without the cache's identity record it would find
+    every row already present and report the new corpus as fully extracted.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+    before = (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    _retext_one_session(corpus_dir)
+
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError, match="corpus_loaded_sha256"
+    ):
+        real_run.extract_only(cfg, client_factory=_factory([]))
+
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
+
+
+def _tear_last_row(cache_path: Path) -> bytes:
+    """Append an unterminated row, as an interrupted write would leave behind.
+
+    Returned bytes are what the file must still hold after a refusal: a pass that
+    may not touch these rows may not tidy them either. Truncating first and
+    refusing afterwards would hand back a file the operator never asked anyone to
+    edit — and, when the torn row is the only one, an *empty* file, which then
+    looks like a cache no identity record has to vouch for.
+    """
+    with cache_path.open("ab") as handle:
+        handle.write(b'{"question_id": "torn", "session_id": "s9", "claims": [')
+    return cache_path.read_bytes()
+
+
+@pytest.mark.integration
+def test_an_extraction_pass_leaves_a_torn_row_alone_when_it_refuses_the_cache(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The identity gate runs before the repair, not after it.
+
+    Repairing first truncates and fsyncs a file belonging to another identity —
+    a write into an output directory this pass has just been told it may not
+    touch. The byte-for-byte guarantee the refusal is supposed to give is only
+    real if it holds for a cache that needs repairing.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+    cache_path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    before = _tear_last_row(cache_path)
+
+    _retext_one_session(corpus_dir)
+
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError, match="corpus_loaded_sha256"
+    ):
+        real_run.extract_only(cfg, client_factory=_factory([]))
+
+    assert cache_path.read_bytes() == before
+
+
+@pytest.mark.integration
+def test_a_graded_run_leaves_a_torn_row_alone_when_it_refuses_the_cache(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The same guarantee on the ``--real`` side, whose repair covers four files.
+
+    ``extractions.jsonl`` is the one file in that list a graded run may be
+    refused over, so it is the one that has to wait for the gate; the run's own
+    answers, claims and verdicts are still repaired up front.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    cache_path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    before = _tear_last_row(cache_path)
+
+    forged = _preregister_with(tmp_path, _with_another_extractor)
+    graded = _config(
+        tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, preregister_path=forged
+    )
+    with pytest.raises(real_run.ExtractionIdentityMismatchError, match="extractor_pin"):
+        real_run.execute(graded, client_factory=_factory([]), judge_client=FakeJudge())
+
+    assert cache_path.read_bytes() == before
+
+
+@pytest.mark.integration
+def test_a_cache_torn_down_to_nothing_is_still_refused_without_a_record(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A cache that is *only* a torn row must not be adopted by emptying it.
+
+    Repairing before the gate truncates such a file to zero bytes, and the
+    "rows but no identity record" refusal keys on size — so the pass would write
+    its own identity beside a file it had just erased, and call that attributable.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "orphan")
+    cfg.out_dir.mkdir(parents=True)
+    cache_path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    cache_path.write_bytes(b'{"question_id": "ku-one", "session_id": "ku-one::s1"')
+    before = cache_path.read_bytes()
+
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError,
+        match=real_run.EXTRACTION_IDENTITY_NAME,
+    ):
+        real_run.extract_only(cfg, client_factory=_factory([]))
+
+    assert cache_path.read_bytes() == before
+    assert not (cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME).exists()
+
+
+@pytest.mark.integration
+def test_an_extraction_pass_resumes_the_cache_a_graded_run_left(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Matching identity resumes: the guard refuses mismatches, not resumes."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared")
+    real_run.execute(cfg, client_factory=_factory([]), judge_client=FakeJudge())
+    before = (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    resumed: list[FakeChat] = []
+    summary = real_run.extract_only(cfg, client_factory=_factory(resumed))
+
+    assert summary["extraction_calls"] == 0
+    assert summary["questions_skipped"] == summary["questions"] == len(_QUESTIONS)
+    assert sum(client.extract_calls for client in resumed) == 0
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
+
+
+@pytest.mark.integration
+def test_an_extraction_resume_is_not_blocked_by_state_it_cannot_depend_on(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Retrieval depth, the M5 sample corpus and a narrower slice are irrelevant.
+
+    An extraction row is what the pinned extractor said about one session's
+    bytes. ``top_k`` re-ranks retrieval *of* those claims and cannot move one;
+    the M5 sample corpus is read by a metric that scores the run's output; a
+    narrower ``--limit`` asks for a strict subset of the rows already on disk,
+    each produced exactly as this pass would produce it. Gating the extraction
+    manifest on the whole run's identity made every one of them refuse an
+    otherwise-safe resume — and an extraction pass exists precisely so its cost
+    is paid once.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    before = (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    samples = tmp_path / "other-samples"
+    (samples / "pkg").mkdir(parents=True)
+    (samples / "pkg" / "manifest.json").write_text("{}", encoding="utf-8")
+
+    retuned = _config(
+        tmp_path,
+        corpus_dir,
+        split_path,
+        out_dir=cfg.out_dir,
+        top_k=cfg.top_k + 3,
+        limit=1,
+        samples_root=samples,
+    )
+    resumed: list[FakeChat] = []
+    summary = real_run.extract_only(retuned, client_factory=_factory(resumed))
+
+    assert summary["extraction_calls"] == 0
+    assert sum(client.extract_calls for client in resumed) == 0
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
+
+
+@pytest.mark.integration
+def test_a_cache_with_no_identity_record_is_refused_rather_than_adopted(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Rows nobody can attribute are not adopted on the strength of their keys.
+
+    A cache whose identity record is missing was written by something this
+    harness cannot question — an older revision, a hand-assembled file, another
+    directory's rows copied in. Adopting it would mint provenance for bytes
+    whose provenance is exactly what is unknown.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    (cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME).unlink()
+
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError,
+        match=real_run.EXTRACTION_IDENTITY_NAME,
+    ):
+        real_run.extract_only(cfg, client_factory=_factory([]))
+
+
+@pytest.mark.integration
+def test_a_graded_run_refuses_a_cache_with_no_identity_record(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The ``--real`` direction of the same refusal, and the one that will happen.
+
+    Every output directory created before the identity record existed holds
+    ``extractions.jsonl`` and no sidecar, so its next graded resume takes exactly
+    this path. The mismatching-sidecar case was covered for ``execute``; a
+    *missing* one was asserted only for the extraction pass, which is the mode
+    those directories will not be run in.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "legacy")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    (cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME).unlink()
+    before = (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    chats: list[FakeChat] = []
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError,
+        match=real_run.EXTRACTION_IDENTITY_NAME,
+    ):
+        real_run.execute(cfg, client_factory=_factory(chats), judge_client=FakeJudge())
+
+    # Refused before it spent a call, minted a manifest, or touched the rows.
+    assert not (cfg.out_dir / real_run.MANIFEST_NAME).exists()
+    assert sum(client.extract_calls for client in chats) == 0
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
+
+
+@pytest.mark.unit
+def test_an_identity_record_over_an_empty_cache_is_replaced_not_enforced(
+    tmp_path: Path,
+) -> None:
+    """A record with no rows beneath it attests to nothing, so it cannot refuse.
+
+    Both modes write the sidecar before extracting, so a pass that dies at its
+    first model call leaves one behind over an absent or empty cache. Enforcing
+    it would pin the output directory to an identity that never produced a byte,
+    and the only remedy the message offers is a fresh ``--out-dir``.
+    """
+    sidecar = tmp_path / real_run.EXTRACTION_IDENTITY_NAME
+    cache_path = tmp_path / real_run.EXTRACTIONS_NAME
+    stale = {
+        "extraction_cache_format": real_run.EXTRACTION_CACHE_FORMAT,
+        "extractor_pin": {"model": "the-one-that-never-ran"},
+    }
+    sidecar.write_text(json.dumps(stale), encoding="utf-8")
+    fresh = {
+        "extraction_cache_format": real_run.EXTRACTION_CACHE_FORMAT,
+        "extractor_pin": {"model": "the-one-running-now"},
+    }
+
+    # No cache file at all.
+    assert (
+        real_run.reconcile_extraction_identity(sidecar, fresh, cache_path=cache_path)
+        == fresh
+    )
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == fresh
+
+    # A cache file that exists and is empty is the same claim.
+    sidecar.write_text(json.dumps(stale), encoding="utf-8")
+    cache_path.write_bytes(b"")
+    assert (
+        real_run.reconcile_extraction_identity(sidecar, fresh, cache_path=cache_path)
+        == fresh
+    )
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == fresh
+
+    # One row is enough for the refusal to stand: now there is something to
+    # misattribute, which is the whole point of the record.
+    cache_path.write_bytes(b'{"question_id": "ku-one", "session_id": "ku-one::s1"}\n')
+    with pytest.raises(real_run.ExtractionIdentityMismatchError, match="extractor_pin"):
+        real_run.reconcile_extraction_identity(sidecar, stale, cache_path=cache_path)
+
+
+@pytest.mark.integration
+def test_a_pass_that_died_before_its_first_row_does_not_pin_the_directory(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The end-to-end shape of the same thing: a stillborn extraction pass."""
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "stillborn")
+
+    def dead_factory(pin: Any) -> FakeChat:
+        client = FakeChat(pin)
+        client.fail_after = 0
+        return client
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        real_run.extract_only(cfg, client_factory=dead_factory)
+
+    sidecar = cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME
+    cache_path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    assert sidecar.is_file(), "the pass never got as far as writing its identity"
+    assert not (cache_path.is_file() and cache_path.stat().st_size)
+
+    # The graded run's manifest was never written by that pass, so the only thing
+    # standing between this directory and a different extractor is the sidecar.
+    forged = _preregister_with(tmp_path, _with_another_extractor)
+    retooled = _config(
+        tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, preregister_path=forged
+    )
+    real_run.execute(retooled, client_factory=_factory([]), judge_client=FakeJudge())
+
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == real_run.extraction_identity(
+        json.loads((cfg.out_dir / real_run.MANIFEST_NAME).read_text(encoding="utf-8"))
+    )
+
+
+@pytest.mark.unit
+def test_extract_only_is_mutually_exclusive_with_the_other_modes() -> None:
+    """One mode per invocation, or an output directory holds two experiments."""
+    with pytest.raises(SystemExit):
+        run_mod.main(["--extract-only", "--real", "--haystack", "oracle"])
+    with pytest.raises(SystemExit):
+        run_mod.main(["--extract-only", "--smoke"])
+
+
+@pytest.mark.unit
+def test_extract_only_requires_a_haystack() -> None:
+    """Same reason ``--real`` does: the corpus decides what is extracted."""
+    with pytest.raises(SystemExit):
+        run_mod.main(["--extract-only"])
+
+
+# --------------------------------------------------------------------------- #
+# Reported usage                                                               #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        (
+            {"prompt_eval_count": 12, "eval_count": 5},
+            {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17},
+        ),
+        (
+            {"usage": {"prompt_tokens": 30, "completion_tokens": 8, "total_tokens": 38}},
+            {"prompt_tokens": 30, "completion_tokens": 8, "total_tokens": 38},
+        ),
+        # A server's own total is kept rather than recomputed.
+        (
+            {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 99}},
+            {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 99},
+        ),
+        ({"message": {"content": "hi"}}, None),
+        # Counts this harness cannot add up are absent, not coerced.
+        ({"prompt_eval_count": "12", "eval_count": 1.5}, None),
+        ({"prompt_eval_count": True, "eval_count": 3}, {"completion_tokens": 3}),
+        ({"usage": None}, None),
+        ("not a body", None),
+    ],
+)
+def test_usage_is_read_from_either_dialect(body: Any, expected: Any) -> None:
+    assert clients.usage_record(body) == expected
+
+
+@pytest.mark.unit
+def test_the_lan_client_reports_usage_beside_its_completion() -> None:
+    """``chat`` and ``chat_detailed`` are one request path, not two."""
+    seen: list[tuple[str, dict]] = []
+    client = clients.LocalChatClient(
+        pin=_PIN,
+        transport=_transport(
+            [{"message": {"content": "hello"}, "prompt_eval_count": 9, "eval_count": 4}],
+            seen,
+        ),
+    )
+
+    result = client.chat_detailed([{"role": "user", "content": "hi"}])
+    assert result.text == "hello"
+    assert result.usage == {
+        "prompt_tokens": 9,
+        "completion_tokens": 4,
+        "total_tokens": 13,
+    }
+    assert client.chat([{"role": "user", "content": "hi"}]) == "hello"
+    # Both calls sent the same request: the projection adds nothing of its own.
+    assert seen[0][1] == seen[1][1]
+
+
+@pytest.mark.unit
+def test_the_completions_client_reports_usage_beside_its_completion() -> None:
+    """The dialect the pinned extractor actually speaks, on the same contract."""
+    seen: list[tuple[str, dict]] = []
+    chat_pin = clients.ChatPin(pin=_PIN, api=clients.API_CHAT_COMPLETIONS)
+    client = clients.client_for(
+        chat_pin,
+        transport=_transport(
+            [
+                {
+                    "choices": [{"message": {"content": "hello"}}],
+                    "usage": {"prompt_tokens": 6, "completion_tokens": 2},
+                }
+            ],
+            seen,
+        ),
+    )
+
+    result = client.chat_detailed([{"role": "user", "content": "hi"}])
+    assert result.text == "hello"
+    # No total was reported, so one is derived from the two counts that were.
+    assert result.usage == {
+        "prompt_tokens": 6,
+        "completion_tokens": 2,
+        "total_tokens": 8,
+    }
+
+
+@pytest.mark.unit
+def test_a_client_without_usage_support_still_extracts() -> None:
+    """``chat_result`` degrades to ``chat``: a plain double is still a client."""
+
+    class PlainChat:
+        def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
+            return "plain"
+
+    result = clients.chat_result(PlainChat(), [{"role": "user", "content": "hi"}])
+    assert result.text == "plain"
+    assert result.usage is None
+
+
+@pytest.mark.unit
+def test_a_client_that_breaks_the_chat_detailed_contract_says_so() -> None:
+    """A wrong return type is a client bug, and must be reported as one.
+
+    Coercing it with ``str()`` turned a dict or a raw HTTP response into its own
+    repr, which then surfaced downstream as an ``ExtractionFormatError`` about
+    unparseable model output — sending whoever is bringing up a new client to
+    read prompts and completions for a fault in their own return statement. This
+    module's policy is to fail loud rather than salvage.
+    """
+
+    class DictChat:
+        def chat_detailed(self, messages: Sequence[Mapping[str, str]]) -> dict:
+            return {"text": "not a ChatResult"}
+
+    with pytest.raises(TypeError) as excinfo:
+        clients.chat_result(DictChat(), [{"role": "user", "content": "hi"}])
+
+    message = str(excinfo.value)
+    assert "DictChat" in message, "the failing client is not named"
+    assert "dict" in message, "the type it actually returned is not named"
+    assert "ChatResult" in message

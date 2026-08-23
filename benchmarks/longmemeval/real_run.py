@@ -145,6 +145,26 @@ ANSWERS_NAME = "answers.jsonl"
 VERDICTS_NAME = "verdicts.jsonl"
 METRICS_NAME = "metrics.json"
 
+# The extraction-only pass records its provenance under its OWN name rather than
+# sharing manifest.json. The graded run's manifest is keyed on things an
+# extraction pass has no opinion about — which judge ran, which M3 label set was
+# scored — so writing this pass's record into that file would make the very
+# ``--real`` resume the pass exists to prepare fail its identity check.
+EXTRACT_MANIFEST_NAME = "extract-manifest.json"
+
+# The extraction cache's own provenance, written beside the cache rather than
+# inside either manifest. The two modes validate different manifests — ``--real``
+# reads manifest.json, an extraction pass reads extract-manifest.json — but they
+# append to ONE extractions.jsonl, whose rows are keyed on nothing but
+# ``(question_id, session_id)``. A record only one mode consults cannot defend a
+# file both of them write, so the cache carries its identity itself and BOTH
+# modes check it before reading or appending a row (:func:`extraction_identity`).
+EXTRACTION_IDENTITY_NAME = "extractions-identity.json"
+
+# What a manifest's ``mode`` says produced it.
+MODE_REAL = "real"
+MODE_EXTRACT_ONLY = "extract-only"
+
 
 class RunManifestMismatchError(ValueError):
     """A resume was attempted against a run of a different shape.
@@ -153,6 +173,19 @@ class RunManifestMismatchError(ValueError):
     key is a function of the question set, so continuing a 78-question run inside
     a 220-question output directory would silently interleave two different
     experiments. Refused rather than merged.
+    """
+
+
+class ExtractionIdentityMismatchError(ValueError):
+    """The extraction cache on disk was produced under another identity.
+
+    A cache row records what the pinned extractor said about one session's bytes.
+    Its key names neither the extractor nor the bytes, so a row extracted under
+    one pin, corpus or harness revision is indistinguishable — by key — from the
+    row a different configuration would write, and replaying it would have a run
+    answer from claims its own extractor never produced. Refused rather than
+    merged, in both directions: the mode that would *read* such a row and the
+    mode that would *append* beside it are equally wrong.
     """
 
 
@@ -224,7 +257,7 @@ def _complete_rows(raw: bytes) -> tuple[list[dict], int]:
     offset = 0
     position = 0
     for chunk in raw.split(b"\n"):
-        start, position = position, position + len(chunk) + 1
+        position += len(chunk) + 1
         if not chunk.strip():
             # A blank line carries no row, but it is still complete input: an
             # append may resume after it.
@@ -518,17 +551,47 @@ class ExtractionCache:
         question_id: str,
         session_id: str,
         records: Sequence[Mapping[str, str]],
+        *,
+        instrumentation: Mapping[str, Any] | None = None,
     ) -> None:
+        """Memoise one session's claims, optionally annotated with call costs.
+
+        ``instrumentation`` rides *beside* the four fields that define the row,
+        never inside them: a reader replaying this cache takes ``claims`` and
+        ignores the rest, so an annotated row and a bare one are the same input
+        to every arm. The pinned ``--real`` path passes nothing, which keeps its
+        rows byte-identical to the ones it has always written.
+        """
         stored = [dict(record) for record in records]
         self._records[(question_id, session_id)] = stored
-        self._writer.append(
-            {
-                "format": EXTRACTION_CACHE_FORMAT,
-                "question_id": question_id,
-                "session_id": session_id,
-                "claims": stored,
-            }
-        )
+        row: dict[str, Any] = {
+            "format": EXTRACTION_CACHE_FORMAT,
+            "question_id": question_id,
+            "session_id": session_id,
+            "claims": stored,
+        }
+        for key, value in sorted(dict(instrumentation or {}).items()):
+            # Never allowed to shadow the fields the replay reads.
+            if key not in row:
+                row[key] = value
+        self._writer.append(row)
+
+
+def _call_instrumentation(
+    wall_ms: float, usage: Mapping[str, int] | None
+) -> dict[str, Any]:
+    """What one extraction call cost, in the fields a cache row carries.
+
+    ``wall_ms`` is always present — it is measured here, so it cannot be
+    missing. The token counts are prefixed ``usage_`` and appear only when the
+    endpoint reported them: a served model that says nothing about tokens must
+    leave the fields absent rather than record a zero that reads as a
+    measurement.
+    """
+    record: dict[str, Any] = {"wall_ms": wall_ms}
+    for name, value in sorted(dict(usage or {}).items()):
+        record[f"usage_{name}"] = value
+    return record
 
 
 @dataclass
@@ -548,6 +611,11 @@ class RealExtractor:
     cache: ExtractionCache
     question_id: str
     calls: int = 0
+    # When set, every FRESH extraction annotates its cache row with what the call
+    # cost — wall time here, tokens as the endpoint reported them. Off for the
+    # pinned run, whose cache rows are an input to three arms and are therefore
+    # kept to the fields a replay reads.
+    instrument: bool = False
     # Session ids in first-seen (pinned occurrence) order, and their claims. The
     # priming vocabulary for a session is derived from these rather than
     # accumulated as the run goes, so it is a pure function of the pinned order
@@ -579,16 +647,28 @@ class RealExtractor:
 
         records = self.cache.get(self.question_id, session.id)
         if records is None:
-            completion = self.client.chat(
+            started = time.perf_counter()
+            result = clients.chat_result(
+                self.client,
                 clients.extract_structured_messages(
                     session.text, self.vocabulary_before(session.id)
-                )
+                ),
             )
+            wall_ms = (time.perf_counter() - started) * 1000.0
             records = [
                 {"text": claim.text, "subject": claim.subject, "value": claim.value}
-                for claim in clients.extracted_claims(completion)
+                for claim in clients.extracted_claims(result.text)
             ]
-            self.cache.put(self.question_id, session.id, records)
+            self.cache.put(
+                self.question_id,
+                session.id,
+                records,
+                instrumentation=(
+                    _call_instrumentation(wall_ms, result.usage)
+                    if self.instrument
+                    else None
+                ),
+            )
             self.calls += 1
 
         # Recorded whether the claims came from the model or from the memo: the
@@ -791,14 +871,21 @@ def build_manifest(
     judge_standing: Mapping[str, Any],
     label_source: M3LabelSource | None,
     model_config: Mapping[str, Any],
+    mode: str = MODE_REAL,
 ) -> dict[str, Any]:
-    """The run's provenance record: what ran, against what, under which pins."""
+    """The run's provenance record: what ran, against what, under which pins.
+
+    ``mode`` names which pass produced the record. It is deliberately *not* one
+    of :data:`_IDENTITY_FIELDS`: the two modes write to different manifest files
+    (see :data:`EXTRACT_MANIFEST_NAME`), so it is a label for a reader rather
+    than a resume key.
+    """
     preregister = json.loads(cfg.preregister_path.read_text(encoding="utf-8"))
     git = git_provenance()
-    return {
+    record: dict[str, Any] = {
         **dict(judge_standing),
         "benchmark": preregister.get("benchmark"),
-        "mode": "real",
+        "mode": mode,
         "arms": sorted(ARM_STORES),
         "pins": dict(pins),
         # Beyond the four fields pipeline.py's fairness checks compare: the chat
@@ -845,10 +932,18 @@ def build_manifest(
         "question_count": len(specs),
         "questions_sha256": questions_digest(specs),
         "harness_sha256": harness_digest(),
+        # Narrower on purpose, and recorded beside the wide one so a reader can
+        # see both: this is the digest the extraction cache is keyed on.
+        "extraction_harness_sha256": harness_digest(_EXTRACTION_HARNESS_ROOTS),
         "git_sha": git.get("sha"),
         "git_dirty": git.get("dirty"),
         "git": git,
     }
+    # Recorded in both manifests, and identical to the record written beside the
+    # cache: a reader holding one file can see what the other agreed to without
+    # having to know which fields the projection selects.
+    record["extraction_identity"] = extraction_identity(record)
+    return record
 
 
 class JudgeDeviationError(ValueError):
@@ -960,6 +1055,15 @@ _HARNESS_ROOTS = (
     REPO_ROOT / "src" / "aphelion",
     REPO_ROOT / "scripts" / "external_reader.py",
 )
+
+# The subset of the above that can change one extraction ROW: the prompt is built
+# here, the sessions are ordered here, and the priming vocabulary is minted here.
+# The other two roots are read by consumers of the cache — Arm C's store ingests
+# the claims a row already holds, M5's reader is measured against the run's
+# output — so digesting them into the cache's identity would throw away paid
+# extraction work every time the shipped package moved, for a resume that cannot
+# be unsafe. The run's own identity keeps the wide digest (:data:`_IDENTITY_FIELDS`).
+_EXTRACTION_HARNESS_ROOTS = (Path(__file__).resolve().parent,)
 
 
 def _framed(digest: "hashlib._Hash", *parts: bytes) -> None:
@@ -1120,26 +1224,99 @@ _IDENTITY_FIELDS = (
 )
 
 
-def reconcile_manifest(path: Path, fresh: Mapping[str, Any]) -> dict[str, Any]:
-    """Write the manifest, or check a resume against the one already there."""
+def manifest_identity(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The projection of a manifest that defines what the whole run *is*."""
+    return {field_name: record.get(field_name) for field_name in _IDENTITY_FIELDS}
+
+
+def extraction_identity(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The projection of a manifest that decides one extraction ROW.
+
+    Every field here changes what the pinned extractor would say about a session:
+    which model answers and how it is served, which corpus bytes it is shown,
+    which sessions a question even has, and the code that builds the prompt.
+    Nothing else is admitted, and the omissions are the point —
+    :data:`_IDENTITY_FIELDS` is the *run's* identity and covers scoring too, so
+    keying the cache on it would refuse resumes that cannot be unsafe: a changed
+    ``top_k`` re-ranks retrieval and cannot move a claim; the arm list, the M5
+    sample corpus, the M3 labels and the judge all read the cache's output and
+    never its input. ``limit`` is left out for the same reason — a narrower pass
+    writes a strict subset of the rows a wider one would, each produced exactly
+    as the wider pass would produce it — which is what lets a small pilot
+    extraction be topped up rather than thrown away.
+
+    ``split`` is kept even though it, too, only selects questions: an extraction
+    pass exists to pre-pay a *named* graded run, and quietly serving a different
+    split's rows out of one directory is the confusion this record exists to make
+    impossible.
+
+    The code is identified by ``extraction_harness_sha256`` — the digest over
+    ``benchmarks/longmemeval/`` alone (:data:`_EXTRACTION_HARNESS_ROOTS`) — and
+    not by ``git_sha``, which moves with every unrelated edit in the repository,
+    nor by the run-wide ``harness_sha256``, which also spans ``src/aphelion/``
+    and ``scripts/external_reader.py``. Those two are read by *consumers* of a
+    row and cannot change one, so admitting them would re-import the same
+    over-coupling this projection drops ``top_k`` and ``arms`` to avoid: a
+    one-line edit to the shipped package would discard hours of paid extraction.
+    ``harness_sha256`` stays in the *run's* identity, where those files do decide
+    the result (:data:`_IDENTITY_FIELDS`).
+    """
+    pins = record.get("pins") or {}
+    model_config = record.get("model_config") or {}
+    return {
+        "extraction_cache_format": EXTRACTION_CACHE_FORMAT,
+        "extractor_pin": pins.get("extractor"),
+        "extractor_model_config": model_config.get("extractor"),
+        "haystack": record.get("haystack"),
+        "split": record.get("split"),
+        "corpus_data_dir": record.get("corpus_data_dir"),
+        "corpus_loaded_sha256": record.get("corpus_loaded_sha256"),
+        "split_manifest_sha256": record.get("split_manifest_sha256"),
+        "extraction_harness_sha256": record.get("extraction_harness_sha256"),
+    }
+
+
+def _identity_differences(
+    existing: Mapping[str, Any], fresh: Mapping[str, Any]
+) -> list[str]:
+    """Field-by-field disagreement between two identity projections.
+
+    Reported in the fresh projection's own order, with any field only the
+    existing record carries listed after it, so a record written by an older
+    revision is described rather than silently ignored.
+    """
+    names = list(fresh) + [name for name in existing if name not in fresh]
+    return [
+        f"{name}: existing {existing.get(name)!r} != requested {fresh.get(name)!r}"
+        for name in names
+        if existing.get(name) != fresh.get(name)
+    ]
+
+
+def check_manifest(
+    path: Path,
+    fresh: Mapping[str, Any],
+    *,
+    identity: Callable[[Mapping[str, Any]], Mapping[str, Any]] = manifest_identity,
+) -> dict[str, Any] | None:
+    """The manifest already at ``path``, checked against ``fresh``.
+
+    ``None`` when there is none to check. Checking is separated from writing
+    (:func:`write_manifest`) because a run has more than one gate to pass, and a
+    manifest minted before the others have spoken would describe an experiment
+    that never happened — one the *next* attempt would then have to reconcile
+    against, having done nothing wrong.
+
+    ``identity`` names which projection has to agree. It is a parameter because
+    the two modes guard different things: a graded resume must match the whole
+    run (:func:`manifest_identity`), while an extraction pass may require only
+    what an extraction row depends on (:func:`extraction_identity`).
+    """
     if not path.is_file():
-        record = dict(fresh)
-        record["started_at"] = datetime.now(timezone.utc).isoformat()
-        record["completed_at"] = None
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(
-            (json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
-            .encode("utf-8")
-        )
-        return record
+        return None
 
     existing = json.loads(path.read_text(encoding="utf-8"))
-    differences = [
-        f"{field_name}: existing {existing.get(field_name)!r} != requested "
-        f"{fresh.get(field_name)!r}"
-        for field_name in _IDENTITY_FIELDS
-        if existing.get(field_name) != fresh.get(field_name)
-    ]
+    differences = _identity_differences(identity(existing), identity(fresh))
     if differences:
         raise RunManifestMismatchError(
             f"{path} records a different run than the one requested, so resuming "
@@ -1150,10 +1327,101 @@ def reconcile_manifest(path: Path, fresh: Mapping[str, Any]) -> dict[str, Any]:
     return existing
 
 
-def finalize_manifest(path: Path, record: Mapping[str, Any]) -> None:
-    """Stamp the completion time onto an existing manifest."""
+def write_manifest(path: Path, fresh: Mapping[str, Any]) -> dict[str, Any]:
+    """Write a first manifest for this output directory, stamped as started."""
+    record = dict(fresh)
+    record["started_at"] = datetime.now(timezone.utc).isoformat()
+    record["completed_at"] = None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        (json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        .encode("utf-8")
+    )
+    return record
+
+
+def reconcile_extraction_identity(
+    path: Path, fresh: Mapping[str, Any], *, cache_path: Path
+) -> dict[str, Any]:
+    """Write the extraction cache's identity, or check it against the one there.
+
+    Called by both modes before either reads or appends a row. What decides the
+    outcome is whether there are ROWS to misattribute — the record exists to
+    vouch for bytes, so with no bytes it has nothing to say:
+
+    * No identity record and no rows — this pass owns the cache; the record is
+      written and it is now attributable.
+    * A record that agrees — the rows on disk were produced by this exact
+      extraction, and replaying or extending them is what resume means.
+    * A record that disagrees **over rows on disk** — refused: replaying them
+      would answer from claims this configuration's extractor never made.
+    * A record that disagrees over an absent or empty cache — replaced. Both
+      modes write the sidecar *before* extracting, so a pass that died at its
+      first model call leaves one behind with nothing beneath it; enforcing that
+      would pin an output directory to an identity that never produced a byte.
+    * Rows with no record at all — refused, and this is not the benign case it
+      looks like: rows whose provenance is missing are precisely the rows nothing
+      can vouch for, and writing this pass's identity over them would mint an
+      attestation for bytes it never produced.
+    """
+    # Checked before anything is read or written, and deliberately on size rather
+    # than on parsed rows: a torn trailing row is still a row somebody paid for.
+    rows_on_disk = cache_path.is_file() and bool(cache_path.stat().st_size)
+
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        differences = _identity_differences(existing, fresh)
+        if not differences:
+            return existing
+        if rows_on_disk:
+            raise ExtractionIdentityMismatchError(
+                f"{cache_path} holds extractions produced under a different "
+                "identity, so replaying them would answer from claims this "
+                "configuration's extractor never made. Use a new --out-dir, or "
+                "re-run with the recorded settings. Differences:\n  "
+                + "\n  ".join(differences)
+            )
+    elif rows_on_disk:
+        raise ExtractionIdentityMismatchError(
+            f"{cache_path} holds extraction rows but {path.name} is missing, so "
+            "nothing says which extractor, corpus or harness revision produced "
+            f"them. Refused rather than adopted: delete {cache_path.name} (or "
+            "start a new --out-dir) to re-extract, and only restore the identity "
+            "record if you know what wrote those rows."
+        )
+
+    record = dict(fresh)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        (json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        .encode("utf-8")
+    )
+    return record
+
+
+def finalize_manifest(
+    path: Path, record: Mapping[str, Any], *, resume: Mapping[str, Any] | None = None
+) -> None:
+    """Stamp the completion time onto an existing manifest.
+
+    ``resume`` appends one entry to a ``resumes`` list, stamped with the same
+    instant. It exists because an extraction manifest is reconciled on the
+    *extraction* projection, which deliberately admits neither ``limit`` nor
+    ``question_count``: a wider pass may legitimately resume a narrow pilot's
+    directory, and what the record's own header then describes is the pass that
+    FIRST wrote it. Re-stamping ``completed_at`` alone would leave the file
+    reporting a slice that is no longer what the directory holds, with nothing on
+    it to say otherwise. The header is not rewritten — that pass really did do
+    what it says — so the ledger is how each later pass gets to speak for itself.
+    """
     updated = dict(record)
-    updated["completed_at"] = datetime.now(timezone.utc).isoformat()
+    finished_at = datetime.now(timezone.utc).isoformat()
+    updated["completed_at"] = finished_at
+    if resume is not None:
+        updated["resumes"] = [
+            *(updated.get("resumes") or []),
+            {**dict(resume), "finished_at": finished_at},
+        ]
     path.write_bytes(
         (json.dumps(updated, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
         .encode("utf-8")
@@ -2596,6 +2864,175 @@ def preflight(
     return report
 
 
+def extract_only(
+    cfg: RealRunConfig,
+    *,
+    client_factory: Callable[[Any], Any] = default_client_factory,
+    progress: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    """Run the shared extraction stage alone, and write nothing else.
+
+    This is the answering phase's first pass with the arms taken away. Every
+    question's sessions go through one :class:`RealExtractor` in pinned
+    occurrence order, strictly serially, so each session is primed by exactly the
+    vocabulary its predecessors minted — the same prompts, in the same order, as
+    the pass ``--real`` would perform. What lands in ``extractions.jsonl`` is
+    therefore the cache a later ``--real`` run resumes from rather than a
+    lookalike of it.
+
+    Nothing is answered, scored or judged here, and no answer, verdict, claim or
+    metrics file is created: the extraction is the *shared* input to all three
+    arms, and separating it lets its cost be measured — and paid — before the
+    graded run starts. The pinned run's own manifest is left untouched for the
+    same reason (:data:`EXTRACT_MANIFEST_NAME`).
+    """
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    split_manifest = load_split(cfg.split_manifest_path)
+
+    specs = load_questions(
+        split=cfg.split,
+        limit=cfg.limit,
+        haystack=cfg.haystack,
+        data_directory=cfg.directory(),
+        split_manifest=split_manifest,
+    )
+    if not specs:
+        raise ValueError(
+            f"the {cfg.split!r} split with limit {cfg.limit!r} selects no questions"
+        )
+
+    chat_pin = clients.extractor_pin(cfg.preregister_path)
+    manifest_path = cfg.out_dir / EXTRACT_MANIFEST_NAME
+    fresh = build_manifest(
+        cfg,
+        specs,
+        {"extractor": chat_pin.pin.as_record()},
+        # No judge and no M3 labels take part in an extraction pass: nothing
+        # here is scored, so requiring either would be a gate on a stage that
+        # cannot reach them.
+        judge_fallback=None,
+        retriever_params={},
+        split_manifest=split_manifest,
+        judge_standing={},
+        label_source=None,
+        model_config={"extractor": chat_pin.as_record()},
+        mode=MODE_EXTRACT_ONLY,
+    )
+    # Both gates before either record: this pass's own manifest says what it
+    # intends to do, and the cache's identity says whether it may. A pass that
+    # may not touch these rows must be refused without first writing a manifest
+    # claiming it did.
+    #
+    # The manifest is reconciled on the EXTRACTION projection rather than the
+    # whole run's identity. It records a great deal this pass has an opinion
+    # about — how many questions it walked, which slice, which M5 sample corpus
+    # was on disk — but none of that reaches an extraction row, and requiring it
+    # to match made a changed --top-k, a re-pointed samples root or a narrower
+    # --limit refuse a resume that could not be unsafe. What the record then
+    # describes is the pass that FIRST wrote it, and what has to agree is what
+    # decides a row; every later pass appends its own slice to `resumes` at the
+    # end, so the file still says what the directory actually holds.
+    existing = check_manifest(manifest_path, fresh, identity=extraction_identity)
+    reconcile_extraction_identity(
+        cfg.out_dir / EXTRACTION_IDENTITY_NAME,
+        extraction_identity(fresh),
+        cache_path=cfg.out_dir / EXTRACTIONS_NAME,
+    )
+    manifest = existing if existing is not None else write_manifest(manifest_path, fresh)
+
+    # Repaired only now, once the cache is known to be this pass's to append to.
+    # A truncate-and-fsync is a write, and a pass that has just been refused must
+    # leave the directory exactly as it found it — including a torn trailing row,
+    # which is evidence about the interrupted run that owns these bytes, not
+    # litter for the next caller to sweep up. Only the extraction cache is
+    # repaired at all, because it is the only file this pass appends to;
+    # repairing the graded run's artefacts here would be this mode reaching into
+    # a run it does not participate in.
+    dropped = repair_jsonl(cfg.out_dir / EXTRACTIONS_NAME)
+    if dropped:
+        progress(f"repaired {EXTRACTIONS_NAME}: dropped {dropped} torn byte(s)")
+
+    cache = ExtractionCache(cfg.out_dir / EXTRACTIONS_NAME)
+    client = client_factory(chat_pin)
+    calls = 0
+    # Two different numbers, because a partly-cached question replays sessions it
+    # does not re-extract: the replay is what keeps the priming vocabulary right,
+    # and counting it as extraction would report a cost the run never paid.
+    sessions_processed = 0
+    sessions_extracted = 0
+    questions_skipped = 0
+
+    for position, spec in enumerate(specs, 1):
+        # A question is skipped only when EVERY one of its sessions is already
+        # memoised. A partially-extracted question is replayed from its first
+        # session, because the priming vocabulary for a pending session is
+        # derived from the ones before it — resuming into the middle would prime
+        # it from nothing and send a prompt the original run never sent.
+        pending = [
+            session
+            for session in spec.sessions
+            if cache.get(spec.question_id, session.id) is None
+        ]
+        if not pending:
+            questions_skipped += 1
+            progress(
+                f"  [{position}/{len(specs)}] {spec.question_id} ({spec.split}): "
+                f"{len(spec.sessions)} session(s) already cached, skipped"
+            )
+            continue
+
+        extractor = RealExtractor(
+            client=client,
+            linker=SharedLinker(spec.question_id),
+            cache=cache,
+            question_id=spec.question_id,
+            instrument=True,
+        )
+        for session in spec.sessions:
+            # Counted from what the extractor actually did rather than from the
+            # `pending` list above: `pending` is the miss set as it looked before
+            # the question ran, and a session the pass itself has just memoised
+            # is no longer a session it has to pay for.
+            before = extractor.calls
+            extractor(session, pin=chat_pin.pin)
+            sessions_processed += 1
+            if extractor.calls != before:
+                sessions_extracted += 1
+
+        calls += extractor.calls
+        progress(
+            f"  [{position}/{len(specs)}] {spec.question_id} ({spec.split}): "
+            f"{len(spec.sessions)} sessions, {extractor.calls} extraction call(s)"
+        )
+
+    # This pass's own slice, appended rather than stamped over the header: the
+    # header belongs to whichever pass minted the record (see the note above the
+    # check_manifest call), and this is the only place a later pass is described.
+    finalize_manifest(
+        manifest_path,
+        manifest,
+        resume={"limit": cfg.limit, "question_count": len(specs)},
+    )
+    summary = {
+        "mode": MODE_EXTRACT_ONLY,
+        "questions": len(specs),
+        "questions_skipped": questions_skipped,
+        # Sessions the model was actually asked about, and sessions walked at all.
+        "sessions_extracted": sessions_extracted,
+        "sessions_processed": sessions_processed,
+        "extraction_calls": calls,
+        "cache_rows": len(cache),
+        "extractions_path": str(cfg.out_dir / EXTRACTIONS_NAME),
+        "manifest_path": str(manifest_path),
+    }
+    progress(
+        f"extract-only: {calls} model call(s) for {sessions_extracted} newly "
+        f"extracted session(s), {sessions_processed} session(s) replayed; "
+        f"{questions_skipped} question(s) already cached"
+    )
+    return summary
+
+
 def execute(
     cfg: RealRunConfig,
     *,
@@ -2612,7 +3049,13 @@ def execute(
     # has to be truncated rather than merely tolerated: the writers append, so
     # residue left in place would have the next row concatenated onto it and
     # become permanently unparseable in the middle of the file.
-    for name in (EXTRACTIONS_NAME, CLAIMS_NAME, ANSWERS_NAME, VERDICTS_NAME):
+    #
+    # The extraction cache is deliberately NOT in this list. It is the one
+    # durable file this run may be *refused* over — it can carry rows another
+    # extraction pass produced — and a refused run may not write into the
+    # directory at all, truncate-and-fsync included. It is repaired below, once
+    # its identity record has said these rows are ours.
+    for name in (CLAIMS_NAME, ANSWERS_NAME, VERDICTS_NAME):
         dropped = repair_jsonl(cfg.out_dir / name)
         if dropped:
             progress(f"repaired {name}: dropped {dropped} torn byte(s)")
@@ -2659,23 +3102,39 @@ def execute(
 
     config = pins_config(pins)
     manifest_path = cfg.out_dir / MANIFEST_NAME
-    manifest = reconcile_manifest(
-        manifest_path,
-        build_manifest(
-            cfg,
-            specs,
-            config.pins_record(),
-            judge_fallback=cli_pin.fallback_model,
-            retriever_params=retriever.params,
-            split_manifest=split_manifest,
-            judge_standing=standing,
-            label_source=label_source,
-            model_config={
-                stage: chat_pin.as_record()
-                for stage, chat_pin in sorted(chat_pins.items())
-            },
-        ),
+    fresh = build_manifest(
+        cfg,
+        specs,
+        config.pins_record(),
+        judge_fallback=cli_pin.fallback_model,
+        retriever_params=retriever.params,
+        split_manifest=split_manifest,
+        judge_standing=standing,
+        label_source=label_source,
+        model_config={
+            stage: chat_pin.as_record()
+            for stage, chat_pin in sorted(chat_pins.items())
+        },
     )
+    # This run's own manifest first — it is the richer record, and where a resume
+    # of a *graded* run belongs. Then the extraction cache, separately, because
+    # an extraction pass may have filled it and its identity record is the only
+    # thing saying under which extractor, corpus and harness: replaying those
+    # rows without agreeing would score claims these pins never produced, and
+    # manifest.json, which that pass never wrote, cannot say so. Only once both
+    # have passed is a manifest written for a directory that had none.
+    existing = check_manifest(manifest_path, fresh)
+    reconcile_extraction_identity(
+        cfg.out_dir / EXTRACTION_IDENTITY_NAME,
+        extraction_identity(fresh),
+        cache_path=cfg.out_dir / EXTRACTIONS_NAME,
+    )
+    manifest = existing if existing is not None else write_manifest(manifest_path, fresh)
+
+    # Now that the cache is ours to append to (see the repair loop above).
+    dropped = repair_jsonl(cfg.out_dir / EXTRACTIONS_NAME)
+    if dropped:
+        progress(f"repaired {EXTRACTIONS_NAME}: dropped {dropped} torn byte(s)")
 
     progress(f"answering {len(specs)} questions x {len(ARM_STORES)} arms")
     phase = load_answer_phase(cfg.out_dir)

@@ -126,7 +126,7 @@ claim: a model that wraps correct output in a fence has still answered correctly
 
 ---
 
-## 11. Vocabulary priming (amendment #4, 2026-08-16)
+## 7. Vocabulary priming (amendment #4, 2026-08-16)
 
 ### What the second probe found
 
