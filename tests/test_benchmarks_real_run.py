@@ -4591,6 +4591,36 @@ def test_a_cache_with_no_identity_record_is_refused_rather_than_adopted(
         real_run.extract_only(cfg, client_factory=_factory([]))
 
 
+@pytest.mark.integration
+def test_a_graded_run_refuses_a_cache_with_no_identity_record(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """The ``--real`` direction of the same refusal, and the one that will happen.
+
+    Every output directory created before the identity record existed holds
+    ``extractions.jsonl`` and no sidecar, so its next graded resume takes exactly
+    this path. The mismatching-sidecar case was covered for ``execute``; a
+    *missing* one was asserted only for the extraction pass, which is the mode
+    those directories will not be run in.
+    """
+    cfg = _config(tmp_path, corpus_dir, split_path, out_dir=tmp_path / "legacy")
+    real_run.extract_only(cfg, client_factory=_factory([]))
+    (cfg.out_dir / real_run.EXTRACTION_IDENTITY_NAME).unlink()
+    before = (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    chats: list[FakeChat] = []
+    with pytest.raises(
+        real_run.ExtractionIdentityMismatchError,
+        match=real_run.EXTRACTION_IDENTITY_NAME,
+    ):
+        real_run.execute(cfg, client_factory=_factory(chats), judge_client=FakeJudge())
+
+    # Refused before it spent a call, minted a manifest, or touched the rows.
+    assert not (cfg.out_dir / real_run.MANIFEST_NAME).exists()
+    assert sum(client.extract_calls for client in chats) == 0
+    assert (cfg.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
+
+
 @pytest.mark.unit
 def test_an_identity_record_over_an_empty_cache_is_replaced_not_enforced(
     tmp_path: Path,
