@@ -1399,10 +1399,29 @@ def reconcile_extraction_identity(
     return record
 
 
-def finalize_manifest(path: Path, record: Mapping[str, Any]) -> None:
-    """Stamp the completion time onto an existing manifest."""
+def finalize_manifest(
+    path: Path, record: Mapping[str, Any], *, resume: Mapping[str, Any] | None = None
+) -> None:
+    """Stamp the completion time onto an existing manifest.
+
+    ``resume`` appends one entry to a ``resumes`` list, stamped with the same
+    instant. It exists because an extraction manifest is reconciled on the
+    *extraction* projection, which deliberately admits neither ``limit`` nor
+    ``question_count``: a wider pass may legitimately resume a narrow pilot's
+    directory, and what the record's own header then describes is the pass that
+    FIRST wrote it. Re-stamping ``completed_at`` alone would leave the file
+    reporting a slice that is no longer what the directory holds, with nothing on
+    it to say otherwise. The header is not rewritten — that pass really did do
+    what it says — so the ledger is how each later pass gets to speak for itself.
+    """
     updated = dict(record)
-    updated["completed_at"] = datetime.now(timezone.utc).isoformat()
+    finished_at = datetime.now(timezone.utc).isoformat()
+    updated["completed_at"] = finished_at
+    if resume is not None:
+        updated["resumes"] = [
+            *(updated.get("resumes") or []),
+            {**dict(resume), "finished_at": finished_at},
+        ]
     path.write_bytes(
         (json.dumps(updated, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
         .encode("utf-8")
@@ -2911,7 +2930,8 @@ def extract_only(
     # to match made a changed --top-k, a re-pointed samples root or a narrower
     # --limit refuse a resume that could not be unsafe. What the record then
     # describes is the pass that FIRST wrote it, and what has to agree is what
-    # decides a row.
+    # decides a row; every later pass appends its own slice to `resumes` at the
+    # end, so the file still says what the directory actually holds.
     existing = check_manifest(manifest_path, fresh, identity=extraction_identity)
     reconcile_extraction_identity(
         cfg.out_dir / EXTRACTION_IDENTITY_NAME,
@@ -2985,7 +3005,14 @@ def extract_only(
             f"{len(spec.sessions)} sessions, {extractor.calls} extraction call(s)"
         )
 
-    finalize_manifest(manifest_path, manifest)
+    # This pass's own slice, appended rather than stamped over the header: the
+    # header belongs to whichever pass minted the record (see the note above the
+    # check_manifest call), and this is the only place a later pass is described.
+    finalize_manifest(
+        manifest_path,
+        manifest,
+        resume={"limit": cfg.limit, "question_count": len(specs)},
+    )
     summary = {
         "mode": MODE_EXTRACT_ONLY,
         "questions": len(specs),

@@ -4197,6 +4197,47 @@ def test_the_extract_manifest_records_the_mode_and_refuses_a_reshaped_resume(
         real_run.extract_only(reshaped, client_factory=_factory([]))
 
 
+@pytest.mark.integration
+def test_the_extract_manifest_records_every_pass_that_resumed_it(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """A resumed pass appends to a ledger instead of only re-stamping the header.
+
+    Reconciling on the extraction projection is what lets a wider ``--limit``
+    resume a narrow pilot — the rows a pilot wrote are a strict subset, produced
+    exactly as the wider pass would produce them. The cost is that the record
+    still describes the pass that FIRST wrote it, so an operator reading
+    ``extract-manifest.json`` to learn what the directory holds is told about a
+    slice that is no longer the whole story. The ledger is what closes that gap.
+    """
+    cfg = _config(
+        tmp_path, corpus_dir, split_path, out_dir=tmp_path / "extract", limit=1
+    )
+    real_run.extract_only(cfg, client_factory=_factory([]))
+
+    manifest_path = cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME
+    first = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert first["limit"] == 1
+    assert first["question_count"] == 1
+    assert [entry["limit"] for entry in first["resumes"]] == [1]
+    assert first["resumes"][0]["question_count"] == 1
+    assert first["resumes"][0]["finished_at"] == first["completed_at"]
+
+    widened = _config(tmp_path, corpus_dir, split_path, out_dir=cfg.out_dir, limit=None)
+    real_run.extract_only(widened, client_factory=_factory([]))
+
+    second = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # The header still describes the pass that minted it — rewriting it would be
+    # claiming the first pass had done work it never did.
+    assert second["limit"] == 1
+    assert second["question_count"] == 1
+    # The ledger is what says what the directory actually holds now.
+    assert [entry["limit"] for entry in second["resumes"]] == [1, None]
+    assert second["resumes"][-1]["question_count"] == len(_QUESTIONS)
+    assert second["resumes"][-1]["finished_at"] == second["completed_at"]
+    assert second["resumes"][0] == first["resumes"][0]
+
+
 # --------------------------------------------------------------------------- #
 # The extraction cache's own identity                                          #
 # --------------------------------------------------------------------------- #
