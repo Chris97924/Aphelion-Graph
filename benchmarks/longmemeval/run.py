@@ -1034,9 +1034,10 @@ def _run_extract_only(parser: argparse.ArgumentParser, args: argparse.Namespace)
         f"({summary['questions_skipped']} already cached)"
     )
     print(
-        f"  extraction calls: {summary['extraction_calls']} over "
-        f"{summary['sessions_extracted']} session(s)"
+        f"  extraction calls: {summary['extraction_calls']} for "
+        f"{summary['sessions_extracted']} newly extracted session(s)"
     )
+    print(f"  sessions replayed: {summary['sessions_processed']}")
     print(f"  cache rows: {summary['cache_rows']}")
     return 0
 

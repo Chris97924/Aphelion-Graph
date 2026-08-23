@@ -2898,7 +2898,11 @@ def extract_only(
     cache = ExtractionCache(cfg.out_dir / EXTRACTIONS_NAME)
     client = client_factory(chat_pin)
     calls = 0
-    sessions_seen = 0
+    # Two different numbers, because a partly-cached question replays sessions it
+    # does not re-extract: the replay is what keeps the priming vocabulary right,
+    # and counting it as extraction would report a cost the run never paid.
+    sessions_processed = 0
+    sessions_extracted = 0
     questions_skipped = 0
 
     for position, spec in enumerate(specs, 1):
@@ -2928,8 +2932,15 @@ def extract_only(
             instrument=True,
         )
         for session in spec.sessions:
+            # Counted from what the extractor actually did rather than from the
+            # `pending` list above: `pending` is the miss set as it looked before
+            # the question ran, and a session the pass itself has just memoised
+            # is no longer a session it has to pay for.
+            before = extractor.calls
             extractor(session, pin=chat_pin.pin)
-            sessions_seen += 1
+            sessions_processed += 1
+            if extractor.calls != before:
+                sessions_extracted += 1
 
         calls += extractor.calls
         progress(
@@ -2942,14 +2953,17 @@ def extract_only(
         "mode": MODE_EXTRACT_ONLY,
         "questions": len(specs),
         "questions_skipped": questions_skipped,
-        "sessions_extracted": sessions_seen,
+        # Sessions the model was actually asked about, and sessions walked at all.
+        "sessions_extracted": sessions_extracted,
+        "sessions_processed": sessions_processed,
         "extraction_calls": calls,
         "cache_rows": len(cache),
         "extractions_path": str(cfg.out_dir / EXTRACTIONS_NAME),
         "manifest_path": str(manifest_path),
     }
     progress(
-        f"extract-only: {calls} model call(s) over {sessions_seen} session(s); "
+        f"extract-only: {calls} model call(s) for {sessions_extracted} newly "
+        f"extracted session(s), {sessions_processed} session(s) replayed; "
         f"{questions_skipped} question(s) already cached"
     )
     return summary

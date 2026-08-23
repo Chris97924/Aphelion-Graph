@@ -3959,6 +3959,9 @@ def test_extract_only_writes_the_cache_rows_the_graded_run_writes(
     assert summary["extraction_calls"] == len(extract_rows)
     assert summary["questions"] == len(_QUESTIONS)
     assert summary["questions_skipped"] == 0
+    # Nothing was cached, so every session replayed was also a session extracted.
+    assert summary["sessions_extracted"] == len(extract_rows)
+    assert summary["sessions_processed"] == len(extract_rows)
 
 
 @pytest.mark.integration
@@ -4010,6 +4013,8 @@ def test_extract_only_resume_skips_questions_already_cached(
     assert summary["extraction_calls"] == 0
     assert summary["questions_skipped"] == summary["questions"] == len(_QUESTIONS)
     assert summary["sessions_extracted"] == 0
+    # Every question was skipped whole, so no session was even replayed.
+    assert summary["sessions_processed"] == 0
     assert sum(client.extract_calls for client in resumed) == 0
     # Byte-unchanged, not merely equivalent: the resume appended nothing at all.
     assert path.read_bytes() == before
@@ -4042,6 +4047,13 @@ def test_extract_only_replays_a_partly_cached_question_from_its_first_session(
     assert summary["questions_skipped"] == len(_QUESTIONS) - 1
     prompts = [p for client in resumed for p in client.extract_prompts]
     assert len(prompts) == 1, "only the missing session may reach the model"
+
+    # What the pass EXTRACTED is what it paid for: the one missing session. The
+    # other session of that question was replayed from the memo, and counting it
+    # as extracted would report a cost of two calls for a run that made one —
+    # exactly the reading an operator uses to decide whether extraction is done.
+    assert summary["sessions_extracted"] == 1
+    assert summary["sessions_processed"] == 2
 
     # And what it re-extracted is what was there before.
     replayed = real_run.read_jsonl(path)[-1]
