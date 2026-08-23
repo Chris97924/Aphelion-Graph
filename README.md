@@ -236,6 +236,40 @@ python -m benchmarks.longmemeval.run --smoke-3arm --out /tmp/results-3arm.jsonl
 corpus directory if you have one. Omit `--out` and the rows are written beside
 the harness.
 
+### Extraction pass
+
+All three arms ingest the same sessions, so the extractor's claims are a
+*shared* input to the measurement rather than part of it. `--extract-only` runs
+that stage alone, against a real model, so its cost can be paid and measured
+before the graded run starts:
+
+```bash
+python -m benchmarks.longmemeval.run \
+    --extract-only --haystack s --out-dir runs/extract
+```
+
+`--haystack` is required and has no default — it decides which sessions exist at
+all. `--split` and `--limit` select the slice; `--data-dir` points at the corpus.
+
+Into `--out-dir` it writes exactly three things and nothing else:
+
+- `extractions.jsonl` — the claim cache, in the same format `--real` writes, each
+  fresh row annotated with the call's wall time and the endpoint's token counts
+  where the server reports them.
+- `extract-manifest.json` — this pass's provenance, kept separate from the graded
+  run's `manifest.json`, with a `resumes` entry per pass naming the slice it
+  extracted.
+- `extractions-identity.json` — what the rows may be replayed under: the
+  extractor pin and model config, the haystack, the split, and digests of the
+  corpus, the split manifest and the harness. Both modes reconcile against it
+  before touching a row, and a mismatch is refused rather than merged.
+
+Nothing is answered, scored or judged, and no answers, claims, verdicts or
+metrics file is created. A later `--real` run against the same `--out-dir`
+resumes the cache instead of re-extracting it — that is the point of the mode —
+and re-running `--extract-only` at a wider `--limit` tops the cache up rather
+than starting over.
+
 ### Pre-registration
 
 `benchmarks/longmemeval/preregister.json` pins the protocol — seed, split sizes
