@@ -276,11 +276,16 @@ strictly serial — each one's prompt is primed by the vocabulary its predecesso
 minted, so they cannot overlap — while whole questions, which share nothing but
 the cache, run concurrently. The rows produced are the same set at any `N`; only
 the wall clock and the order rows land in the file change, and the width a run
-used is recorded in its manifest as `extract_workers` (where, like `top_k`, it is
-not a resume key — a wide pass and a narrow one may resume each other). The flag
+used is recorded in its manifest as `extract_workers`, which is not a resume key
+in either mode — a wide pass and a narrow one may resume each other. Its
+neighbours in that record are not the same case: `top_k` and `limit` are not
+extraction-cache keys either, but both *are* graded-run resume keys, so changing
+one between `--real` passes over a single `--out-dir` is refused. The flag
 applies to `--real` as well, which above 1 warms the cache before the graded
 phase begins. Raising it only pays against an endpoint configured to serve
-concurrent sequences; see `docs/benchmark/extraction-mechanism.md` §8.
+concurrent sequences. Merging this change also retires any extraction cache
+written before it, by the same identity rules; see
+`docs/benchmark/extraction-mechanism.md` §8.
 
 ### Pre-registration
 
