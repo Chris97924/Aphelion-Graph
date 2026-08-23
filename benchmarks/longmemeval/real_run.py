@@ -932,6 +932,9 @@ def build_manifest(
         "question_count": len(specs),
         "questions_sha256": questions_digest(specs),
         "harness_sha256": harness_digest(),
+        # Narrower on purpose, and recorded beside the wide one so a reader can
+        # see both: this is the digest the extraction cache is keyed on.
+        "extraction_harness_sha256": harness_digest(_EXTRACTION_HARNESS_ROOTS),
         "git_sha": git.get("sha"),
         "git_dirty": git.get("dirty"),
         "git": git,
@@ -1052,6 +1055,15 @@ _HARNESS_ROOTS = (
     REPO_ROOT / "src" / "aphelion",
     REPO_ROOT / "scripts" / "external_reader.py",
 )
+
+# The subset of the above that can change one extraction ROW: the prompt is built
+# here, the sessions are ordered here, and the priming vocabulary is minted here.
+# The other two roots are read by consumers of the cache — Arm C's store ingests
+# the claims a row already holds, M5's reader is measured against the run's
+# output — so digesting them into the cache's identity would throw away paid
+# extraction work every time the shipped package moved, for a resume that cannot
+# be unsafe. The run's own identity keeps the wide digest (:data:`_IDENTITY_FIELDS`).
+_EXTRACTION_HARNESS_ROOTS = (Path(__file__).resolve().parent,)
 
 
 def _framed(digest: "hashlib._Hash", *parts: bytes) -> None:
@@ -1236,9 +1248,18 @@ def extraction_identity(record: Mapping[str, Any]) -> dict[str, Any]:
     ``split`` is kept even though it, too, only selects questions: an extraction
     pass exists to pre-pay a *named* graded run, and quietly serving a different
     split's rows out of one directory is the confusion this record exists to make
-    impossible. The harness is identified by ``harness_sha256`` rather than by
-    ``git_sha``, because the git identity moves with every unrelated edit in the
-    repository while the digest covers exactly the source that produces a row.
+    impossible.
+
+    The code is identified by ``extraction_harness_sha256`` — the digest over
+    ``benchmarks/longmemeval/`` alone (:data:`_EXTRACTION_HARNESS_ROOTS`) — and
+    not by ``git_sha``, which moves with every unrelated edit in the repository,
+    nor by the run-wide ``harness_sha256``, which also spans ``src/aphelion/``
+    and ``scripts/external_reader.py``. Those two are read by *consumers* of a
+    row and cannot change one, so admitting them would re-import the same
+    over-coupling this projection drops ``top_k`` and ``arms`` to avoid: a
+    one-line edit to the shipped package would discard hours of paid extraction.
+    ``harness_sha256`` stays in the *run's* identity, where those files do decide
+    the result (:data:`_IDENTITY_FIELDS`).
     """
     pins = record.get("pins") or {}
     model_config = record.get("model_config") or {}
@@ -1251,7 +1272,7 @@ def extraction_identity(record: Mapping[str, Any]) -> dict[str, Any]:
         "corpus_data_dir": record.get("corpus_data_dir"),
         "corpus_loaded_sha256": record.get("corpus_loaded_sha256"),
         "split_manifest_sha256": record.get("split_manifest_sha256"),
-        "harness_sha256": record.get("harness_sha256"),
+        "extraction_harness_sha256": record.get("extraction_harness_sha256"),
     }
 
 

@@ -4241,7 +4241,9 @@ def test_the_extraction_identity_names_what_decides_a_row_and_nothing_else(
     assert identity["extraction_cache_format"] == real_run.EXTRACTION_CACHE_FORMAT
     assert identity["haystack"] == cfg.haystack
     assert identity["split"] == cfg.split
-    assert identity["harness_sha256"] == real_run.harness_digest()
+    assert identity["extraction_harness_sha256"] == real_run.harness_digest(
+        real_run._EXTRACTION_HARNESS_ROOTS
+    )
     assert (
         identity["extractor_pin"]
         == clients.extractor_pin(cfg.preregister_path).pin.as_record()
@@ -4251,7 +4253,8 @@ def test_the_extraction_identity_names_what_decides_a_row_and_nothing_else(
         == clients.extractor_pin(cfg.preregister_path).as_record()
     )
     assert identity["corpus_loaded_sha256"] == real_run.corpus_digests(cfg)
-    # Nothing an extraction row is independent of.
+    # Nothing an extraction row is independent of — the run-wide harness digest
+    # included, because it spans the shipped package and the M5 reader.
     assert not set(identity) & {
         "arms",
         "limit",
@@ -4261,6 +4264,7 @@ def test_the_extraction_identity_names_what_decides_a_row_and_nothing_else(
         "top_k",
         "judge_model",
         "m3_labels_sha256",
+        "harness_sha256",
     }
 
     # The same record rides in the manifest, so one file explains the other.
@@ -4268,6 +4272,58 @@ def test_the_extraction_identity_names_what_decides_a_row_and_nothing_else(
         (cfg.out_dir / real_run.EXTRACT_MANIFEST_NAME).read_text(encoding="utf-8")
     )
     assert manifest["extraction_identity"] == identity
+
+
+@pytest.mark.unit
+def test_an_edit_to_the_shipped_package_cannot_invalidate_an_extraction_cache() -> None:
+    """The cache is keyed on the harness's own digest, not the run-wide one.
+
+    ``harness_sha256`` spans ``benchmarks/longmemeval/``, ``src/aphelion/`` and
+    ``scripts/external_reader.py``, because all three decide what a *run*
+    reports. Neither of the last two can move an extraction row: Arm C's store
+    and M5's independent reader consume the cache's OUTPUT. Keying the cache on
+    the wide digest threw away paid extraction work on every edit to the shipped
+    package — exactly the class of false refusal the projection drops ``top_k``
+    and ``arms`` to avoid.
+    """
+    record = {
+        "pins": {"extractor": {"model": "pinned-extractor"}},
+        "model_config": {"extractor": {"chat_dialect": "openai"}},
+        "haystack": real_run.HAYSTACK_ORACLE,
+        "split": real_run.SPLIT_ALL,
+        "corpus_data_dir": "/corpus",
+        "corpus_loaded_sha256": {corpus.ORACLE_FILENAME: "c0"},
+        "split_manifest_sha256": "s0",
+        "harness_sha256": "run-wide-0",
+        "extraction_harness_sha256": "harness-0",
+    }
+
+    repackaged = {**record, "harness_sha256": "run-wide-1"}
+    assert real_run.extraction_identity(record) == real_run.extraction_identity(
+        repackaged
+    )
+    # The run's own identity still moves with it: a graded resume is a different
+    # claim, and src/aphelion is code its results depend on.
+    assert real_run.manifest_identity(record) != real_run.manifest_identity(repackaged)
+
+    retooled = {**record, "extraction_harness_sha256": "harness-1"}
+    assert real_run.extraction_identity(record) != real_run.extraction_identity(retooled)
+
+
+@pytest.mark.unit
+def test_the_extraction_harness_digest_covers_exactly_the_harness_package() -> None:
+    """What the projection's docstring claims, asserted rather than described."""
+    harness = Path(real_run.__file__).resolve().parent
+
+    assert real_run._EXTRACTION_HARNESS_ROOTS == (harness,)
+    assert real_run.REPO_ROOT / "src" / "aphelion" in real_run._HARNESS_ROOTS
+    assert (
+        real_run.REPO_ROOT / "scripts" / "external_reader.py" in real_run._HARNESS_ROOTS
+    )
+    # Two digests over two different trees: the narrow one cannot be the wide one.
+    assert real_run.harness_digest() != real_run.harness_digest(
+        real_run._EXTRACTION_HARNESS_ROOTS
+    )
 
 
 @pytest.mark.integration
