@@ -270,6 +270,23 @@ resumes the cache instead of re-extracting it — that is the point of the mode 
 and re-running `--extract-only` at a wider `--limit` tops the cache up rather
 than starting over.
 
+Extraction walks one question at a time by default. `--extract-workers N` walks
+N of them at once, and the invariant is that sessions **inside** a question stay
+strictly serial — each one's prompt is primed by the vocabulary its predecessors
+minted, so they cannot overlap — while whole questions, which share nothing but
+the cache, run concurrently. The rows produced are the same set at any `N`; only
+the wall clock and the order rows land in the file change, and the width a run
+used is recorded in its manifest as `extract_workers`, which is not a resume key
+in either mode — a wide pass and a narrow one may resume each other. Its
+neighbours in that record are not the same case: `top_k` and `limit` are not
+extraction-cache keys either, but both *are* graded-run resume keys, so changing
+one between `--real` passes over a single `--out-dir` is refused. The flag
+applies to `--real` as well, which above 1 warms the cache before the graded
+phase begins. Raising it only pays against an endpoint configured to serve
+concurrent sequences. Merging this change also retires any extraction cache
+written before it, by the same identity rules; see
+`docs/benchmark/extraction-mechanism.md` §8.
+
 ### Pre-registration
 
 `benchmarks/longmemeval/preregister.json` pins the protocol — seed, split sizes

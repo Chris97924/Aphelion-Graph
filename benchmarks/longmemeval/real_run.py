@@ -51,7 +51,9 @@ import math
 import os
 import re
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -164,6 +166,14 @@ EXTRACTION_IDENTITY_NAME = "extractions-identity.json"
 # What a manifest's ``mode`` says produced it.
 MODE_REAL = "real"
 MODE_EXTRACT_ONLY = "extract-only"
+
+# How many QUESTIONS an extraction pass has in flight at once. One by default,
+# and deliberately so: the pinned run's shape is the thing being measured, and a
+# default that quietly ran it eight questions wide would make every recorded run
+# before this one a different pass from every run after it. Raising it is an
+# explicit operator choice, recorded in the manifest with the rest of the run's
+# shape (:func:`extract_questions` for what it may and may not change).
+DEFAULT_EXTRACT_WORKERS = 1
 
 
 class RunManifestMismatchError(ValueError):
@@ -328,19 +338,44 @@ class JsonlWriter:
 
     The file is repaired on construction, so an append can never land on top of a
     torn row (see :func:`repair_jsonl`).
+
+    **One row, one write, one thread at a time.** The extraction scheduler runs
+    questions concurrently against a single cache file, so appends arrive from
+    many threads. The row is serialised to bytes *before* the lock and handed to
+    one ``write`` call inside it, which makes the failure this guards against
+    impossible rather than unlikely: two interleaved appends do not produce a
+    *torn* row — the tolerance above is for those, and they are only ever at the
+    end of a file — they produce a spliced row in the MIDDLE of one, which
+    :func:`read_jsonl` refuses permanently and correctly, leaving the run
+    unresumable with its model work already paid for.
+
+    The lock belongs to the *instance*, which is the whole of what is claimed.
+    Two writers over one path hold two different locks and do not serialise
+    against each other, so a phase that opens its own writer must not overlap
+    another that has one — as things stand none do: a graded run's pre-extraction
+    finishes before the answering phase opens the cache again. Two *processes*
+    were never supported either; what stops those is the manifest and
+    extraction-identity gates, which refuse a second run over another pass's rows
+    before a byte is written.
     """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self.repaired_bytes = repair_jsonl(path)
 
     def append(self, row: Mapping[str, Any]) -> None:
-        line = json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n"
-        with self.path.open("ab") as handle:
-            handle.write(line.encode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
+        # Encoded outside the lock: it is pure CPU on a private row, and holding
+        # the lock across it would serialise formatting as well as writing.
+        payload = (json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        )
+        with self._lock:
+            with self.path.open("ab") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
 
 
 def _sha256_text(text: str) -> str:
@@ -519,11 +554,19 @@ class ExtractionCache:
     longer a measurement of the memory layer (design doc §7.3). Memoising makes
     the extraction a fixed input to all three arms — and, because the memo is on
     disk, keeps it fixed across a restart too.
+
+    Shared by every question the extraction scheduler has in flight, so the
+    in-memory index and the durable row behind it are updated under one lock. The
+    two halves must not be observable out of step: a row on disk the index does
+    not know about is a session re-extracted and paid for twice, and an index
+    entry with no row behind it is a session that silently disappears on the next
+    resume. Under the lock they are one operation, so a key is in both or neither.
     """
 
     def __init__(self, path: Path) -> None:
         self._writer = JsonlWriter(path)
         self._records: dict[tuple[str, str], list[dict]] = {}
+        self._lock = threading.Lock()
         for row in read_jsonl(path):
             if row.get("format") != EXTRACTION_CACHE_FORMAT:
                 raise ExtractionCacheVersionError(
@@ -540,11 +583,15 @@ class ExtractionCache:
             self._records[(row["question_id"], row["session_id"])] = list(row["claims"])
 
     def __len__(self) -> int:
-        return len(self._records)
+        with self._lock:
+            return len(self._records)
 
     def get(self, question_id: str, session_id: str) -> list[dict] | None:
-        records = self._records.get((question_id, session_id))
-        return [dict(record) for record in records] if records is not None else None
+        with self._lock:
+            records = self._records.get((question_id, session_id))
+            return (
+                [dict(record) for record in records] if records is not None else None
+            )
 
     def put(
         self,
@@ -563,7 +610,6 @@ class ExtractionCache:
         rows byte-identical to the ones it has always written.
         """
         stored = [dict(record) for record in records]
-        self._records[(question_id, session_id)] = stored
         row: dict[str, Any] = {
             "format": EXTRACTION_CACHE_FORMAT,
             "question_id": question_id,
@@ -574,7 +620,13 @@ class ExtractionCache:
             # Never allowed to shadow the fields the replay reads.
             if key not in row:
                 row[key] = value
-        self._writer.append(row)
+        # Index and row together — see the class docstring. The append is inside
+        # the lock rather than after it because "durable, then visible" is the
+        # order a resume depends on: a caller that saw the memo entry has to be
+        # able to assume the bytes behind it survive the process.
+        with self._lock:
+            self._records[(question_id, session_id)] = stored
+            self._writer.append(row)
 
 
 def _call_instrumentation(
@@ -804,6 +856,10 @@ class RealRunConfig:
     judge_deviation_ack: bool = False
     split_manifest_path: Path = corpus.MANIFEST_PATH
     preregister_path: Path = PREREGISTER_PATH
+    # How many questions the extraction stage has in flight at once. A scheduling
+    # setting and nothing more: it cannot change which rows are produced or what
+    # is in them, only how long the pass takes (:func:`extract_questions`).
+    extract_workers: int = DEFAULT_EXTRACT_WORKERS
 
     def directory(self) -> Path:
         return self.data_dir or corpus.data_dir()
@@ -926,6 +982,15 @@ def build_manifest(
         "split": cfg.split,
         "limit": cfg.limit,
         "top_k": cfg.top_k,
+        # How wide the extraction stage ran. Recorded because it is part of how
+        # the run was performed and an operator reading the record months later
+        # should not have to guess — and deliberately NOT part of
+        # :data:`_IDENTITY_FIELDS` or :func:`extraction_identity`, because it
+        # cannot change a row. A pass that extracted eight questions at a time
+        # produces rows a one-at-a-time pass would produce, so refusing to resume
+        # across a change of width would throw away paid work for a scheduling
+        # decision.
+        "extract_workers": cfg.extract_workers,
         "seed": pinned_seed(cfg.preregister_path),
         "query_time": PINNED_QUERY_TIME.isoformat(),
         "retriever_params": dict(retriever_params),
@@ -2864,6 +2929,227 @@ def preflight(
     return report
 
 
+# ---------------------------------------------------------------------------
+# The extraction scheduler: questions concurrently, sessions never
+# ---------------------------------------------------------------------------
+
+
+class QuestionExtractionError(RuntimeError):
+    """One or more questions failed to extract; the rest of the pass completed.
+
+    Raised once, after the pass has drained, rather than at the moment of
+    failure. A question already running when another one fails is allowed to
+    finish: its rows are durable the moment they are written, so cutting it short
+    would not un-spend the calls it had already made — it would only throw away
+    the ones it had not yet recorded. What stops immediately is *submission*, so
+    a dead endpoint costs one round of in-flight questions rather than the whole
+    split.
+
+    At the default one worker nothing is ever in flight beside the failing
+    question, so this is precisely the old behaviour — the pass stops at the
+    first failure, having attempted nothing after it — carrying a name that says
+    which question it was.
+    """
+
+    def __init__(self, failures: Mapping[str, BaseException]) -> None:
+        self.failures = dict(failures)
+        detail = "; ".join(
+            f"{question_id}: {error!r}" for question_id, error in self.failures.items()
+        )
+        super().__init__(
+            f"{len(self.failures)} question(s) failed to extract. No question was "
+            "started after the first failure, and every question already running "
+            "was allowed to finish, so what they wrote is durable — re-run to "
+            f"resume from it. Failures: {detail}"
+        )
+
+
+@dataclass
+class QuestionExtraction:
+    """What one question's extraction did, or why it did nothing."""
+
+    question_id: str
+    sessions_processed: int = 0
+    sessions_extracted: int = 0
+    calls: int = 0
+    # Every session was already memoised, so the question was not walked at all.
+    skipped: bool = False
+    # False when the pass had already failed elsewhere and this question was
+    # therefore never begun. Not an error of its own, and not work either.
+    started: bool = True
+    error: BaseException | None = None
+    message: str = ""
+
+
+def _extract_question(
+    spec: QuestionSpec,
+    *,
+    position: int,
+    total: int,
+    cache: ExtractionCache,
+    client: Any,
+    pin: ModelPin,
+    instrument: bool,
+) -> QuestionExtraction:
+    """Walk one question's sessions in pinned occurrence order, strictly serially.
+
+    The unit of work the scheduler hands to a worker — and the reason the
+    concurrency is *across* questions only. Vocabulary priming makes session k's
+    prompt a function of the sessions before it in the same question, so two
+    sessions of one question can never be in flight together; two different
+    questions share nothing but the cache, whose lock is what makes that sharing
+    safe.
+
+    A question is skipped only when EVERY one of its sessions is memoised. A
+    partially-extracted question is replayed from its first session, because the
+    priming vocabulary for a pending session is derived from the ones before it —
+    resuming into the middle would prime it from nothing and send a prompt the
+    original run never sent.
+    """
+    label = f"  [{position}/{total}] {spec.question_id} ({spec.split}): "
+    if all(
+        cache.get(spec.question_id, session.id) is not None
+        for session in spec.sessions
+    ):
+        return QuestionExtraction(
+            question_id=spec.question_id,
+            skipped=True,
+            message=f"{label}{len(spec.sessions)} session(s) already cached, skipped",
+        )
+
+    extractor = RealExtractor(
+        client=client,
+        linker=SharedLinker(spec.question_id),
+        cache=cache,
+        question_id=spec.question_id,
+        instrument=instrument,
+    )
+    outcome = QuestionExtraction(question_id=spec.question_id)
+    for session in spec.sessions:
+        # Counted from what the extractor actually did rather than from a miss
+        # set computed before the question ran: `pending` is the miss set as it
+        # looked then, and a session this pass has just memoised is no longer a
+        # session it has to pay for.
+        before = extractor.calls
+        extractor(session, pin=pin)
+        outcome.sessions_processed += 1
+        if extractor.calls != before:
+            outcome.sessions_extracted += 1
+    outcome.calls = extractor.calls
+    outcome.message = (
+        f"{label}{len(spec.sessions)} sessions, {extractor.calls} extraction call(s)"
+    )
+    return outcome
+
+
+def extract_questions(
+    specs: Sequence[QuestionSpec],
+    *,
+    cache: ExtractionCache,
+    client: Any,
+    pin: ModelPin,
+    instrument: bool = False,
+    workers: int = DEFAULT_EXTRACT_WORKERS,
+    progress: Callable[[str], None] = lambda _message: None,
+) -> list[QuestionExtraction]:
+    """Extract every question, up to ``workers`` of them at a time.
+
+    What ``workers`` buys is the only concurrency this harness has any business
+    taking: extraction is one model call per session, the calls are seconds long,
+    and the endpoint serves several at once. What it must not buy is a different
+    *measurement*, so the invariant is drawn tightly:
+
+    * **Serial within a question, concurrent across questions.** Enforced by the
+      unit of work (:func:`_extract_question`), not by the scheduler — there is
+      no arrangement of workers that can put two sessions of one question in
+      flight together, because one call site walks them in a plain loop.
+    * **The output is a function of the questions, not of the workers.** Results
+      and progress lines are merged back in the order ``specs`` gives, so what a
+      reader sees is the pinned question order at any ``workers``. The rows the
+      cache holds afterwards are the same SET for any ``workers``; only the order
+      they happen to land in the file, and the wall clock, differ.
+    * **Content is untouched.** ``instrument`` is the caller's, not the
+      scheduler's: a pass records what its calls cost, or does not, for the same
+      reason at one worker as at eight.
+
+    ``workers == 1`` builds no pool at all. The questions run inline on the
+    calling thread, which is the pinned run's default and is the pass this module
+    has always performed, down to the interleaving of progress lines with calls.
+
+    Failures are recorded per question and re-raised together as
+    :class:`QuestionExtractionError`; see its docstring for why the pass drains
+    rather than aborting.
+    """
+    if workers < 1:
+        raise ValueError(
+            f"extract workers must be at least 1, got {workers}: the setting "
+            "chooses how many QUESTIONS are extracted at once, and a pass that "
+            "extracts none of them is not a slower pass, it is no pass at all"
+        )
+
+    total = len(specs)
+    failures: dict[str, BaseException] = {}
+    # Set by the first failing question; read by every question before it starts.
+    halt = threading.Event()
+
+    def run(numbered: tuple[int, QuestionSpec]) -> QuestionExtraction:
+        position, spec = numbered
+        if halt.is_set():
+            return QuestionExtraction(question_id=spec.question_id, started=False)
+        try:
+            return _extract_question(
+                spec,
+                position=position,
+                total=total,
+                cache=cache,
+                client=client,
+                pin=pin,
+                instrument=instrument,
+            )
+        except Exception as error:  # noqa: BLE001 - re-raised aggregated below
+            # Exception, not BaseException: a transport wall or a refused
+            # completion is this pass's business to report, while a
+            # KeyboardInterrupt is the operator's instruction to stop now and
+            # must not be turned into a summary line.
+            halt.set()
+            return QuestionExtraction(
+                question_id=spec.question_id,
+                error=error,
+                message=(
+                    f"  [{position}/{total}] {spec.question_id} "
+                    f"({spec.split}): FAILED, {error!r}"
+                ),
+            )
+
+    def drain(results: Iterable[QuestionExtraction]) -> list[QuestionExtraction]:
+        """Report and collect in pinned question order, as results arrive."""
+        collected: list[QuestionExtraction] = []
+        for outcome in results:
+            if outcome.error is not None:
+                failures[outcome.question_id] = outcome.error
+            if outcome.message:
+                progress(outcome.message)
+            collected.append(outcome)
+        return collected
+
+    numbered = list(enumerate(specs, 1))
+    if workers == 1:
+        # A generator, so a question runs, reports, and only then does the next
+        # one begin — the pinned pass's own rhythm, on the caller's thread.
+        outcomes = drain(run(item) for item in numbered)
+    else:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="extract"
+        ) as pool:
+            # ``map`` yields in submission order, which is pinned question order,
+            # so the merge is the iteration and no sorting is needed.
+            outcomes = drain(pool.map(run, numbered))
+
+    if failures:
+        raise QuestionExtractionError(failures) from next(iter(failures.values()))
+    return outcomes
+
+
 def extract_only(
     cfg: RealRunConfig,
     *,
@@ -2954,56 +3240,27 @@ def extract_only(
 
     cache = ExtractionCache(cfg.out_dir / EXTRACTIONS_NAME)
     client = client_factory(chat_pin)
-    calls = 0
+
+    outcomes = extract_questions(
+        specs,
+        cache=cache,
+        client=client,
+        pin=chat_pin.pin,
+        # This mode exists to measure what extraction costs, so its rows carry
+        # what each call cost — beside the four fields a replay reads, never
+        # inside them.
+        instrument=True,
+        workers=cfg.extract_workers,
+        progress=progress,
+    )
+
+    calls = sum(outcome.calls for outcome in outcomes)
     # Two different numbers, because a partly-cached question replays sessions it
     # does not re-extract: the replay is what keeps the priming vocabulary right,
     # and counting it as extraction would report a cost the run never paid.
-    sessions_processed = 0
-    sessions_extracted = 0
-    questions_skipped = 0
-
-    for position, spec in enumerate(specs, 1):
-        # A question is skipped only when EVERY one of its sessions is already
-        # memoised. A partially-extracted question is replayed from its first
-        # session, because the priming vocabulary for a pending session is
-        # derived from the ones before it — resuming into the middle would prime
-        # it from nothing and send a prompt the original run never sent.
-        pending = [
-            session
-            for session in spec.sessions
-            if cache.get(spec.question_id, session.id) is None
-        ]
-        if not pending:
-            questions_skipped += 1
-            progress(
-                f"  [{position}/{len(specs)}] {spec.question_id} ({spec.split}): "
-                f"{len(spec.sessions)} session(s) already cached, skipped"
-            )
-            continue
-
-        extractor = RealExtractor(
-            client=client,
-            linker=SharedLinker(spec.question_id),
-            cache=cache,
-            question_id=spec.question_id,
-            instrument=True,
-        )
-        for session in spec.sessions:
-            # Counted from what the extractor actually did rather than from the
-            # `pending` list above: `pending` is the miss set as it looked before
-            # the question ran, and a session the pass itself has just memoised
-            # is no longer a session it has to pay for.
-            before = extractor.calls
-            extractor(session, pin=chat_pin.pin)
-            sessions_processed += 1
-            if extractor.calls != before:
-                sessions_extracted += 1
-
-        calls += extractor.calls
-        progress(
-            f"  [{position}/{len(specs)}] {spec.question_id} ({spec.split}): "
-            f"{len(spec.sessions)} sessions, {extractor.calls} extraction call(s)"
-        )
+    sessions_processed = sum(outcome.sessions_processed for outcome in outcomes)
+    sessions_extracted = sum(outcome.sessions_extracted for outcome in outcomes)
+    questions_skipped = sum(1 for outcome in outcomes if outcome.skipped)
 
     # This pass's own slice, appended rather than stamped over the header: the
     # header belongs to whichever pass minted the record (see the note above the
@@ -3135,6 +3392,38 @@ def execute(
     dropped = repair_jsonl(cfg.out_dir / EXTRACTIONS_NAME)
     if dropped:
         progress(f"repaired {EXTRACTIONS_NAME}: dropped {dropped} torn byte(s)")
+
+    if cfg.extract_workers > 1:
+        # Extraction is the one stage of a graded run that can be widened, and
+        # the answering phase below cannot be the place to widen it: it walks a
+        # question's arms through ONE shared linker whose lineage state is built
+        # in ingestion order, so its questions are not independent of each other
+        # in the way extraction's are. So the cache is warmed first, up to
+        # `extract_workers` questions at a time, and the pass below then finds
+        # every session memoised and makes no extraction call at all — replaying
+        # from the memo exactly as a resumed run always has.
+        #
+        # Only above 1. At the default this branch does not run, and the graded
+        # run is the interleaved, strictly serial pass it has always been, down
+        # to the order its extraction calls are made in.
+        #
+        # `instrument` stays off, as it is in the answering phase: these rows are
+        # a shared input to three arms, so they carry the four fields a replay
+        # reads and nothing else, and are byte-identical to the ones the serial
+        # path writes.
+        progress(
+            f"pre-extracting {len(specs)} questions, "
+            f"{cfg.extract_workers} at a time"
+        )
+        extract_questions(
+            specs,
+            cache=ExtractionCache(cfg.out_dir / EXTRACTIONS_NAME),
+            client=client_factory(chat_pins["extractor"]),
+            pin=pins["extractor"],
+            instrument=False,
+            workers=cfg.extract_workers,
+            progress=progress,
+        )
 
     progress(f"answering {len(specs)} questions x {len(ARM_STORES)} arms")
     phase = load_answer_phase(cfg.out_dir)

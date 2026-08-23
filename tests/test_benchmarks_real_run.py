@@ -29,11 +29,14 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
+import time
 import types
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import pytest
 
@@ -2493,6 +2496,153 @@ def test_repairing_a_clean_file_changes_nothing(tmp_path: Path) -> None:
     assert real_run.repair_jsonl(tmp_path / "absent.jsonl") == 0
 
 
+# --------------------------------------------------------------------------- #
+# The durable writer and the extraction memo, under many threads at once       #
+# --------------------------------------------------------------------------- #
+
+# Enough threads that the OS actually has to interleave them, and enough rows
+# each that a missing lock loses the race rather than merely being able to.
+_HAMMER_THREADS = 8
+_HAMMER_ROWS = 40
+_HAMMER_TOTAL = _HAMMER_THREADS * _HAMMER_ROWS
+
+# Long enough to cross the buffered writer's boundary, and non-ASCII so a spliced
+# row is a broken UTF-8 sequence as well as broken JSON — which is the shape the
+# torn-tail tolerance above exists for, and the shape it must never see here.
+_HAMMER_FILLER = "中文" * 200
+
+
+def _run_hammer(work: Callable[[int], None]) -> None:
+    """Run ``work(worker)`` on :data:`_HAMMER_THREADS` threads, released together.
+
+    The barrier is the point: threads started in a loop tend to finish in the
+    order they were started, which is exactly the schedule a missing lock
+    survives. Releasing them at once is what makes the append window overlap.
+    """
+    barrier = threading.Barrier(_HAMMER_THREADS)
+    errors: list[BaseException] = []
+
+    def entry(worker: int) -> None:
+        try:
+            barrier.wait(timeout=60)
+            work(worker)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+            errors.append(exc)
+            barrier.abort()
+
+    threads = [
+        threading.Thread(target=entry, args=(worker,), name=f"hammer-{worker}")
+        for worker in range(_HAMMER_THREADS)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=180)
+
+    stuck = [thread.name for thread in threads if thread.is_alive()]
+    assert not stuck, f"worker(s) never finished: {stuck}"
+    assert not errors, f"worker(s) raised: {errors!r}"
+
+
+@pytest.mark.unit
+def test_concurrent_appends_never_tear_or_interleave_a_row(tmp_path: Path) -> None:
+    """Every row arrives whole, exactly once, and the tear path never opens.
+
+    A per-question extraction scheduler has many threads appending to one cache
+    file. Without serialisation two appends can interleave inside one line, and
+    the result is not a *torn* row the repair path can drop — it is a spliced row
+    in the middle of the file, which :func:`real_run.read_jsonl` correctly refuses
+    forever. So the assertion is not "mostly fine": it is that the file is
+    byte-for-byte what a serial writer would have produced, modulo row order.
+    """
+    path = tmp_path / "rows.jsonl"
+    writer = real_run.JsonlWriter(path)
+
+    def hammer(worker: int) -> None:
+        for index in range(_HAMMER_ROWS):
+            writer.append(
+                {
+                    "id": f"w{worker}-r{index}",
+                    # The id restated inside the payload: a row assembled from
+                    # two writers' bytes can still parse, and would still carry
+                    # one id. It cannot also carry a payload that agrees with it.
+                    "payload": f"{worker}:{index}:{_HAMMER_FILLER}",
+                }
+            )
+
+    _run_hammer(hammer)
+
+    raw = path.read_bytes()
+    # Decoded as strict UTF-8 over the whole file: a splice inside a multi-byte
+    # character fails here, before any per-line parse gets a chance to be lenient.
+    lines = raw.decode("utf-8").splitlines()
+    assert len(lines) == _HAMMER_TOTAL
+
+    rows = [json.loads(line) for line in lines]
+    ids = [row["id"] for row in rows]
+    assert sorted(ids) == sorted(
+        f"w{worker}-r{index}"
+        for worker in range(_HAMMER_THREADS)
+        for index in range(_HAMMER_ROWS)
+    )
+    for row in rows:
+        worker, index, filler = row["payload"].split(":", 2)
+        assert row["id"] == f"w{worker}-r{index}"
+        assert filler == _HAMMER_FILLER
+
+    # The torn-tail path was never entered: nothing to repair, and a writer
+    # reopening the file finds no residue to truncate.
+    assert real_run.repair_jsonl(path) == 0
+    assert real_run.JsonlWriter(path).repaired_bytes == 0
+    # And a reader after the fact sees every row the writers returned from.
+    assert real_run.read_jsonl(path) == rows
+
+
+@pytest.mark.unit
+def test_the_extraction_memo_is_consistent_under_concurrent_puts(
+    tmp_path: Path,
+) -> None:
+    """The in-memory index and the file agree, whichever thread wrote which row.
+
+    ``put`` updates a dict *and* appends a durable row. Concurrent callers must
+    not be able to observe those two halves out of step — a row on disk that the
+    memo does not know about would be re-extracted (paid for twice), and a memo
+    entry with no row behind it would vanish on the next resume.
+    """
+    path = tmp_path / real_run.EXTRACTIONS_NAME
+    cache = real_run.ExtractionCache(path)
+
+    def claims(worker: int, index: int) -> list[dict[str, str]]:
+        return [
+            {
+                "text": f"worker {worker} session {index} says {_HAMMER_FILLER}",
+                "subject": f"w{worker} s{index}",
+                "value": str(index),
+            }
+        ]
+
+    def hammer(worker: int) -> None:
+        for index in range(_HAMMER_ROWS):
+            cache.put(f"q{worker}", f"s{index}", claims(worker, index))
+            # Read-after-write, from the writing thread, while others are mid-put.
+            assert cache.get(f"q{worker}", f"s{index}") == claims(worker, index)
+
+    _run_hammer(hammer)
+
+    assert len(cache) == _HAMMER_TOTAL
+    assert real_run.repair_jsonl(path) == 0
+
+    # Reopened from the file alone: every row is there, under the right key, with
+    # the claims its writer put — which is what a resume actually depends on.
+    reopened = real_run.ExtractionCache(path)
+    assert len(reopened) == _HAMMER_TOTAL
+    for worker in range(_HAMMER_THREADS):
+        for index in range(_HAMMER_ROWS):
+            expected = claims(worker, index)
+            assert cache.get(f"q{worker}", f"s{index}") == expected
+            assert reopened.get(f"q{worker}", f"s{index}") == expected
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize("verdict", ["INCORRECT", "CORRECT", None, 1, 0, "", "false"])
 def test_a_non_bool_verdict_is_never_coerced(verdict: Any) -> None:
@@ -4698,6 +4848,627 @@ def test_a_pass_that_died_before_its_first_row_does_not_pin_the_directory(
     assert json.loads(sidecar.read_text(encoding="utf-8")) == real_run.extraction_identity(
         json.loads((cfg.out_dir / real_run.MANIFEST_NAME).read_text(encoding="utf-8"))
     )
+
+
+# --------------------------------------------------------------------------- #
+# The extraction scheduler: questions concurrently, sessions never             #
+# --------------------------------------------------------------------------- #
+
+# Wider than the shared fixture, which has four questions of two sessions and
+# reuses one session's text — fine for the linker, useless here, where a prompt
+# has to say which question sent it. Six questions of three sessions leaves room
+# for four workers to be visibly busy and for a failure to have neighbours.
+_SCHED_QUESTIONS = 6
+_SCHED_SESSIONS = 3
+
+# Long enough that four workers overlap on any machine that can run threads at
+# all, short enough that the whole section stays under a second of dwell.
+_SCHED_HOLD = 0.05
+
+
+def _scheduler_corpus(tmp_path: Path) -> tuple[Path, Path]:
+    """A corpus wide enough to schedule, with every session's text unique."""
+    records = []
+    for question in range(_SCHED_QUESTIONS):
+        sessions = [
+            (
+                f"s{index}",
+                f"2023-0{index + 1}-05T09:00:00Z",
+                [f"question {question} session {index} value is q{question}v{index}"],
+            )
+            for index in range(_SCHED_SESSIONS)
+        ]
+        records.append(
+            {
+                "question_id": f"sched-{question}",
+                "question_type": "knowledge-update",
+                "question": f"What is question {question}'s value?",
+                "answer": f"q{question}v{_SCHED_SESSIONS - 1}",
+                "question_date": "2023-10-01",
+                "answer_session_ids": [sid for sid, _, _ in sessions],
+                "haystack_session_ids": [sid for sid, _, _ in sessions],
+                "haystack_dates": [date for _, date, _ in sessions],
+                "haystack_sessions": [
+                    [{"role": "user", "content": line} for line in lines]
+                    for _, _, lines in sessions
+                ],
+            }
+        )
+
+    # exist_ok: a test that compares two worker counts builds the same corpus
+    # twice, and it must be the SAME corpus or the comparison means nothing.
+    directory = tmp_path / "sched-data"
+    directory.mkdir(exist_ok=True)
+    body = json.dumps(records, ensure_ascii=False)
+    (directory / corpus.ORACLE_FILENAME).write_text(body, encoding="utf-8")
+    (directory / corpus.S_CLEANED_FILENAME).write_text(body, encoding="utf-8")
+
+    split = tmp_path / "sched-split.json"
+    split.write_text(
+        json.dumps(
+            {
+                "seed": corpus.SEED,
+                "question_ids": {
+                    "ku": [f"sched-{q}" for q in range(_SCHED_QUESTIONS)],
+                    "ms": [],
+                    "adversarial": [],
+                },
+                "source_sha256": {corpus.ORACLE_FILENAME: "0" * 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return directory, split
+
+
+def _pinned_sessions(cfg: Any) -> list[tuple[str, int, str]]:
+    """``(question_id, position, session text)`` for every session, in pinned order.
+
+    Derived from the loader the pass itself uses rather than restated, so the
+    expected order cannot drift from the order under test.
+    """
+    specs = real_run.load_questions(
+        split=cfg.split,
+        limit=cfg.limit,
+        haystack=cfg.haystack,
+        data_directory=cfg.directory(),
+        split_manifest=real_run.load_split(cfg.split_manifest_path),
+    )
+    return [
+        (spec.question_id, index, session.text)
+        for spec in specs
+        for index, session in enumerate(spec.sessions)
+    ]
+
+
+class SchedulerProbe(FakeChat):
+    """A FakeChat that dwells inside every extraction call and times it.
+
+    ``extract_only`` builds exactly ONE client and hands it to every worker, so
+    this is also the check that a shared client survives concurrent calls.
+    """
+
+    def __init__(self, pin: Any, *, fail_on: str = "") -> None:
+        super().__init__(pin)
+        self.fail_on = fail_on
+        self.calls: list[dict[str, Any]] = []
+        self.live = 0
+        self.peak = 0
+        self._lock = threading.Lock()
+
+    def chat(self, messages: Sequence[dict]) -> str:
+        if not messages[0]["content"].startswith(
+            clients.EXTRACT_STRUCTURED_SYSTEM_PROMPT
+        ):
+            return super().chat(messages)
+        session = _unfence("SESSION", messages[1]["content"])
+        entered = time.perf_counter()
+        with self._lock:
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+        try:
+            time.sleep(_SCHED_HOLD)
+            if self.fail_on and self.fail_on in session:
+                raise RuntimeError("simulated endpoint failure")
+            return super().chat(messages)
+        finally:
+            with self._lock:
+                self.live -= 1
+                self.calls.append(
+                    {
+                        "session": session,
+                        "entered": entered,
+                        "exited": time.perf_counter(),
+                    }
+                )
+
+
+def _probe_factory(created: list[SchedulerProbe], *, fail_on: str = ""):
+    def factory(pin: Any) -> SchedulerProbe:
+        probe = SchedulerProbe(pin, fail_on=fail_on)
+        created.append(probe)
+        return probe
+
+    return factory
+
+
+def _sched_config(tmp_path: Path, name: str, workers: int) -> Any:
+    directory, split = _scheduler_corpus(tmp_path)
+    return _config(
+        tmp_path,
+        directory,
+        split,
+        out_dir=tmp_path / name,
+        extract_workers=workers,
+    )
+
+
+def _calls_by_question(
+    cfg: Any, probes: Sequence[SchedulerProbe]
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Every extraction call in start order, and grouped by the question it served."""
+    index = {text: (question_id, position) for question_id, position, text in _pinned_sessions(cfg)}
+    calls = sorted(
+        (dict(call) for probe in probes for call in probe.calls),
+        key=lambda call: call["entered"],
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for call in calls:
+        question_id, position = index[call["session"]]
+        call["question_id"] = question_id
+        call["position"] = position
+        grouped.setdefault(question_id, []).append(call)
+    return calls, grouped
+
+
+@pytest.mark.integration
+def test_one_worker_sends_exactly_the_pinned_serial_call_sequence(
+    tmp_path: Path,
+) -> None:
+    """The default is the pass this module has always performed.
+
+    Not "equivalent": the same sessions, in the same order, one at a time. The
+    graded run's own serial path is compared against separately by
+    ``test_extract_only_sends_the_prompts_the_graded_run_sends``; this pins the
+    order against the loader instead, so a scheduler that reordered *both* paths
+    identically would still be caught.
+    """
+    cfg = _sched_config(tmp_path, "one", 1)
+    probes: list[SchedulerProbe] = []
+    real_run.extract_only(cfg, client_factory=_probe_factory(probes))
+
+    calls, _ = _calls_by_question(cfg, probes)
+    assert [call["session"] for call in calls] == [
+        text for _, _, text in _pinned_sessions(cfg)
+    ]
+    # Nothing was ever in flight beside anything else.
+    assert [probe.peak for probe in probes] == [1]
+
+
+@pytest.mark.integration
+def test_four_workers_keep_every_question_serial_while_overlapping_questions(
+    tmp_path: Path,
+) -> None:
+    """The whole invariant, in one run: serial within, concurrent across.
+
+    Vocabulary priming makes session k's prompt a function of the sessions before
+    it *in the same question*, so two sessions of one question overlapping would
+    not be a slow test — it would be a prompt the pinned run never sends. Across
+    questions there is no such dependency, and if none of them ever overlapped the
+    flag would be buying nothing.
+    """
+    cfg = _sched_config(tmp_path, "four", 4)
+    probes: list[SchedulerProbe] = []
+    real_run.extract_only(cfg, client_factory=_probe_factory(probes))
+
+    calls, grouped = _calls_by_question(cfg, probes)
+    assert len(calls) == _SCHED_QUESTIONS * _SCHED_SESSIONS
+    assert len(grouped) == _SCHED_QUESTIONS
+
+    for question_id, sequence in grouped.items():
+        # Sessions k = 0..K-1, in order, and each one returned before the next
+        # began — which is what "strictly serial" has to mean when the calls are
+        # concurrent with everything else.
+        assert [call["position"] for call in sequence] == list(range(_SCHED_SESSIONS))
+        for earlier, later in zip(sequence, sequence[1:]):
+            assert earlier["exited"] <= later["entered"], (
+                f"{question_id}: session {later['position']} began before session "
+                f"{earlier['position']} returned"
+            )
+
+    # And at least two questions really were in flight together — asserted twice,
+    # once on the intervals and once on a counter the probe keeps, because a test
+    # that silently degraded to a serial run would still pass everything above.
+    overlapping = [
+        (left["question_id"], right["question_id"])
+        for left in calls
+        for right in calls
+        if left["question_id"] != right["question_id"]
+        and left["entered"] < right["exited"]
+        and right["entered"] < left["exited"]
+    ]
+    assert overlapping, "no two questions were ever in flight at the same time"
+    assert max(probe.peak for probe in probes) >= 2
+
+
+@pytest.mark.integration
+def test_the_cache_is_the_same_set_of_rows_at_one_worker_and_at_four(
+    tmp_path: Path,
+) -> None:
+    """``--extract-workers`` changes the schedule and nothing a reader consumes.
+
+    Row ORDER in the file is deliberately not part of the contract — rows are
+    appended the moment they are durable, which is what makes an interrupted pass
+    resumable, and buffering them into pinned order would trade that away for a
+    log that looks tidier. Nothing reads the file positionally: the cache keys on
+    ``(question_id, session_id)`` and the priming vocabulary is derived from the
+    session walk, never from the file. So the contract is the SET, and this is it.
+    """
+    one = _sched_config(tmp_path, "one", 1)
+    four = _sched_config(tmp_path, "four", 4)
+    real_run.extract_only(one, client_factory=_probe_factory([]))
+    real_run.extract_only(four, client_factory=_probe_factory([]))
+
+    def keyed(cfg: Any) -> dict[tuple[str, str], dict]:
+        rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+        keyed_rows = {
+            (row["question_id"], row["session_id"]): _without_instrumentation(row)
+            for row in rows
+        }
+        # No duplicates: a key collapsing two rows would hide a difference.
+        assert len(keyed_rows) == len(rows) == _SCHED_QUESTIONS * _SCHED_SESSIONS
+        return keyed_rows
+
+    # Identical row for identical key — the instrumentation is wall-clock and is
+    # expected to differ, which is exactly why it is stripped and nothing else is.
+    assert keyed(four) == keyed(one)
+
+    # And the memo built from each file agrees claim for claim, which is what a
+    # later --real run actually replays.
+    memo_one = real_run.ExtractionCache(one.out_dir / real_run.EXTRACTIONS_NAME)
+    memo_four = real_run.ExtractionCache(four.out_dir / real_run.EXTRACTIONS_NAME)
+    assert len(memo_four) == len(memo_one) == _SCHED_QUESTIONS * _SCHED_SESSIONS
+    for question_id, _, _ in _pinned_sessions(one):
+        for index in range(_SCHED_SESSIONS):
+            session_id = f"{question_id}::s{index}"
+            assert memo_four.get(question_id, session_id) == memo_one.get(
+                question_id, session_id
+            )
+
+
+@pytest.mark.integration
+def test_a_failing_question_is_recorded_and_does_not_abort_the_others(
+    tmp_path: Path,
+) -> None:
+    """Drain, then raise: the failure is named, the neighbours keep their rows.
+
+    The policy is stated in ``QuestionExtractionError``: no question is *started*
+    after the first failure, and every question already running is allowed to
+    finish, because its rows are durable the moment they are written and cutting
+    it short would discard only the work it had not yet recorded.
+    """
+    cfg = _sched_config(tmp_path, "failing", 4)
+    probes: list[SchedulerProbe] = []
+    with pytest.raises(real_run.QuestionExtractionError) as raised:
+        real_run.extract_only(
+            cfg,
+            client_factory=_probe_factory(probes, fail_on="question 2 session 0"),
+        )
+
+    assert set(raised.value.failures) == {"sched-2"}
+    assert isinstance(raised.value.failures["sched-2"], RuntimeError)
+    # The message names the question and quotes what went wrong, because that is
+    # what an operator reading an overnight log has to act on.
+    assert "sched-2" in str(raised.value)
+    assert "simulated endpoint failure" in str(raised.value)
+
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+    written: dict[str, int] = {}
+    for row in rows:
+        written[row["question_id"]] = written.get(row["question_id"], 0) + 1
+
+    assert "sched-2" not in written, "the failing question memoised nothing"
+    # Its in-flight neighbours finished, and finished WHOLE: a question is either
+    # walked to its end or not started, never left half-extracted.
+    assert len(written) >= 2, "the failure took the other in-flight questions with it"
+    assert set(written.values()) == {_SCHED_SESSIONS}
+
+
+@pytest.mark.integration
+def test_at_one_worker_a_failure_stops_the_pass_exactly_where_it_always_did(
+    tmp_path: Path,
+) -> None:
+    """Nothing is in flight beside the failure, so nothing after it is attempted.
+
+    The old behaviour, deterministically: questions before the failure are done,
+    the failing one wrote nothing, and the ones after it were never begun.
+    """
+    cfg = _sched_config(tmp_path, "failing-serial", 1)
+    with pytest.raises(real_run.QuestionExtractionError) as raised:
+        real_run.extract_only(
+            cfg, client_factory=_probe_factory([], fail_on="question 2 session 0")
+        )
+
+    assert set(raised.value.failures) == {"sched-2"}
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+    assert {row["question_id"] for row in rows} == {"sched-0", "sched-1"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("workers", [1, 4])
+def test_a_resume_skips_cached_questions_at_any_worker_count(
+    tmp_path: Path, workers: int
+) -> None:
+    """Resume is a property of the cache, not of the schedule."""
+    cfg = _sched_config(tmp_path, f"resume-{workers}", workers)
+    real_run.extract_only(cfg, client_factory=_probe_factory([]))
+
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    before = path.read_bytes()
+
+    probes: list[SchedulerProbe] = []
+    summary = real_run.extract_only(cfg, client_factory=_probe_factory(probes))
+
+    assert summary["extraction_calls"] == 0
+    assert summary["questions_skipped"] == summary["questions"] == _SCHED_QUESTIONS
+    assert summary["sessions_processed"] == 0
+    assert sum(len(probe.calls) for probe in probes) == 0
+    # Byte-unchanged: the resume appended nothing at all, at either width.
+    assert path.read_bytes() == before
+
+
+@pytest.mark.integration
+def test_a_partly_cached_question_is_still_replayed_from_its_first_session(
+    tmp_path: Path,
+) -> None:
+    """Concurrency must not weaken the positional-priming rule it runs beside."""
+    cfg = _sched_config(tmp_path, "partial", 4)
+    real_run.extract_only(cfg, client_factory=_probe_factory([]))
+
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    rows = real_run.read_jsonl(path)
+    kept = [row for row in rows if not (row["question_id"] == "sched-3" and row["session_id"].endswith("::s2"))]
+    _rewrite(path, kept)
+
+    probes: list[SchedulerProbe] = []
+    summary = real_run.extract_only(cfg, client_factory=_probe_factory(probes))
+
+    assert summary["questions_skipped"] == _SCHED_QUESTIONS - 1
+    assert summary["sessions_extracted"] == 1
+    # All three of that question's sessions were walked; only the missing one was
+    # paid for. Replaying the earlier two is what keeps the third one's prompt the
+    # prompt the interrupted pass would have sent.
+    assert summary["sessions_processed"] == _SCHED_SESSIONS
+    calls, grouped = _calls_by_question(cfg, probes)
+    assert len(calls) == 1
+    assert grouped["sched-3"][0]["position"] == _SCHED_SESSIONS - 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("workers", [0, -1])
+def test_a_worker_count_below_one_is_refused(tmp_path: Path, workers: int) -> None:
+    """A pass that extracts no questions at once is not slower, it is no pass."""
+    cache = real_run.ExtractionCache(tmp_path / real_run.EXTRACTIONS_NAME)
+    with pytest.raises(ValueError, match="at least 1"):
+        real_run.extract_questions(
+            [], cache=cache, client=None, pin=_PIN, workers=workers
+        )
+
+
+# --------------------------------------------------------------------------- #
+# --extract-workers: the flag, the manifest record, and the graded run          #
+# --------------------------------------------------------------------------- #
+
+
+def _timeless_answer(row: Mapping[str, Any]) -> dict:
+    """An answer row without the two fields that measure the wall clock."""
+    return {
+        key: value
+        for key, value in row.items()
+        if key not in {"retrieve_ms", "answered_at"}
+    }
+
+
+def _manifest(cfg: Any, name: str = real_run.MANIFEST_NAME) -> dict:
+    return json.loads((cfg.out_dir / name).read_text(encoding="utf-8"))
+
+
+@pytest.mark.unit
+def test_the_extract_workers_flag_is_documented_with_its_default(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A flag an operator cannot discover is a flag that will not be used."""
+    with pytest.raises(SystemExit) as raised:
+        run_mod.main(["--help"])
+    assert raised.value.code == 0
+
+    # Whitespace-normalised: argparse re-wraps help text to the terminal width,
+    # so the assertion must not depend on where the lines happen to break.
+    out = " ".join(capsys.readouterr().out.split())
+    assert "--extract-workers" in out
+    assert f"(default: {real_run.DEFAULT_EXTRACT_WORKERS};" in out
+    # And it says what it does NOT parallelise, which is the part that matters.
+    assert "Sessions inside a question stay strictly serial" in out
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["--extract-only", "--real"])
+@pytest.mark.parametrize("workers", ["0", "-2"])
+def test_a_worker_count_below_one_is_refused_at_the_command_line(
+    mode: str, workers: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Told at the command line, before a corpus is loaded or a gate is run."""
+    with pytest.raises(SystemExit) as raised:
+        run_mod.main([mode, "--haystack", "oracle", "--extract-workers", workers])
+    assert raised.value.code == 2
+    assert "--extract-workers must be at least 1" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("workers", [1, 3, 8])
+def test_the_command_line_carries_the_worker_count_into_both_modes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workers: int
+) -> None:
+    """The flag reaches the config both modes are built from, not just argparse."""
+    captured: list[Any] = []
+
+    def spy_extract(cfg: Any, **_kwargs: Any) -> dict:
+        captured.append(cfg)
+        return {
+            "extractions_path": "-",
+            "manifest_path": "-",
+            "questions": 0,
+            "questions_skipped": 0,
+            "extraction_calls": 0,
+            "sessions_extracted": 0,
+            "sessions_processed": 0,
+            "cache_rows": 0,
+        }
+
+    def spy_execute(cfg: Any, **_kwargs: Any) -> dict:
+        captured.append(cfg)
+        return {
+            "counts": {},
+            "linker": {},
+            "m1": None,
+            "m2": {"f1": 0.0},
+            "m3": None,
+            "m4": {"p95_ms": 0.0},
+            "m5": {"gate_verdict": "-"},
+            "ag": None,
+        }
+
+    monkeypatch.setattr(real_run, "extract_only", spy_extract)
+    monkeypatch.setattr(real_run, "execute", spy_execute)
+
+    common = [
+        "--haystack",
+        "oracle",
+        "--out-dir",
+        str(tmp_path / "out"),
+        "--extract-workers",
+        str(workers),
+    ]
+    assert run_mod.main(["--extract-only", *common]) == 0
+    assert run_mod.main(["--real", *common]) == 0
+
+    assert [cfg.extract_workers for cfg in captured] == [workers, workers]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("workers", [1, 3])
+def test_the_extraction_pass_is_green_offline_at_one_and_at_three(
+    tmp_path: Path, corpus_dir: Path, split_path: Path, workers: int
+) -> None:
+    """The smoke the flag actually needs: a whole pass, offline, at each width."""
+    cfg = _config(
+        tmp_path,
+        corpus_dir,
+        split_path,
+        out_dir=tmp_path / f"smoke-{workers}",
+        extract_workers=workers,
+    )
+    created: list[FakeChat] = []
+    summary = real_run.extract_only(cfg, client_factory=_factory(created))
+
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+    assert summary["questions"] == len(_QUESTIONS)
+    assert summary["questions_skipped"] == 0
+    assert summary["extraction_calls"] == len(rows)
+    assert summary["sessions_extracted"] == summary["sessions_processed"] == len(rows)
+    assert summary["cache_rows"] == len(rows)
+    # The width is recorded in the pass's own manifest too, not only the graded
+    # run's -- an extraction pass is the thing whose cost the width changed.
+    assert _manifest(cfg, real_run.EXTRACT_MANIFEST_NAME)["extract_workers"] == workers
+
+
+@pytest.mark.integration
+def test_a_graded_run_at_three_workers_is_the_run_it_is_at_one(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """``--real`` gains the width without gaining a different measurement.
+
+    Above one worker the graded run warms the cache first, ``extract_workers``
+    questions at a time, and the answering phase then finds every session
+    memoised. That phase is NOT where the width could have gone: it walks a
+    question's arms through one shared linker whose lineage state is built in
+    ingestion order, so its questions are not independent of each other in the
+    way extraction's are.
+    """
+    serial = _config(
+        tmp_path, corpus_dir, split_path, out_dir=tmp_path / "serial", extract_workers=1
+    )
+    wide = _config(
+        tmp_path, corpus_dir, split_path, out_dir=tmp_path / "wide", extract_workers=3
+    )
+    real_run.execute(serial, client_factory=_factory([]), judge_client=FakeJudge())
+
+    created: list[FakeChat] = []
+    real_run.execute(wide, client_factory=_factory(created), judge_client=FakeJudge())
+
+    def rows(cfg: Any, name: str) -> list[dict]:
+        return real_run.read_jsonl(cfg.out_dir / name)
+
+    extractions = rows(wide, real_run.EXTRACTIONS_NAME)
+    assert extractions, "the wide run extracted nothing to compare"
+
+    # Byte-identical rows, not merely equivalent ones: instrumentation is off on
+    # the graded path at BOTH widths, so there is nothing to strip and nothing
+    # that may differ.
+    def keyed(cfg: Any) -> dict[tuple[str, str], dict]:
+        return {
+            (row["question_id"], row["session_id"]): row
+            for row in rows(cfg, real_run.EXTRACTIONS_NAME)
+        }
+
+    assert keyed(wide) == keyed(serial)
+
+    # Every extraction call was made by the pre-pass; the answering phase's own
+    # extractor made none, because it found the whole cache warm.
+    assert created, "no client was built"
+    calls = [client.extract_calls for client in created]
+    assert sum(calls) == len(extractions)
+    assert calls[0] == sum(calls), "the answering phase re-extracted something"
+
+    # And everything downstream of extraction is the same run.
+    assert rows(wide, real_run.CLAIMS_NAME) == rows(serial, real_run.CLAIMS_NAME)
+    assert [_timeless_answer(row) for row in rows(wide, real_run.ANSWERS_NAME)] == [
+        _timeless_answer(row) for row in rows(serial, real_run.ANSWERS_NAME)
+    ]
+
+
+@pytest.mark.integration
+def test_the_manifest_records_the_width_without_making_it_a_resume_key(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Recorded so a reader knows how the run was performed; not an identity key.
+
+    A pass that extracted eight questions at a time produces the rows a
+    one-at-a-time pass produces, so making the width a resume key would throw
+    away paid extraction over a scheduling decision — the same over-coupling
+    ``extraction_identity`` already drops ``top_k`` and ``limit`` to avoid.
+    """
+    narrow = _config(
+        tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared", extract_workers=1
+    )
+    real_run.extract_only(narrow, client_factory=_factory([]))
+    before = (narrow.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    record = _manifest(narrow, real_run.EXTRACT_MANIFEST_NAME)
+    assert record["extract_workers"] == 1
+    assert "extract_workers" not in real_run.extraction_identity(record)
+    assert "extract_workers" not in real_run.manifest_identity(record)
+
+    # The proof that follows from it: the same directory resumes at a different
+    # width, refuses nothing, and appends nothing.
+    widened = replace(narrow, extract_workers=4)
+    resumed: list[FakeChat] = []
+    summary = real_run.extract_only(widened, client_factory=_factory(resumed))
+
+    assert summary["extraction_calls"] == 0
+    assert summary["questions_skipped"] == summary["questions"] == len(_QUESTIONS)
+    assert sum(client.extract_calls for client in resumed) == 0
+    assert (narrow.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
 
 
 @pytest.mark.unit

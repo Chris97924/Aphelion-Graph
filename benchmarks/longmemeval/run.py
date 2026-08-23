@@ -938,6 +938,21 @@ def _add_real_run_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--extract-workers",
+        type=int,
+        default=real_run.DEFAULT_EXTRACT_WORKERS,
+        help=(
+            "how many QUESTIONS the extraction stage has in flight at once "
+            f"(default: {real_run.DEFAULT_EXTRACT_WORKERS}; recorded in the run "
+            "manifest). Sessions inside a question stay strictly serial - each "
+            "one's prompt is primed by the vocabulary its predecessors minted - "
+            "so this parallelises only across questions, which share nothing. "
+            "The rows produced are the same set at any value; only the wall "
+            "clock and the order they land in the file change. Applies to "
+            "--extract-only and to --real"
+        ),
+    )
+    parser.add_argument(
         "--judge-prompt-via",
         choices=clients.PROMPT_VIA_CHOICES,
         default=clients.PROMPT_VIA_STDIN,
@@ -1011,11 +1026,30 @@ def _require_haystack(
         )
 
 
+def _require_extract_workers(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Refuse a worker count that cannot describe a pass.
+
+    Checked here rather than only in :func:`real_run.extract_questions` so the
+    operator is told at the command line, before the corpus is loaded and the
+    manifest gates run — a mistyped flag should cost a line of output, not a
+    traceback several seconds into a run that was never going to start.
+    """
+    if args.extract_workers < 1:
+        parser.error(
+            f"--extract-workers must be at least 1, got {args.extract_workers}: "
+            "the flag chooses how many QUESTIONS are extracted at once, and a "
+            "pass that extracts none of them is not a slower pass, it is no pass"
+        )
+
+
 def _run_extract_only(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Run the shared extraction stage alone and report what it cost."""
     from benchmarks.longmemeval import real_run
 
     _require_haystack(parser, args, "--extract-only")
+    _require_extract_workers(parser, args)
 
     config = real_run.RealRunConfig(
         out_dir=args.out_dir,
@@ -1024,6 +1058,7 @@ def _run_extract_only(parser: argparse.ArgumentParser, args: argparse.Namespace)
         haystack=args.haystack,
         data_dir=args.data_dir,
         top_k=args.top_k,
+        extract_workers=args.extract_workers,
     )
     summary = real_run.extract_only(config, progress=print)
 
@@ -1047,6 +1082,7 @@ def _run_real(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     from benchmarks.longmemeval import real_run
 
     _require_haystack(parser, args, "--real")
+    _require_extract_workers(parser, args)
 
     config = real_run.RealRunConfig(
         out_dir=args.out_dir,
@@ -1055,6 +1091,7 @@ def _run_real(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         haystack=args.haystack,
         data_dir=args.data_dir,
         top_k=args.top_k,
+        extract_workers=args.extract_workers,
         m3_labels=args.m3_labels,
         m3_labels_deviation_ack=args.m3_labels_deviation_ack,
         judge_prompt_via=args.judge_prompt_via,

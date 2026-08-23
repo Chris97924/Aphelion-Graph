@@ -202,3 +202,64 @@ pre-priming cache is discarded, never migrated.
 Cost: session reuse across questions is negligible — 10,417 (question, session)
 pairs against 9,454 unique sessions, 1.1x — so per-question scoping costs roughly
 10% more extraction calls than session-only caching would. Priced and accepted.
+
+---
+
+## 8. Extraction width (`--extract-workers`, 2026-08-24)
+
+Extraction is one model call per session and the calls are slow — §5 records ~30
+s for a long evidence session — but the dependency that makes them *sequential*
+exists only inside a question. §7's priming makes session *k*'s prompt a function
+of the sessions before it in the same question, so those can never overlap; two
+different questions share nothing but the durable cache. `--extract-workers N`
+takes exactly that asymmetry and nothing else: **sessions inside a question stay
+strictly serial, whole questions run concurrently, up to N at a time.** What N
+may change is the schedule and the wall clock; what it may not change is the
+measurement, so the rows the cache ends up holding are the same set at any N,
+each produced by the prompt the serial pass would have sent. Row *order within
+the file* is deliberately not part of the contract — rows are appended the moment
+they are durable, which is what makes an interrupted pass resumable, and nothing
+reads the file positionally: the cache keys on `(question, session)` and the
+priming vocabulary is derived from the session walk. The value a run used is
+recorded in its manifest as `extract_workers`, and it is **not** a resume key in
+either mode: it appears in neither `_IDENTITY_FIELDS`, the projection a graded
+`--real` resume must match, nor `extraction_identity`, the one that guards the
+cache. So a pass that ran four questions wide may be resumed one question wide
+and the reverse, because neither produced a row the other would not have. Do not
+read that across to the fields recorded beside it. `top_k` and `limit` are
+likewise absent from `extraction_identity` — which is what lets a narrow pilot
+extraction be topped up by a wider pass rather than thrown away — but both *are*
+in `_IDENTITY_FIELDS`, so changing either between graded `--real` passes over one
+`--out-dir` is refused with `RunManifestMismatchError`. `--real` takes the width
+flag too; above 1 it warms the cache before the graded phase, which then finds
+every session cached and replays it exactly as a resumed run always has. At the
+default of 1 no pool is built at all and both modes are the strictly serial pass
+they have always been.
+
+**Merging this widening does, however, retire every extraction cache written
+before it — the mechanism working rather than a regression.** Adding the flag
+edits `real_run.py` and `run.py`, both inside `_EXTRACTION_HARNESS_ROOTS`
+(`benchmarks/longmemeval/` itself), so `extraction_harness_sha256` moves, and
+that digest is a field of `extraction_identity`; the wide `harness_sha256` spans
+the same directory, so `_IDENTITY_FIELDS` shifts with it. An `--out-dir` filled
+by pre-merge code is therefore refused at whichever gate it reaches first:
+`check_manifest` raises `RunManifestMismatchError` against the manifest an
+earlier pass left, and `reconcile_extraction_identity` raises
+`ExtractionIdentityMismatchError` against rows whose identity record disagrees —
+the refusal §7's pre-priming caches get, through the same record. No flag waives
+either check, and the ways forward are the ones those errors themselves name: run
+against a **new `--out-dir`**, which always works and leaves the paid rows where
+they are, replayable by the revision that wrote them; or **re-run with the
+recorded settings**, which for a harness digest means the revision of
+`benchmarks/longmemeval/` that record was written under. Deleting
+`extractions.jsonl` is admitted too — with no rows left there is nothing to
+misattribute, so a disagreeing identity record is replaced rather than enforced —
+but it does not clear the manifest gate by itself, and it re-pays every
+extraction call. No path carries a pre-merge cache across at half price.
+
+**This buys nothing against a server that will not serve it.** The reference
+launch recorded in §5 carries `--max-num-seqs 1`, which admits one sequence at a
+time: against that configuration N concurrent questions simply queue at the
+endpoint and the pass takes as long as it always did. Raising N is worth doing
+only together with a serving configuration that admits concurrent sequences —
+and either way, the width that actually ran is on the record.
