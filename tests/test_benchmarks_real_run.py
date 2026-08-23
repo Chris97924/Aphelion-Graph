@@ -30,6 +30,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 import types
 import urllib.error
 import urllib.request
@@ -4846,6 +4847,411 @@ def test_a_pass_that_died_before_its_first_row_does_not_pin_the_directory(
     assert json.loads(sidecar.read_text(encoding="utf-8")) == real_run.extraction_identity(
         json.loads((cfg.out_dir / real_run.MANIFEST_NAME).read_text(encoding="utf-8"))
     )
+
+
+# --------------------------------------------------------------------------- #
+# The extraction scheduler: questions concurrently, sessions never             #
+# --------------------------------------------------------------------------- #
+
+# Wider than the shared fixture, which has four questions of two sessions and
+# reuses one session's text — fine for the linker, useless here, where a prompt
+# has to say which question sent it. Six questions of three sessions leaves room
+# for four workers to be visibly busy and for a failure to have neighbours.
+_SCHED_QUESTIONS = 6
+_SCHED_SESSIONS = 3
+
+# Long enough that four workers overlap on any machine that can run threads at
+# all, short enough that the whole section stays under a second of dwell.
+_SCHED_HOLD = 0.05
+
+
+def _scheduler_corpus(tmp_path: Path) -> tuple[Path, Path]:
+    """A corpus wide enough to schedule, with every session's text unique."""
+    records = []
+    for question in range(_SCHED_QUESTIONS):
+        sessions = [
+            (
+                f"s{index}",
+                f"2023-0{index + 1}-05T09:00:00Z",
+                [f"question {question} session {index} value is q{question}v{index}"],
+            )
+            for index in range(_SCHED_SESSIONS)
+        ]
+        records.append(
+            {
+                "question_id": f"sched-{question}",
+                "question_type": "knowledge-update",
+                "question": f"What is question {question}'s value?",
+                "answer": f"q{question}v{_SCHED_SESSIONS - 1}",
+                "question_date": "2023-10-01",
+                "answer_session_ids": [sid for sid, _, _ in sessions],
+                "haystack_session_ids": [sid for sid, _, _ in sessions],
+                "haystack_dates": [date for _, date, _ in sessions],
+                "haystack_sessions": [
+                    [{"role": "user", "content": line} for line in lines]
+                    for _, _, lines in sessions
+                ],
+            }
+        )
+
+    # exist_ok: a test that compares two worker counts builds the same corpus
+    # twice, and it must be the SAME corpus or the comparison means nothing.
+    directory = tmp_path / "sched-data"
+    directory.mkdir(exist_ok=True)
+    body = json.dumps(records, ensure_ascii=False)
+    (directory / corpus.ORACLE_FILENAME).write_text(body, encoding="utf-8")
+    (directory / corpus.S_CLEANED_FILENAME).write_text(body, encoding="utf-8")
+
+    split = tmp_path / "sched-split.json"
+    split.write_text(
+        json.dumps(
+            {
+                "seed": corpus.SEED,
+                "question_ids": {
+                    "ku": [f"sched-{q}" for q in range(_SCHED_QUESTIONS)],
+                    "ms": [],
+                    "adversarial": [],
+                },
+                "source_sha256": {corpus.ORACLE_FILENAME: "0" * 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return directory, split
+
+
+def _pinned_sessions(cfg: Any) -> list[tuple[str, int, str]]:
+    """``(question_id, position, session text)`` for every session, in pinned order.
+
+    Derived from the loader the pass itself uses rather than restated, so the
+    expected order cannot drift from the order under test.
+    """
+    specs = real_run.load_questions(
+        split=cfg.split,
+        limit=cfg.limit,
+        haystack=cfg.haystack,
+        data_directory=cfg.directory(),
+        split_manifest=real_run.load_split(cfg.split_manifest_path),
+    )
+    return [
+        (spec.question_id, index, session.text)
+        for spec in specs
+        for index, session in enumerate(spec.sessions)
+    ]
+
+
+class SchedulerProbe(FakeChat):
+    """A FakeChat that dwells inside every extraction call and times it.
+
+    ``extract_only`` builds exactly ONE client and hands it to every worker, so
+    this is also the check that a shared client survives concurrent calls.
+    """
+
+    def __init__(self, pin: Any, *, fail_on: str = "") -> None:
+        super().__init__(pin)
+        self.fail_on = fail_on
+        self.calls: list[dict[str, Any]] = []
+        self.live = 0
+        self.peak = 0
+        self._lock = threading.Lock()
+
+    def chat(self, messages: Sequence[dict]) -> str:
+        if not messages[0]["content"].startswith(
+            clients.EXTRACT_STRUCTURED_SYSTEM_PROMPT
+        ):
+            return super().chat(messages)
+        session = _unfence("SESSION", messages[1]["content"])
+        entered = time.perf_counter()
+        with self._lock:
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+        try:
+            time.sleep(_SCHED_HOLD)
+            if self.fail_on and self.fail_on in session:
+                raise RuntimeError("simulated endpoint failure")
+            return super().chat(messages)
+        finally:
+            with self._lock:
+                self.live -= 1
+                self.calls.append(
+                    {
+                        "session": session,
+                        "entered": entered,
+                        "exited": time.perf_counter(),
+                    }
+                )
+
+
+def _probe_factory(created: list[SchedulerProbe], *, fail_on: str = ""):
+    def factory(pin: Any) -> SchedulerProbe:
+        probe = SchedulerProbe(pin, fail_on=fail_on)
+        created.append(probe)
+        return probe
+
+    return factory
+
+
+def _sched_config(tmp_path: Path, name: str, workers: int) -> Any:
+    directory, split = _scheduler_corpus(tmp_path)
+    return _config(
+        tmp_path,
+        directory,
+        split,
+        out_dir=tmp_path / name,
+        extract_workers=workers,
+    )
+
+
+def _calls_by_question(
+    cfg: Any, probes: Sequence[SchedulerProbe]
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Every extraction call in start order, and grouped by the question it served."""
+    index = {text: (question_id, position) for question_id, position, text in _pinned_sessions(cfg)}
+    calls = sorted(
+        (dict(call) for probe in probes for call in probe.calls),
+        key=lambda call: call["entered"],
+    )
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for call in calls:
+        question_id, position = index[call["session"]]
+        call["question_id"] = question_id
+        call["position"] = position
+        grouped.setdefault(question_id, []).append(call)
+    return calls, grouped
+
+
+@pytest.mark.integration
+def test_one_worker_sends_exactly_the_pinned_serial_call_sequence(
+    tmp_path: Path,
+) -> None:
+    """The default is the pass this module has always performed.
+
+    Not "equivalent": the same sessions, in the same order, one at a time. The
+    graded run's own serial path is compared against separately by
+    ``test_extract_only_sends_the_prompts_the_graded_run_sends``; this pins the
+    order against the loader instead, so a scheduler that reordered *both* paths
+    identically would still be caught.
+    """
+    cfg = _sched_config(tmp_path, "one", 1)
+    probes: list[SchedulerProbe] = []
+    real_run.extract_only(cfg, client_factory=_probe_factory(probes))
+
+    calls, _ = _calls_by_question(cfg, probes)
+    assert [call["session"] for call in calls] == [
+        text for _, _, text in _pinned_sessions(cfg)
+    ]
+    # Nothing was ever in flight beside anything else.
+    assert [probe.peak for probe in probes] == [1]
+
+
+@pytest.mark.integration
+def test_four_workers_keep_every_question_serial_while_overlapping_questions(
+    tmp_path: Path,
+) -> None:
+    """The whole invariant, in one run: serial within, concurrent across.
+
+    Vocabulary priming makes session k's prompt a function of the sessions before
+    it *in the same question*, so two sessions of one question overlapping would
+    not be a slow test — it would be a prompt the pinned run never sends. Across
+    questions there is no such dependency, and if none of them ever overlapped the
+    flag would be buying nothing.
+    """
+    cfg = _sched_config(tmp_path, "four", 4)
+    probes: list[SchedulerProbe] = []
+    real_run.extract_only(cfg, client_factory=_probe_factory(probes))
+
+    calls, grouped = _calls_by_question(cfg, probes)
+    assert len(calls) == _SCHED_QUESTIONS * _SCHED_SESSIONS
+    assert len(grouped) == _SCHED_QUESTIONS
+
+    for question_id, sequence in grouped.items():
+        # Sessions k = 0..K-1, in order, and each one returned before the next
+        # began — which is what "strictly serial" has to mean when the calls are
+        # concurrent with everything else.
+        assert [call["position"] for call in sequence] == list(range(_SCHED_SESSIONS))
+        for earlier, later in zip(sequence, sequence[1:]):
+            assert earlier["exited"] <= later["entered"], (
+                f"{question_id}: session {later['position']} began before session "
+                f"{earlier['position']} returned"
+            )
+
+    # And at least two questions really were in flight together — asserted twice,
+    # once on the intervals and once on a counter the probe keeps, because a test
+    # that silently degraded to a serial run would still pass everything above.
+    overlapping = [
+        (left["question_id"], right["question_id"])
+        for left in calls
+        for right in calls
+        if left["question_id"] != right["question_id"]
+        and left["entered"] < right["exited"]
+        and right["entered"] < left["exited"]
+    ]
+    assert overlapping, "no two questions were ever in flight at the same time"
+    assert max(probe.peak for probe in probes) >= 2
+
+
+@pytest.mark.integration
+def test_the_cache_is_the_same_set_of_rows_at_one_worker_and_at_four(
+    tmp_path: Path,
+) -> None:
+    """``--extract-workers`` changes the schedule and nothing a reader consumes.
+
+    Row ORDER in the file is deliberately not part of the contract — rows are
+    appended the moment they are durable, which is what makes an interrupted pass
+    resumable, and buffering them into pinned order would trade that away for a
+    log that looks tidier. Nothing reads the file positionally: the cache keys on
+    ``(question_id, session_id)`` and the priming vocabulary is derived from the
+    session walk, never from the file. So the contract is the SET, and this is it.
+    """
+    one = _sched_config(tmp_path, "one", 1)
+    four = _sched_config(tmp_path, "four", 4)
+    real_run.extract_only(one, client_factory=_probe_factory([]))
+    real_run.extract_only(four, client_factory=_probe_factory([]))
+
+    def keyed(cfg: Any) -> dict[tuple[str, str], dict]:
+        rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+        keyed_rows = {
+            (row["question_id"], row["session_id"]): _without_instrumentation(row)
+            for row in rows
+        }
+        # No duplicates: a key collapsing two rows would hide a difference.
+        assert len(keyed_rows) == len(rows) == _SCHED_QUESTIONS * _SCHED_SESSIONS
+        return keyed_rows
+
+    # Identical row for identical key — the instrumentation is wall-clock and is
+    # expected to differ, which is exactly why it is stripped and nothing else is.
+    assert keyed(four) == keyed(one)
+
+    # And the memo built from each file agrees claim for claim, which is what a
+    # later --real run actually replays.
+    memo_one = real_run.ExtractionCache(one.out_dir / real_run.EXTRACTIONS_NAME)
+    memo_four = real_run.ExtractionCache(four.out_dir / real_run.EXTRACTIONS_NAME)
+    assert len(memo_four) == len(memo_one) == _SCHED_QUESTIONS * _SCHED_SESSIONS
+    for question_id, _, _ in _pinned_sessions(one):
+        for index in range(_SCHED_SESSIONS):
+            session_id = f"{question_id}::s{index}"
+            assert memo_four.get(question_id, session_id) == memo_one.get(
+                question_id, session_id
+            )
+
+
+@pytest.mark.integration
+def test_a_failing_question_is_recorded_and_does_not_abort_the_others(
+    tmp_path: Path,
+) -> None:
+    """Drain, then raise: the failure is named, the neighbours keep their rows.
+
+    The policy is stated in ``QuestionExtractionError``: no question is *started*
+    after the first failure, and every question already running is allowed to
+    finish, because its rows are durable the moment they are written and cutting
+    it short would discard only the work it had not yet recorded.
+    """
+    cfg = _sched_config(tmp_path, "failing", 4)
+    probes: list[SchedulerProbe] = []
+    with pytest.raises(real_run.QuestionExtractionError) as raised:
+        real_run.extract_only(
+            cfg,
+            client_factory=_probe_factory(probes, fail_on="question 2 session 0"),
+        )
+
+    assert set(raised.value.failures) == {"sched-2"}
+    assert isinstance(raised.value.failures["sched-2"], RuntimeError)
+    # The message names the question and quotes what went wrong, because that is
+    # what an operator reading an overnight log has to act on.
+    assert "sched-2" in str(raised.value)
+    assert "simulated endpoint failure" in str(raised.value)
+
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+    written: dict[str, int] = {}
+    for row in rows:
+        written[row["question_id"]] = written.get(row["question_id"], 0) + 1
+
+    assert "sched-2" not in written, "the failing question memoised nothing"
+    # Its in-flight neighbours finished, and finished WHOLE: a question is either
+    # walked to its end or not started, never left half-extracted.
+    assert len(written) >= 2, "the failure took the other in-flight questions with it"
+    assert set(written.values()) == {_SCHED_SESSIONS}
+
+
+@pytest.mark.integration
+def test_at_one_worker_a_failure_stops_the_pass_exactly_where_it_always_did(
+    tmp_path: Path,
+) -> None:
+    """Nothing is in flight beside the failure, so nothing after it is attempted.
+
+    The old behaviour, deterministically: questions before the failure are done,
+    the failing one wrote nothing, and the ones after it were never begun.
+    """
+    cfg = _sched_config(tmp_path, "failing-serial", 1)
+    with pytest.raises(real_run.QuestionExtractionError) as raised:
+        real_run.extract_only(
+            cfg, client_factory=_probe_factory([], fail_on="question 2 session 0")
+        )
+
+    assert set(raised.value.failures) == {"sched-2"}
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+    assert {row["question_id"] for row in rows} == {"sched-0", "sched-1"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("workers", [1, 4])
+def test_a_resume_skips_cached_questions_at_any_worker_count(
+    tmp_path: Path, workers: int
+) -> None:
+    """Resume is a property of the cache, not of the schedule."""
+    cfg = _sched_config(tmp_path, f"resume-{workers}", workers)
+    real_run.extract_only(cfg, client_factory=_probe_factory([]))
+
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    before = path.read_bytes()
+
+    probes: list[SchedulerProbe] = []
+    summary = real_run.extract_only(cfg, client_factory=_probe_factory(probes))
+
+    assert summary["extraction_calls"] == 0
+    assert summary["questions_skipped"] == summary["questions"] == _SCHED_QUESTIONS
+    assert summary["sessions_processed"] == 0
+    assert sum(len(probe.calls) for probe in probes) == 0
+    # Byte-unchanged: the resume appended nothing at all, at either width.
+    assert path.read_bytes() == before
+
+
+@pytest.mark.integration
+def test_a_partly_cached_question_is_still_replayed_from_its_first_session(
+    tmp_path: Path,
+) -> None:
+    """Concurrency must not weaken the positional-priming rule it runs beside."""
+    cfg = _sched_config(tmp_path, "partial", 4)
+    real_run.extract_only(cfg, client_factory=_probe_factory([]))
+
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    rows = real_run.read_jsonl(path)
+    kept = [row for row in rows if not (row["question_id"] == "sched-3" and row["session_id"].endswith("::s2"))]
+    _rewrite(path, kept)
+
+    probes: list[SchedulerProbe] = []
+    summary = real_run.extract_only(cfg, client_factory=_probe_factory(probes))
+
+    assert summary["questions_skipped"] == _SCHED_QUESTIONS - 1
+    assert summary["sessions_extracted"] == 1
+    # All three of that question's sessions were walked; only the missing one was
+    # paid for. Replaying the earlier two is what keeps the third one's prompt the
+    # prompt the interrupted pass would have sent.
+    assert summary["sessions_processed"] == _SCHED_SESSIONS
+    calls, grouped = _calls_by_question(cfg, probes)
+    assert len(calls) == 1
+    assert grouped["sched-3"][0]["position"] == _SCHED_SESSIONS - 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("workers", [0, -1])
+def test_a_worker_count_below_one_is_refused(tmp_path: Path, workers: int) -> None:
+    """A pass that extracts no questions at once is not slower, it is no pass."""
+    cache = real_run.ExtractionCache(tmp_path / real_run.EXTRACTIONS_NAME)
+    with pytest.raises(ValueError, match="at least 1"):
+        real_run.extract_questions(
+            [], cache=cache, client=None, pin=_PIN, workers=workers
+        )
 
 
 @pytest.mark.unit
