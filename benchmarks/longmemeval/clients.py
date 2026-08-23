@@ -550,13 +550,27 @@ def chat_result(client: Any, messages: Sequence[Mapping[str, str]]) -> ChatResul
     no usage. Written as a free function so the extraction stage can be
     instrumented without every caller having to know which kind of client it
     holds.
+
+    A client that *has* ``chat_detailed`` and returns something else is a broken
+    client, and is reported as one. Coercing the value with ``str()`` would turn
+    a dict or a raw HTTP response into its own repr, which reaches the extractor
+    as unparseable model output and raises :class:`ExtractionFormatError` — a
+    diagnosis about the model, aimed at whoever is bringing up a new client for a
+    fault in their own return statement. Failing loud rather than salvaging is
+    this module's rule (see :class:`ExtractionFormatError`), and it applies to
+    the client contract too.
     """
     detailed = getattr(client, "chat_detailed", None)
     if callable(detailed):
         result = detailed(messages)
-        if isinstance(result, ChatResult):
-            return result
-        return ChatResult(text=str(result))
+        if not isinstance(result, ChatResult):
+            raise TypeError(
+                f"{type(client).__name__}.chat_detailed returned "
+                f"{type(result).__name__}, not a ChatResult. A client that "
+                "implements chat_detailed must return one — text plus optional "
+                "usage — or implement only chat and let usage go unreported."
+            )
+        return result
     return ChatResult(text=client.chat(messages))
 
 

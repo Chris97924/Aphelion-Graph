@@ -4813,3 +4813,27 @@ def test_a_client_without_usage_support_still_extracts() -> None:
     result = clients.chat_result(PlainChat(), [{"role": "user", "content": "hi"}])
     assert result.text == "plain"
     assert result.usage is None
+
+
+@pytest.mark.unit
+def test_a_client_that_breaks_the_chat_detailed_contract_says_so() -> None:
+    """A wrong return type is a client bug, and must be reported as one.
+
+    Coercing it with ``str()`` turned a dict or a raw HTTP response into its own
+    repr, which then surfaced downstream as an ``ExtractionFormatError`` about
+    unparseable model output — sending whoever is bringing up a new client to
+    read prompts and completions for a fault in their own return statement. This
+    module's policy is to fail loud rather than salvage.
+    """
+
+    class DictChat:
+        def chat_detailed(self, messages: Sequence[Mapping[str, str]]) -> dict:
+            return {"text": "not a ChatResult"}
+
+    with pytest.raises(TypeError) as excinfo:
+        clients.chat_result(DictChat(), [{"role": "user", "content": "hi"}])
+
+    message = str(excinfo.value)
+    assert "DictChat" in message, "the failing client is not named"
+    assert "dict" in message, "the type it actually returned is not named"
+    assert "ChatResult" in message
