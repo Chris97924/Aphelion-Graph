@@ -34,9 +34,11 @@ the record of what a bump would carry.
   chosen split/limit/haystack, filling `extractions.jsonl` with the rows the
   graded run would write, so the extractor can be paid for and measured before
   the graded run starts. It answers nothing and judges nothing, writes its own
-  provenance record (`extract-manifest.json`) so a later `--real` run in the
-  same directory resumes cleanly, and annotates each fresh cache row with the
-  call's wall time and the endpoint's token counts where reported.
+  provenance record (`extract-manifest.json`, whose `resumes` list names the
+  slice each later pass extracted) plus the cache's own identity record
+  (`extractions-identity.json` — see Compatibility below) so a later `--real`
+  run in the same directory resumes cleanly, and annotates each fresh cache row
+  with the call's wall time and the endpoint's token counts where reported.
 - **Canonical serialization layer in `scripts/external_reader.py`** — the
   stdlib-only reader grew a second, fully independent implementation of
   canonical JSON, NFC, `claims[].hash` recomputation and POSIX ustar framing.
@@ -102,6 +104,28 @@ the record of what a bump would carry.
   `U+FFFF` key. A package whose manifest carries such a key hashes differently
   than it did before this change. `spec/content-hash.md` records the rule as
   Rule 0.
+- **Benchmark run directories created before this branch are refused on their
+  next `--real` resume.** The extraction cache now carries its own provenance
+  record, `extractions-identity.json`, written beside `extractions.jsonl` and
+  naming the extractor pin and model config, the haystack, the split, the corpus
+  directory and the digests of the corpus, the split manifest and
+  `benchmarks/longmemeval/`. Both `--real` and `--extract-only` reconcile against
+  it before reading or appending a row, and rows with **no** record are refused
+  rather than adopted: nothing says which extractor, corpus or harness revision
+  produced them, and writing this pass's identity over them would mint an
+  attestation for bytes it never produced. Every output directory created before
+  this change holds `extractions.jsonl` and no sidecar, so it hits exactly that
+  refusal and raises `ExtractionIdentityMismatchError`.
+
+  **There is no supported way to attest such a cache after the fact, and a fresh
+  `--out-dir` is required.** The record's `extraction_harness_sha256` is a digest
+  over the harness source *as it was when the rows were written*, which this
+  branch has changed and which no older run recorded — so even a hand-written
+  sidecar could not honestly reproduce it, and one carrying today's digest would
+  attest to code that did not produce those rows. The refusal message names the
+  manual restore path for the one operator who can independently vouch for a
+  cache's provenance; it is an escape hatch, not a migration. Extraction work
+  already paid for under a pre-branch revision has to be re-extracted.
 - The benchmark harness is additive and imports nothing into the shipped
   package; `src/aphelion/` is untouched by it.
 
