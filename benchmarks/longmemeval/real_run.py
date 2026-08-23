@@ -978,6 +978,15 @@ def build_manifest(
         "split": cfg.split,
         "limit": cfg.limit,
         "top_k": cfg.top_k,
+        # How wide the extraction stage ran. Recorded because it is part of how
+        # the run was performed and an operator reading the record months later
+        # should not have to guess — and deliberately NOT part of
+        # :data:`_IDENTITY_FIELDS` or :func:`extraction_identity`, because it
+        # cannot change a row. A pass that extracted eight questions at a time
+        # produces rows a one-at-a-time pass would produce, so refusing to resume
+        # across a change of width would throw away paid work for a scheduling
+        # decision.
+        "extract_workers": cfg.extract_workers,
         "seed": pinned_seed(cfg.preregister_path),
         "query_time": PINNED_QUERY_TIME.isoformat(),
         "retriever_params": dict(retriever_params),
@@ -3379,6 +3388,38 @@ def execute(
     dropped = repair_jsonl(cfg.out_dir / EXTRACTIONS_NAME)
     if dropped:
         progress(f"repaired {EXTRACTIONS_NAME}: dropped {dropped} torn byte(s)")
+
+    if cfg.extract_workers > 1:
+        # Extraction is the one stage of a graded run that can be widened, and
+        # the answering phase below cannot be the place to widen it: it walks a
+        # question's arms through ONE shared linker whose lineage state is built
+        # in ingestion order, so its questions are not independent of each other
+        # in the way extraction's are. So the cache is warmed first, up to
+        # `extract_workers` questions at a time, and the pass below then finds
+        # every session memoised and makes no extraction call at all — replaying
+        # from the memo exactly as a resumed run always has.
+        #
+        # Only above 1. At the default this branch does not run, and the graded
+        # run is the interleaved, strictly serial pass it has always been, down
+        # to the order its extraction calls are made in.
+        #
+        # `instrument` stays off, as it is in the answering phase: these rows are
+        # a shared input to three arms, so they carry the four fields a replay
+        # reads and nothing else, and are byte-identical to the ones the serial
+        # path writes.
+        progress(
+            f"pre-extracting {len(specs)} questions, "
+            f"{cfg.extract_workers} at a time"
+        )
+        extract_questions(
+            specs,
+            cache=ExtractionCache(cfg.out_dir / EXTRACTIONS_NAME),
+            client=client_factory(chat_pins["extractor"]),
+            pin=pins["extractor"],
+            instrument=False,
+            workers=cfg.extract_workers,
+            progress=progress,
+        )
 
     progress(f"answering {len(specs)} questions x {len(ARM_STORES)} arms")
     phase = load_answer_phase(cfg.out_dir)

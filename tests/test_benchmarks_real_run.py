@@ -34,6 +34,7 @@ import time
 import types
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -5252,6 +5253,222 @@ def test_a_worker_count_below_one_is_refused(tmp_path: Path, workers: int) -> No
         real_run.extract_questions(
             [], cache=cache, client=None, pin=_PIN, workers=workers
         )
+
+
+# --------------------------------------------------------------------------- #
+# --extract-workers: the flag, the manifest record, and the graded run          #
+# --------------------------------------------------------------------------- #
+
+
+def _timeless_answer(row: Mapping[str, Any]) -> dict:
+    """An answer row without the two fields that measure the wall clock."""
+    return {
+        key: value
+        for key, value in row.items()
+        if key not in {"retrieve_ms", "answered_at"}
+    }
+
+
+def _manifest(cfg: Any, name: str = real_run.MANIFEST_NAME) -> dict:
+    return json.loads((cfg.out_dir / name).read_text(encoding="utf-8"))
+
+
+@pytest.mark.unit
+def test_the_extract_workers_flag_is_documented_with_its_default(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A flag an operator cannot discover is a flag that will not be used."""
+    with pytest.raises(SystemExit) as raised:
+        run_mod.main(["--help"])
+    assert raised.value.code == 0
+
+    # Whitespace-normalised: argparse re-wraps help text to the terminal width,
+    # so the assertion must not depend on where the lines happen to break.
+    out = " ".join(capsys.readouterr().out.split())
+    assert "--extract-workers" in out
+    assert f"(default: {real_run.DEFAULT_EXTRACT_WORKERS};" in out
+    # And it says what it does NOT parallelise, which is the part that matters.
+    assert "Sessions inside a question stay strictly serial" in out
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["--extract-only", "--real"])
+@pytest.mark.parametrize("workers", ["0", "-2"])
+def test_a_worker_count_below_one_is_refused_at_the_command_line(
+    mode: str, workers: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Told at the command line, before a corpus is loaded or a gate is run."""
+    with pytest.raises(SystemExit) as raised:
+        run_mod.main([mode, "--haystack", "oracle", "--extract-workers", workers])
+    assert raised.value.code == 2
+    assert "--extract-workers must be at least 1" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("workers", [1, 3, 8])
+def test_the_command_line_carries_the_worker_count_into_both_modes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workers: int
+) -> None:
+    """The flag reaches the config both modes are built from, not just argparse."""
+    captured: list[Any] = []
+
+    def spy_extract(cfg: Any, **_kwargs: Any) -> dict:
+        captured.append(cfg)
+        return {
+            "extractions_path": "-",
+            "manifest_path": "-",
+            "questions": 0,
+            "questions_skipped": 0,
+            "extraction_calls": 0,
+            "sessions_extracted": 0,
+            "sessions_processed": 0,
+            "cache_rows": 0,
+        }
+
+    def spy_execute(cfg: Any, **_kwargs: Any) -> dict:
+        captured.append(cfg)
+        return {
+            "counts": {},
+            "linker": {},
+            "m1": None,
+            "m2": {"f1": 0.0},
+            "m3": None,
+            "m4": {"p95_ms": 0.0},
+            "m5": {"gate_verdict": "-"},
+            "ag": None,
+        }
+
+    monkeypatch.setattr(real_run, "extract_only", spy_extract)
+    monkeypatch.setattr(real_run, "execute", spy_execute)
+
+    common = [
+        "--haystack",
+        "oracle",
+        "--out-dir",
+        str(tmp_path / "out"),
+        "--extract-workers",
+        str(workers),
+    ]
+    assert run_mod.main(["--extract-only", *common]) == 0
+    assert run_mod.main(["--real", *common]) == 0
+
+    assert [cfg.extract_workers for cfg in captured] == [workers, workers]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("workers", [1, 3])
+def test_the_extraction_pass_is_green_offline_at_one_and_at_three(
+    tmp_path: Path, corpus_dir: Path, split_path: Path, workers: int
+) -> None:
+    """The smoke the flag actually needs: a whole pass, offline, at each width."""
+    cfg = _config(
+        tmp_path,
+        corpus_dir,
+        split_path,
+        out_dir=tmp_path / f"smoke-{workers}",
+        extract_workers=workers,
+    )
+    created: list[FakeChat] = []
+    summary = real_run.extract_only(cfg, client_factory=_factory(created))
+
+    rows = real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME)
+    assert summary["questions"] == len(_QUESTIONS)
+    assert summary["questions_skipped"] == 0
+    assert summary["extraction_calls"] == len(rows)
+    assert summary["sessions_extracted"] == summary["sessions_processed"] == len(rows)
+    assert summary["cache_rows"] == len(rows)
+    # The width is recorded in the pass's own manifest too, not only the graded
+    # run's -- an extraction pass is the thing whose cost the width changed.
+    assert _manifest(cfg, real_run.EXTRACT_MANIFEST_NAME)["extract_workers"] == workers
+
+
+@pytest.mark.integration
+def test_a_graded_run_at_three_workers_is_the_run_it_is_at_one(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """``--real`` gains the width without gaining a different measurement.
+
+    Above one worker the graded run warms the cache first, ``extract_workers``
+    questions at a time, and the answering phase then finds every session
+    memoised. That phase is NOT where the width could have gone: it walks a
+    question's arms through one shared linker whose lineage state is built in
+    ingestion order, so its questions are not independent of each other in the
+    way extraction's are.
+    """
+    serial = _config(
+        tmp_path, corpus_dir, split_path, out_dir=tmp_path / "serial", extract_workers=1
+    )
+    wide = _config(
+        tmp_path, corpus_dir, split_path, out_dir=tmp_path / "wide", extract_workers=3
+    )
+    real_run.execute(serial, client_factory=_factory([]), judge_client=FakeJudge())
+
+    created: list[FakeChat] = []
+    real_run.execute(wide, client_factory=_factory(created), judge_client=FakeJudge())
+
+    def rows(cfg: Any, name: str) -> list[dict]:
+        return real_run.read_jsonl(cfg.out_dir / name)
+
+    extractions = rows(wide, real_run.EXTRACTIONS_NAME)
+    assert extractions, "the wide run extracted nothing to compare"
+
+    # Byte-identical rows, not merely equivalent ones: instrumentation is off on
+    # the graded path at BOTH widths, so there is nothing to strip and nothing
+    # that may differ.
+    def keyed(cfg: Any) -> dict[tuple[str, str], dict]:
+        return {
+            (row["question_id"], row["session_id"]): row
+            for row in rows(cfg, real_run.EXTRACTIONS_NAME)
+        }
+
+    assert keyed(wide) == keyed(serial)
+
+    # Every extraction call was made by the pre-pass; the answering phase's own
+    # extractor made none, because it found the whole cache warm.
+    assert created, "no client was built"
+    calls = [client.extract_calls for client in created]
+    assert sum(calls) == len(extractions)
+    assert calls[0] == sum(calls), "the answering phase re-extracted something"
+
+    # And everything downstream of extraction is the same run.
+    assert rows(wide, real_run.CLAIMS_NAME) == rows(serial, real_run.CLAIMS_NAME)
+    assert [_timeless_answer(row) for row in rows(wide, real_run.ANSWERS_NAME)] == [
+        _timeless_answer(row) for row in rows(serial, real_run.ANSWERS_NAME)
+    ]
+
+
+@pytest.mark.integration
+def test_the_manifest_records_the_width_without_making_it_a_resume_key(
+    tmp_path: Path, corpus_dir: Path, split_path: Path
+) -> None:
+    """Recorded so a reader knows how the run was performed; not an identity key.
+
+    A pass that extracted eight questions at a time produces the rows a
+    one-at-a-time pass produces, so making the width a resume key would throw
+    away paid extraction over a scheduling decision — the same over-coupling
+    ``extraction_identity`` already drops ``top_k`` and ``limit`` to avoid.
+    """
+    narrow = _config(
+        tmp_path, corpus_dir, split_path, out_dir=tmp_path / "shared", extract_workers=1
+    )
+    real_run.extract_only(narrow, client_factory=_factory([]))
+    before = (narrow.out_dir / real_run.EXTRACTIONS_NAME).read_bytes()
+
+    record = _manifest(narrow, real_run.EXTRACT_MANIFEST_NAME)
+    assert record["extract_workers"] == 1
+    assert "extract_workers" not in real_run.extraction_identity(record)
+    assert "extract_workers" not in real_run.manifest_identity(record)
+
+    # The proof that follows from it: the same directory resumes at a different
+    # width, refuses nothing, and appends nothing.
+    widened = replace(narrow, extract_workers=4)
+    resumed: list[FakeChat] = []
+    summary = real_run.extract_only(widened, client_factory=_factory(resumed))
+
+    assert summary["extraction_calls"] == 0
+    assert summary["questions_skipped"] == summary["questions"] == len(_QUESTIONS)
+    assert sum(client.extract_calls for client in resumed) == 0
+    assert (narrow.out_dir / real_run.EXTRACTIONS_NAME).read_bytes() == before
 
 
 @pytest.mark.unit
