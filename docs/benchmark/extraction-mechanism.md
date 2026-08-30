@@ -323,10 +323,21 @@ error is fatal in every consumer — `extract_questions` halts the pass on it an
 ends the run, with no cooldown to recover into. The status is still retried,
 exactly as it always was; only what it is taken as *evidence of* has narrowed.
 
-The bound that leaves, stated rather than designed around: a gateway that
-answers 504 slowly is counted as reachable, so a wedge hidden behind a proxy that
-eventually replies is not something this acts on — though that reply did come
-back, so it is not the stall being guarded either.
+The bound that leaves is general, and is stated rather than designed around: the
+circuit keys on **whether** an answer came, never on how long it took. So an
+endpoint that answers an error status *slowly* is unguarded — no proxy or gateway
+is required for this, an overloaded model server returning 503 straight down the
+wire is the whole of it. Measured: five requests at three attempts against an
+endpoint that always answers 503 send all fifteen attempts and never open the
+circuit; had each cost the full timeout, that is precisely the
+`attempts x timeout` stall this section set out to remove.
+
+It is left open on purpose, because both ways to close it are worse. Counting
+error statuses as unreachability is the defect the classification above exists to
+fix, and it ends a run over an over-long prompt. Giving the circuit a *time*
+dimension — so that a slow answer counts differently from a fast one — is a
+second mechanism with its own tuning, and belongs to a later change rather than
+bolted onto this one.
 
 The presumption is provisional, because the alternative is worse than the stall:
 an endpoint written off for the rest of an overnight run over one bad minute.

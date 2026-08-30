@@ -5357,6 +5357,58 @@ def test_ctrl_c_leaves_a_resumable_cache_at_one_worker(tmp_path: Path) -> None:
     assert summary["cache_rows"] == _SCHED_QUESTIONS * _SCHED_SESSIONS
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("shape", ["ignored", "non-raising"])
+def test_a_second_ctrl_c_terminates_even_where_the_first_handler_would_not(
+    shape: str,
+) -> None:
+    """The deferral holds the FIRST Ctrl-C. It must never hold the second.
+
+    Holding one is the whole point; holding both would be worse than never
+    deferring at all, because the operator would be waiting out the question in
+    flight with no way to cut it short — up to ``attempts x timeout`` per session
+    at the pinned settings, and nothing on the keyboard to stop it.
+
+    That is what restoring the *previous* handler on the way in got wrong. It is
+    right in the ordinary case, where the previous handler is the interpreter's
+    own and raises. It is exactly wrong in the two cases where it matters: a
+    parent that set ``SIG_IGN`` (nohup and friends) or a supervisor whose handler
+    records and returns. Restoring either of those means the second press runs
+    something that does not stop anything.
+
+    So the deferral hands the second press to ``default_int_handler`` rather than
+    to whatever was there before — while the context manager's own exit still
+    puts the genuine original back, which is a separate job and still done.
+    """
+    swallowed: list[int] = []
+    handler: Any = (
+        signal.SIG_IGN
+        if shape == "ignored"
+        else lambda signum, _frame: swallowed.append(signum)
+    )
+    outer = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, handler)
+    try:
+        halt, interrupted = threading.Event(), threading.Event()
+        with real_run._interrupt_at_question_boundary(halt, interrupted):
+            # First press: held, and recorded rather than raised.
+            signal.raise_signal(signal.SIGINT)
+            assert interrupted.is_set() and halt.is_set()
+            assert not swallowed, "the deferral never took the signal over"
+
+            # Second press: terminates. Under the old restore this raised
+            # nothing at all — SIG_IGN dropped it, the recorder swallowed it.
+            with pytest.raises(KeyboardInterrupt):
+                signal.raise_signal(signal.SIGINT)
+            assert not swallowed, "the second press ran the handler that cannot stop"
+
+        # And the genuine original is back, which is the exit's job, not the
+        # signal handler's — the two were conflated, and that was the defect.
+        assert signal.getsignal(signal.SIGINT) is handler
+    finally:
+        signal.signal(signal.SIGINT, outer)
+
+
 @pytest.mark.integration
 def test_a_failure_names_the_questions_it_never_started(tmp_path: Path) -> None:
     """``started`` is what the error's claim is made of, not prose beside it.

@@ -512,10 +512,21 @@ class EndpointCircuit:
     ``answer_questions`` does not catch it at all), so there is no cooldown to
     recover into.
 
-    The bound that leaves: a gateway that answers 504 *slowly* is still counted
-    as reachable, so a wedge hidden behind a proxy that eventually replies is not
-    something this acts on. It is also not the stall it guards — that reply came
-    back — and no evidence of such a proxy exists in this harness's path.
+    The bound that leaves is general, and worth stating plainly rather than as a
+    corner case: this keys on *whether* an answer came, never on how long it took
+    to come. So an endpoint that answers an error status **slowly** is unguarded
+    — no proxy or gateway required, an overloaded model server returning 503
+    straight down the wire is the whole of it. Measured: five requests at three
+    attempts against an endpoint that always answers 503 send all fifteen
+    attempts and never open the circuit, and had each cost the full timeout that
+    is precisely the ``attempts x timeout`` stall this exists to remove.
+
+    Left unguarded on purpose, because the two ways to close it are both worse.
+    Counting error statuses as unreachability is the bug this classification was
+    written to fix — it ends a run over an over-long prompt. Adding a *time*
+    dimension, so that a slow answer counts differently from a fast one, is a
+    second mechanism with its own tuning, and is a candidate for later rather
+    than something to bolt on here.
 
     One circuit belongs to one client. That covers the extraction stage, which
     shares exactly one client across its workers (``extract_only`` builds one and

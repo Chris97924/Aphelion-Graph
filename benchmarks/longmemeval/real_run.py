@@ -3086,9 +3086,16 @@ def _interrupt_at_question_boundary(
     the run done and strictly less of it to redo.
 
     So SIGINT sets the same ``halt`` a failure sets — submission stops at once —
-    and the exception is raised by the caller after the drain. A **second**
-    Ctrl-C restores the interpreter's own handler on the way in, because an
-    operator pressing it twice is no longer asking to stop tidily.
+    and the exception is raised by the caller after the drain. The **second**
+    Ctrl-C is handed to :func:`signal.default_int_handler`, because an operator
+    pressing it twice is no longer asking to stop tidily. Deliberately the
+    interpreter's own handler rather than whichever one was in force on the way
+    in: holding the first press is the point, and holding the second would be
+    worse than never deferring at all — a parent that set ``SIG_IGN``, or a
+    supervisor whose handler records and returns, would leave the operator
+    waiting out the question in flight with nothing on the keyboard to cut it
+    short. Restoring what was there before is the block's exit, below, and is a
+    separate job.
 
     Outside the main thread there is nothing to install: CPython delivers SIGINT
     to the main thread only, so a pass being driven from a worker thread cannot
@@ -3107,7 +3114,14 @@ def _interrupt_at_question_boundary(
     if installed:
 
         def _stop(_signum: int, _frame: Any) -> None:
-            signal.signal(signal.SIGINT, previous)
+            # The interpreter's own handler, NOT whatever was here before.
+            # Putting `previous` back is the exit's job and is still done there;
+            # doing it here as well conflated two things and got the second press
+            # wrong wherever the previous handler does not raise. A parent that
+            # set SIG_IGN, or a supervisor whose handler records and returns,
+            # would have swallowed it — leaving the operator waiting out the
+            # question in flight with nothing on the keyboard to cut it short.
+            signal.signal(signal.SIGINT, signal.default_int_handler)
             interrupted.set()
             halt.set()
 
