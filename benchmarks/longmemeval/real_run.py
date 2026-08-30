@@ -2951,6 +2951,10 @@ class QuestionExtractionError(RuntimeError):
     question, so this is precisely the old behaviour — the pass stops at the
     first failure, having attempted nothing after it — carrying a name that says
     which question it was.
+
+    ``not_started`` names the questions that stop bought: the ones a re-run still
+    has to get through, read off each outcome's ``started`` flag rather than
+    asserted in the message beside them.
     """
 
     def __init__(
@@ -3092,9 +3096,13 @@ def _interrupt_at_question_boundary(
     """
     try:
         previous = signal.getsignal(signal.SIGINT)
-        installed = True
     except (AttributeError, ValueError):  # pragma: no cover - no SIGINT at all
-        installed = False
+        previous = None
+    # ``getsignal`` answers None when the handler was installed from C, and there
+    # is then nothing this could put back afterwards. Leaving it alone is the
+    # conservative reading: better to keep the old, blunt Ctrl-C than to take
+    # over a handler belonging to something that never agreed to give it up.
+    installed = previous is not None
 
     if installed:
 

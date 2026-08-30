@@ -5376,6 +5376,42 @@ def test_a_failure_names_the_questions_it_never_started(tmp_path: Path) -> None:
     assert "3 question(s) were never started" in str(raised.value)
 
 
+@pytest.mark.integration
+def test_never_started_is_the_flag_and_not_merely_an_empty_outcome(
+    tmp_path: Path,
+) -> None:
+    """A question that cost nothing is not the same as one that was skipped.
+
+    Both walk no sessions and make no calls, so anything derived from the counts
+    would conflate them — and the two mean opposite things to whoever reads the
+    error. A cached question is *done*; a never-started one is the work the
+    re-run still has in front of it. ``started`` is what tells them apart, and
+    this is the shape that proves it is what the list is read from.
+    """
+    cfg = _sched_config(tmp_path, "skipped-vs-unstarted", 1)
+    real_run.extract_only(cfg, client_factory=_probe_factory([]))
+
+    # Keep the first two questions cached; take the rest back out.
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    _rewrite(
+        path,
+        [
+            row
+            for row in real_run.read_jsonl(path)
+            if row["question_id"] in {"sched-0", "sched-1"}
+        ],
+    )
+
+    with pytest.raises(real_run.QuestionExtractionError) as raised:
+        real_run.extract_only(
+            cfg, client_factory=_probe_factory([], fail_on="question 3 session 0")
+        )
+
+    assert set(raised.value.failures) == {"sched-3"}
+    # sched-0 and sched-1 made no calls either, and are not in the list.
+    assert raised.value.not_started == ["sched-4", "sched-5"]
+
+
 # One round of attempts against a wedge is unavoidable — it is how the wedge is
 # discovered. What the endpoint must not get is a whole retry budget from every
 # question in flight, all of them paying the full timeout to learn the same
