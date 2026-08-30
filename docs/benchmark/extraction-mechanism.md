@@ -310,20 +310,37 @@ question, all of it after the answer was known.
 failures with no answer between them — however they were spread across whatever
 was in flight — and the endpoint is presumed wedged; requests then fail
 immediately, as `EndpointWedgedError`, a `LocalModelTransportError` like any
-other except in what it cost to produce. Only *reachability* counts: a server
-that answers with something this harness refuses is a server that is working
-(§6, `LocalModelResponseError`, deliberately never retried), and letting that
-trip the breaker would take a run down over a prompt.
+other except in what it cost to produce. What counts is the **absence of an
+answer**, which is narrower than failure: a server that answers with something
+this harness refuses is a server that is working (§6,
+`LocalModelResponseError`, deliberately never retried), and so is one that
+answers with a *status* — `HTTPError` is a `URLError` is an `OSError`, so a 400
+over an over-long prompt and a 503 from a model still loading reach the retry
+loop beside a refused connection, and are the opposite evidence. Both are
+recorded reachable, and neither can open the circuit. That is not tidiness: the
+error is fatal in every consumer — `extract_questions` halts the pass on it and
+`answer_questions` does not catch it at all — so a breaker tripped over a prompt
+ends the run, with no cooldown to recover into. The status is still retried,
+exactly as it always was; only what it is taken as *evidence of* has narrowed.
+
+The bound that leaves, stated rather than designed around: a gateway that
+answers 504 slowly is counted as reachable, so a wedge hidden behind a proxy that
+eventually replies is not something this acts on — though that reply did come
+back, so it is not the stall being guarded either.
 
 The presumption is provisional, because the alternative is worse than the stall:
 an endpoint written off for the rest of an overnight run over one bad minute.
 After a cooldown exactly one request is let through as a probe — one, so a dead
 endpoint costs one timeout per window rather than one per request — and an answer
 closes the circuit. A probe that fails re-opens it and the window starts again.
-One circuit belongs to one client, which is what the extraction stage shares
-across its workers; two clients built separately over the same endpoint hold
-separate presumptions about it, which is a bound on the claim rather than a
-defect, since nothing here runs two of them at once.
+
+One circuit belongs to one client. That covers the extraction stage, which shares
+exactly one client across its workers. It does **not** make the presumption
+global, and the harness does hold two at once: `answer_questions` builds an
+extractor client and an answering client and keeps both live for the whole phase
+(`real_run.py:1546-1547`), and under the current pins both resolve to the same
+endpoint, so a wedge during answering is discovered twice rather than once.
+Bounded at 2x, on a phase this mechanism is not the guard for.
 
 ### What a stopped pass reports
 
@@ -333,6 +350,16 @@ caller could reach the outcomes, so the fact had nowhere to go.
 `QuestionExtractionError.not_started` is now made of it, and the interrupt path
 counts it — the questions a re-run still has to get through, read off the
 outcomes rather than asserted in prose beside them.
+
+Two halves that do not travel together, so it is worth being exact about which
+is which. The **boundary** holds at every width. The **naming** is the serial
+path's: at `N = 1` the interrupt is raised by `extract_questions` itself, after
+the drain, carrying the count of questions never started and preceded by a
+progress line saying so. Above 1 the exception is the pool's own — it escapes
+`drain()` before that raise is reached, so it arrives bare, with no message and
+no list, and what was not started has to be read off the cache instead. The
+failure path names them at any width; only the interrupt is asymmetric, and only
+away from the default (`DEFAULT_EXTRACT_WORKERS = 1`).
 
 ### The cache this retires
 

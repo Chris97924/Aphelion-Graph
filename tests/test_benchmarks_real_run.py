@@ -5437,19 +5437,17 @@ class _WedgedEndpoint:
 
     def __init__(self, *, width: int = _WEDGE_WORKERS) -> None:
         self.width = width
-        self.calls: list[dict[str, float]] = []
+        self.calls: list[str] = []
         self._lock = threading.Lock()
         self._gathered = threading.Event()
 
     def __call__(self, url: str, payload: bytes, timeout: float) -> bytes:
-        record = {"entered": time.perf_counter()}
         with self._lock:
-            self.calls.append(record)
+            self.calls.append(url)
             if len(self.calls) >= self.width:
                 self._gathered.set()
         self._gathered.wait(timeout=5.0)
         time.sleep(timeout)
-        record["exited"] = time.perf_counter()
         raise urllib.error.URLError("wedged endpoint: no response")
 
 
@@ -5494,12 +5492,11 @@ def test_one_wedged_endpoint_does_not_cost_every_question_its_whole_budget(
     assert len(endpoint.calls) <= _WEDGE_WORKERS + _WEDGE_ATTEMPTS - 1, (
         "every in-flight question spent its whole retry budget on the wedge"
     )
-    # And therefore in wall clock: the pass waited out about one timeout, not the
-    # budget a single question would have burned on its own.
-    span = max(call["exited"] for call in endpoint.calls) - min(
-        call["entered"] for call in endpoint.calls
-    )
-    assert span < _WEDGE_TIMEOUT * _WEDGE_ATTEMPTS
+    # The wall clock is deliberately NOT asserted. Every attempt against this
+    # fake costs exactly one timeout, so the time spent IS the count above, and
+    # the count settles it deterministically — where a clock assertion would be
+    # the same claim re-measured through the scheduler on a platform with 15.6 ms
+    # timer granularity, buying load sensitivity and no coverage.
 
     # Nothing was extracted and nothing was silently dropped: every question is
     # accounted for as either failed or never begun.
@@ -5594,6 +5591,40 @@ def test_an_answering_endpoint_never_opens_the_circuit() -> None:
         with pytest.raises(clients.LocalModelResponseError):
             client.chat([{"role": "user", "content": "hi"}])
     assert len(seen) == 4
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", [400, 503])
+def test_an_http_error_status_is_an_answer_and_never_opens_the_circuit(
+    status: int,
+) -> None:
+    """The same rule, one layer down: a status line is the server answering.
+
+    ``HTTPError`` is a ``URLError`` is an ``OSError``, so a refused *status*
+    arrives at the retry loop's ``except OSError`` clause beside a refused
+    connection — and the two are opposite evidence. A 400 over an over-long
+    prompt, or a 503 from a model that is still loading, is a server that
+    replied, on a round trip, having cost nothing the circuit exists to save.
+    Counting it as unreachability would open the breaker over a prompt, and in
+    every real consumer that is fatal: ``extract_questions`` halts the pass on
+    it, and ``answer_questions`` does not catch it at all.
+
+    The status is still *retried*, exactly as it always was — that policy is not
+    this test's business and is not changed. What must not happen is the fourth
+    request being refused without being sent.
+    """
+    seen: list[tuple[str, dict]] = []
+    refusal = urllib.error.HTTPError(
+        _PIN.endpoint + clients.CHAT_PATH, status, "refused", None, None
+    )
+    client = clients.LocalChatClient(
+        pin=_PIN, attempts=1, transport=_transport([refusal], seen)
+    )
+    for _ in range(4):
+        with pytest.raises(clients.LocalModelTransportError) as raised:
+            client.chat([{"role": "user", "content": "hi"}])
+        assert not isinstance(raised.value, clients.EndpointWedgedError)
+    assert len(seen) == 4, "a request was refused without being sent"
 
 
 # --------------------------------------------------------------------------- #

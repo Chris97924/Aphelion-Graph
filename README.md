@@ -291,14 +291,17 @@ An extraction pass stops at a **question boundary**, at any `N`: Ctrl-C stops
 submission at once and lets the question in flight be walked to its end, so the
 cache is left with whole questions rather than a part-extracted one the next pass
 would have to replay from its first session. A second Ctrl-C is the interpreter's
-own and stops immediately. An endpoint that stops answering is presumed wedged
-after one retry budget's worth of consecutive failures — pooled across everything
-in flight, not counted per request — and further requests then fail at once
-instead of each paying `attempts x timeout` to learn the same thing; one request
-per cooldown is let through to see whether it came back. What a stopped pass
-could not get to is named: both the failure and the interrupt report which
-questions were never started. See `docs/benchmark/extraction-mechanism.md` §9,
-which also retires pre-merge extraction caches for the reason §8 gives.
+own and stops immediately. An endpoint that goes silent is presumed wedged after
+one retry budget's worth of consecutive failures — pooled across everything in
+flight, not counted per request — and further requests then fail at once instead
+of each paying `attempts x timeout` to learn the same thing; one request per
+cooldown is let through to see whether it came back. Only silence counts: a
+refused body and a refused HTTP status are both the server answering, and neither
+opens the circuit. What a stopped pass could not get to is named by the failure
+path at any `N`, and by the interrupt at the default `N = 1`; above 1 the
+interrupt is the thread pool's own and arrives bare, so what was not started is
+read off the cache. See `docs/benchmark/extraction-mechanism.md` §9, which also
+retires pre-merge extraction caches for the reason §8 gives.
 
 ### Pre-registration
 

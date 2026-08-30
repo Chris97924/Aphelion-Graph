@@ -499,16 +499,33 @@ class EndpointCircuit:
     rather than one per request — and an answer closes the circuit. A probe that
     fails re-opens it and the window starts again.
 
-    Only *reachability* counts. A server that answers with something this harness
-    refuses to interpret is a server that is working
-    (:class:`LocalModelResponseError`, deliberately never retried), and letting
-    that trip the breaker would take a run down over a prompt.
+    Only the **absence of an answer** counts, which is a narrower thing than
+    failure. A refused body is the server working and this harness declining what
+    it said (:class:`LocalModelResponseError`, deliberately never retried), and
+    so is a refused *status*: ``HTTPError`` is a ``URLError`` is an ``OSError``,
+    so a 400 over an over-long prompt and a 503 from a model that is still
+    loading arrive at the retry loop beside a refused connection, and are the
+    opposite evidence — a reply, on a round trip, having cost none of the time
+    this exists to save. Both are recorded as reachable. Neither can open the
+    circuit, because opening it over a prompt would end the run: every consumer
+    treats the error as fatal (``extract_questions`` halts the pass on it, and
+    ``answer_questions`` does not catch it at all), so there is no cooldown to
+    recover into.
 
-    One circuit belongs to one client, which is what the extraction stage shares
-    across its workers (``extract_only`` builds exactly one client and hands it
-    to every question). Two clients built separately over the same endpoint hold
-    separate presumptions about it; that is a bound on what is claimed here, not
-    a defect — nothing in this harness runs two of them at once.
+    The bound that leaves: a gateway that answers 504 *slowly* is still counted
+    as reachable, so a wedge hidden behind a proxy that eventually replies is not
+    something this acts on. It is also not the stall it guards — that reply came
+    back — and no evidence of such a proxy exists in this harness's path.
+
+    One circuit belongs to one client. That covers the extraction stage, which
+    shares exactly one client across its workers (``extract_only`` builds one and
+    hands it to every question). It does **not** make the presumption global:
+    :func:`benchmarks.longmemeval.real_run.answer_questions` holds an extractor
+    client and an answering client at once, and under the current pins both
+    resolve to the same endpoint, so two circuits there hold independent
+    presumptions about one server and a wedge is discovered twice rather than
+    once. Bounded at 2x, on a phase this mechanism is not the guard for, and
+    stated rather than designed around.
     """
 
     def __init__(
@@ -751,7 +768,16 @@ class LocalChatClient:
             # the right response.
             except OSError as exc:
                 last = exc
-                self.circuit.record_unreachable()
+                # Retried the same either way; classified oppositely. An HTTP
+                # status is the server ANSWERING — badly, but on a round trip,
+                # having cost none of the time the circuit exists to save — so a
+                # 400 over an over-long prompt or a 503 from a model still
+                # loading must not be evidence that the endpoint is gone.
+                # HTTPError is a URLError, so it has to be asked about first.
+                if isinstance(exc, urllib.error.HTTPError):
+                    self.circuit.record_reachable()
+                else:
+                    self.circuit.record_unreachable()
                 continue
             # Reachable is all this records. Whether the body is usable is the
             # next paragraph's business, and a body this harness refuses is not
