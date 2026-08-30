@@ -287,6 +287,19 @@ concurrent sequences. Merging this change also retires any extraction cache
 written before it, by the same identity rules; see
 `docs/benchmark/extraction-mechanism.md` §8.
 
+An extraction pass stops at a **question boundary**, at any `N`: Ctrl-C stops
+submission at once and lets the question in flight be walked to its end, so the
+cache is left with whole questions rather than a part-extracted one the next pass
+would have to replay from its first session. A second Ctrl-C is the interpreter's
+own and stops immediately. An endpoint that stops answering is presumed wedged
+after one retry budget's worth of consecutive failures — pooled across everything
+in flight, not counted per request — and further requests then fail at once
+instead of each paying `attempts x timeout` to learn the same thing; one request
+per cooldown is let through to see whether it came back. What a stopped pass
+could not get to is named: both the failure and the interrupt report which
+questions were never started. See `docs/benchmark/extraction-mechanism.md` §9,
+which also retires pre-merge extraction caches for the reason §8 gives.
+
 ### Pre-registration
 
 `benchmarks/longmemeval/preregister.json` pins the protocol — seed, split sizes
