@@ -27,6 +27,7 @@ import json
 import math
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -5253,6 +5254,310 @@ def test_a_worker_count_below_one_is_refused(tmp_path: Path, workers: int) -> No
         real_run.extract_questions(
             [], cache=cache, client=None, pin=_PIN, workers=workers
         )
+
+
+# --------------------------------------------------------------------------- #
+# Stopping: the operator's Ctrl-C, and an endpoint that has gone dark           #
+# --------------------------------------------------------------------------- #
+
+
+class _InterruptingChat(FakeChat):
+    """A FakeChat that presses Ctrl-C from inside one extraction call.
+
+    ``signal.raise_signal`` rather than ``raise KeyboardInterrupt``: what is
+    under test is what the interpreter does with SIGINT, and raising the
+    exception by hand would exercise a path no keyboard can reach — it would
+    walk straight past the handler whose absence is the defect.
+    """
+
+    def __init__(self, pin: Any, *, at_session: str) -> None:
+        super().__init__(pin)
+        self.at_session = at_session
+        self.interrupted = False
+
+    def chat(self, messages: Sequence[dict]) -> str:
+        if not messages[0]["content"].startswith(
+            clients.EXTRACT_STRUCTURED_SYSTEM_PROMPT
+        ):
+            return super().chat(messages)
+        text = super().chat(messages)
+        if not self.interrupted and self.at_session in _unfence(
+            "SESSION", messages[1]["content"]
+        ):
+            self.interrupted = True
+            signal.raise_signal(signal.SIGINT)
+        return text
+
+
+def _rows_by_question(cfg: Any) -> dict[str, set[str]]:
+    """The session ids the cache holds, grouped by question."""
+    grouped: dict[str, set[str]] = {}
+    for row in real_run.read_jsonl(cfg.out_dir / real_run.EXTRACTIONS_NAME):
+        grouped.setdefault(row["question_id"], set()).add(row["session_id"])
+    return grouped
+
+
+@pytest.mark.integration
+def test_at_one_worker_ctrl_c_stops_at_a_question_boundary(tmp_path: Path) -> None:
+    """The default width must honour Ctrl-C the way the wide one already does.
+
+    At more than one worker the interrupt lands in the main thread while the pool
+    is draining, so the questions in flight are allowed to finish and the queued
+    ones are dropped. At one worker there is no pool and no such boundary: the
+    interrupt lands *inside* the question being walked and abandons it half
+    extracted, which is the one shape the scheduler's own failure policy says
+    never happens — "a question is either walked to its end or not started".
+
+    So: Ctrl-C during the FIRST session of a question, and the assertion is that
+    the other two were still walked and memoised before the pass stopped.
+    """
+    cfg = _sched_config(tmp_path, "ctrl-c-serial", 1)
+    created: list[_InterruptingChat] = []
+
+    def factory(pin: Any) -> _InterruptingChat:
+        client = _InterruptingChat(pin, at_session="question 2 session 0")
+        created.append(client)
+        return client
+
+    with pytest.raises(KeyboardInterrupt):
+        real_run.extract_only(cfg, client_factory=factory)
+
+    assert created[0].interrupted, "the fake never got to press Ctrl-C"
+    written = _rows_by_question(cfg)
+    # The question that was in flight was walked to its END.
+    assert written.get("sched-2") == {
+        f"sched-2::s{index}" for index in range(_SCHED_SESSIONS)
+    }
+    # Its predecessors are whole, and nothing after it was begun.
+    assert set(written) == {"sched-0", "sched-1", "sched-2"}
+    assert all(len(sessions) == _SCHED_SESSIONS for sessions in written.values())
+
+
+@pytest.mark.integration
+def test_ctrl_c_leaves_a_resumable_cache_at_one_worker(tmp_path: Path) -> None:
+    """Stopping cleanly is only worth anything if the next pass picks it up.
+
+    The re-run is what an operator actually does after a Ctrl-C, so it is what
+    the boundary has to be good for: the three questions already extracted are
+    skipped rather than re-paid for, and the pass completes.
+    """
+    cfg = _sched_config(tmp_path, "ctrl-c-resume", 1)
+
+    def factory(pin: Any) -> _InterruptingChat:
+        return _InterruptingChat(pin, at_session="question 2 session 0")
+
+    with pytest.raises(KeyboardInterrupt):
+        real_run.extract_only(cfg, client_factory=factory)
+
+    probes: list[SchedulerProbe] = []
+    summary = real_run.extract_only(cfg, client_factory=_probe_factory(probes))
+
+    assert summary["questions_skipped"] == 3
+    assert summary["sessions_extracted"] == (_SCHED_QUESTIONS - 3) * _SCHED_SESSIONS
+    assert summary["cache_rows"] == _SCHED_QUESTIONS * _SCHED_SESSIONS
+
+
+@pytest.mark.integration
+def test_a_failure_names_the_questions_it_never_started(tmp_path: Path) -> None:
+    """``started`` is what the error's claim is made of, not prose beside it.
+
+    ``QuestionExtractionError`` has always *asserted* that no question begins
+    after the first failure. Which ones those were is the actionable half — it is
+    the list an operator has to get through on the re-run — and the outcomes
+    already carry it, one flag per question.
+    """
+    cfg = _sched_config(tmp_path, "not-started", 1)
+    with pytest.raises(real_run.QuestionExtractionError) as raised:
+        real_run.extract_only(
+            cfg, client_factory=_probe_factory([], fail_on="question 2 session 0")
+        )
+
+    assert raised.value.not_started == ["sched-3", "sched-4", "sched-5"]
+    assert "3 question(s) were never started" in str(raised.value)
+
+
+# One round of attempts against a wedge is unavoidable — it is how the wedge is
+# discovered. What the endpoint must not get is a whole retry budget from every
+# question in flight, all of them paying the full timeout to learn the same
+# thing.
+_WEDGE_WORKERS = 4
+_WEDGE_ATTEMPTS = 3
+_WEDGE_TIMEOUT = 0.1
+
+
+class _WedgedEndpoint:
+    """A transport that accepts and then never answers.
+
+    A fake, and only a fake: no socket is opened and no pinned endpoint is
+    contacted. It stands in for the shape ``urlopen`` presents when a server has
+    gone quiet — the call dwells for the whole timeout and then raises
+    ``URLError`` — which is the failure this test is about, because the harness's
+    answer to it is to spend the timeout again, twice.
+
+    The first ``width`` attempts wait for each other before any of them fails, so
+    the round the scheduler really did put in flight fails together, the way one
+    shared endpoint going dark makes it fail.
+    """
+
+    def __init__(self, *, width: int = _WEDGE_WORKERS) -> None:
+        self.width = width
+        self.calls: list[dict[str, float]] = []
+        self._lock = threading.Lock()
+        self._gathered = threading.Event()
+
+    def __call__(self, url: str, payload: bytes, timeout: float) -> bytes:
+        record = {"entered": time.perf_counter()}
+        with self._lock:
+            self.calls.append(record)
+            if len(self.calls) >= self.width:
+                self._gathered.set()
+        self._gathered.wait(timeout=5.0)
+        time.sleep(timeout)
+        record["exited"] = time.perf_counter()
+        raise urllib.error.URLError("wedged endpoint: no response")
+
+
+def _wedged_factory(endpoint: _WedgedEndpoint) -> Callable[[Any], Any]:
+    """The real pinned-dialect client, with the socket replaced by the wedge."""
+
+    def factory(chat_pin: Any) -> Any:
+        return clients.client_for(
+            chat_pin,
+            transport=endpoint,
+            get_transport=endpoint,
+            timeout_seconds=_WEDGE_TIMEOUT,
+            attempts=_WEDGE_ATTEMPTS,
+        )
+
+    return factory
+
+
+@pytest.mark.integration
+def test_one_wedged_endpoint_does_not_cost_every_question_its_whole_budget(
+    tmp_path: Path,
+) -> None:
+    """The retry budget belongs to the endpoint, not to each request against it.
+
+    Retries are for a *transient* refusal: re-send and it gets through. A wedged
+    endpoint is the other thing — every attempt costs the full timeout and none
+    of them will return — and the per-request budget then turns one dead endpoint
+    into ``attempts x timeout`` for every question in flight, each paying it to
+    establish what the first attempts already did.
+
+    The bound asserted here is derived, not observed: the circuit opens on the
+    ``attempts``-th consecutive failure, so on top of the round of ``workers``
+    already in flight when it opened, at most ``attempts - 1`` further attempts
+    can have passed the guard while the count was still short.
+    """
+    cfg = _sched_config(tmp_path, "wedged", _WEDGE_WORKERS)
+    endpoint = _WedgedEndpoint()
+
+    with pytest.raises(real_run.QuestionExtractionError) as raised:
+        real_run.extract_only(cfg, client_factory=_wedged_factory(endpoint))
+
+    assert len(endpoint.calls) <= _WEDGE_WORKERS + _WEDGE_ATTEMPTS - 1, (
+        "every in-flight question spent its whole retry budget on the wedge"
+    )
+    # And therefore in wall clock: the pass waited out about one timeout, not the
+    # budget a single question would have burned on its own.
+    span = max(call["exited"] for call in endpoint.calls) - min(
+        call["entered"] for call in endpoint.calls
+    )
+    assert span < _WEDGE_TIMEOUT * _WEDGE_ATTEMPTS
+
+    # Nothing was extracted and nothing was silently dropped: every question is
+    # accounted for as either failed or never begun.
+    every = {f"sched-{index}" for index in range(_SCHED_QUESTIONS)}
+    assert set(raised.value.failures) | set(raised.value.not_started) == every
+    assert raised.value.not_started, "the queue behind the wedge was still walked"
+    assert not (cfg.out_dir / real_run.EXTRACTIONS_NAME).is_file() or not _rows_by_question(
+        cfg
+    )
+
+
+@pytest.mark.unit
+def test_a_request_is_not_sent_to_an_endpoint_already_presumed_wedged() -> None:
+    """The mechanism on its own, without a scheduler around it.
+
+    One request exhausts the budget and opens the circuit; the next is refused
+    before the transport is touched, which is what the timeout is no longer being
+    paid for.
+    """
+    seen: list[tuple[str, dict]] = []
+    client = clients.LocalChatClient(
+        pin=_PIN,
+        attempts=3,
+        transport=_transport([urllib.error.URLError("down")], seen),
+    )
+    with pytest.raises(clients.LocalModelTransportError):
+        client.chat([{"role": "user", "content": "hi"}])
+    assert len(seen) == 3
+
+    with pytest.raises(clients.EndpointWedgedError):
+        client.chat([{"role": "user", "content": "hi"}])
+    assert len(seen) == 3, "the refused request still reached the transport"
+
+
+@pytest.mark.unit
+def test_a_wedged_endpoint_is_probed_again_once_the_cooldown_has_passed() -> None:
+    """A restarting server must not be written off for the rest of the run.
+
+    Failing fast is only safe if it is provisional: the circuit is a presumption,
+    and the cooldown is what lets the endpoint disprove it. Exactly one request
+    goes through as the probe, and a probe that succeeds closes the circuit.
+    """
+    now = [0.0]
+    circuit = clients.EndpointCircuit(
+        threshold=2, cooldown_seconds=30.0, clock=lambda: now[0]
+    )
+    seen: list[tuple[str, dict]] = []
+    client = clients.LocalChatClient(
+        pin=_PIN,
+        attempts=2,
+        transport=_transport(
+            [
+                urllib.error.URLError("down"),
+                urllib.error.URLError("down"),
+                {"message": {"content": "back"}},
+            ],
+            seen,
+        ),
+        circuit=circuit,
+    )
+    with pytest.raises(clients.LocalModelTransportError):
+        client.chat([{"role": "user", "content": "hi"}])
+    assert len(seen) == 2
+
+    # Still inside the window: refused without a request.
+    now[0] = 29.0
+    with pytest.raises(clients.EndpointWedgedError):
+        client.chat([{"role": "user", "content": "hi"}])
+    assert len(seen) == 2
+
+    # Past it: one probe goes through, it answers, and the endpoint is back.
+    now[0] = 31.0
+    assert client.chat([{"role": "user", "content": "hi"}]) == "back"
+    assert len(seen) == 3
+
+
+@pytest.mark.unit
+def test_an_answering_endpoint_never_opens_the_circuit() -> None:
+    """Only unreachability counts. A bad *answer* is an answer.
+
+    A refused completion is the server working and this harness declining what it
+    said (``LocalModelResponseError``), and it is already deliberately not
+    retried. Letting it trip the breaker would take a run down over a prompt.
+    """
+    seen: list[tuple[str, dict]] = []
+    client = clients.LocalChatClient(
+        pin=_PIN,
+        attempts=1,
+        transport=_transport([{"message": {}}] * 5, seen),
+    )
+    for _ in range(4):
+        with pytest.raises(clients.LocalModelResponseError):
+            client.chat([{"role": "user", "content": "hi"}])
+    assert len(seen) == 4
 
 
 # --------------------------------------------------------------------------- #
