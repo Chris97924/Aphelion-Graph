@@ -50,10 +50,12 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2951,16 +2953,27 @@ class QuestionExtractionError(RuntimeError):
     which question it was.
     """
 
-    def __init__(self, failures: Mapping[str, BaseException]) -> None:
+    def __init__(
+        self,
+        failures: Mapping[str, BaseException],
+        *,
+        not_started: Sequence[str] = (),
+    ) -> None:
         self.failures = dict(failures)
+        # Which questions those were, not merely that there were some: it is the
+        # list the re-run still has to get through, and it is read off the
+        # outcomes' own ``started`` flag rather than asserted in this sentence.
+        self.not_started = list(not_started)
         detail = "; ".join(
             f"{question_id}: {error!r}" for question_id, error in self.failures.items()
         )
         super().__init__(
-            f"{len(self.failures)} question(s) failed to extract. No question was "
-            "started after the first failure, and every question already running "
-            "was allowed to finish, so what they wrote is durable — re-run to "
-            f"resume from it. Failures: {detail}"
+            f"{len(self.failures)} question(s) failed to extract and "
+            f"{len(self.not_started)} question(s) were never started, because "
+            "submission stops at the first failure while every question already "
+            "running is allowed to finish — so what they wrote is durable, "
+            f"re-run to resume from it. Failures: {detail}. Never started: "
+            f"{', '.join(self.not_started) or 'none'}"
         )
 
 
@@ -2974,8 +2987,12 @@ class QuestionExtraction:
     calls: int = 0
     # Every session was already memoised, so the question was not walked at all.
     skipped: bool = False
-    # False when the pass had already failed elsewhere and this question was
-    # therefore never begun. Not an error of its own, and not work either.
+    # False when the pass had already stopped — a failure elsewhere, or the
+    # operator's Ctrl-C — and this question was therefore never begun. Not an
+    # error of its own, and not work either. Read by :func:`extract_questions`,
+    # which turns the false ones into the list a stopped pass reports
+    # (:class:`QuestionExtractionError.not_started`): the questions a re-run
+    # still has to get through.
     started: bool = True
     error: BaseException | None = None
     message: str = ""
@@ -3042,6 +3059,63 @@ def _extract_question(
     return outcome
 
 
+@contextmanager
+def _interrupt_at_question_boundary(
+    halt: threading.Event, interrupted: threading.Event
+) -> Iterator[None]:
+    """Hold a Ctrl-C until the question in flight has been walked to its end.
+
+    The wide path gets this for free and the default one did not, which is the
+    asymmetry this closes. At more than one worker the interrupt lands in the
+    main thread while it drains the pool: the queued questions are dropped, the
+    running ones are allowed to finish, and only then does the exception leave.
+    At one worker there is no pool and no such boundary — the question is being
+    walked on this very thread, so the interrupt lands *inside* it and abandons
+    it part-extracted, the one shape :class:`QuestionExtractionError` says never
+    happens ("either walked to its end or not started").
+
+    Abandoning it costs nothing already written — rows are durable the moment
+    they are appended — but it costs the rest of the question, and a
+    part-extracted question is replayed from its first session on the next pass
+    (:func:`_extract_question`), so those sessions are walked again to prime the
+    ones that were dropped. Stopping one question later leaves strictly more of
+    the run done and strictly less of it to redo.
+
+    So SIGINT sets the same ``halt`` a failure sets — submission stops at once —
+    and the exception is raised by the caller after the drain. A **second**
+    Ctrl-C restores the interpreter's own handler on the way in, because an
+    operator pressing it twice is no longer asking to stop tidily.
+
+    Outside the main thread there is nothing to install: CPython delivers SIGINT
+    to the main thread only, so a pass being driven from a worker thread cannot
+    receive one and the block is a no-op.
+    """
+    try:
+        previous = signal.getsignal(signal.SIGINT)
+        installed = True
+    except (AttributeError, ValueError):  # pragma: no cover - no SIGINT at all
+        installed = False
+
+    if installed:
+
+        def _stop(_signum: int, _frame: Any) -> None:
+            signal.signal(signal.SIGINT, previous)
+            interrupted.set()
+            halt.set()
+
+        try:
+            signal.signal(signal.SIGINT, _stop)
+        except ValueError:
+            # Not the main thread. Nothing to defer, and nothing to restore.
+            installed = False
+
+    try:
+        yield
+    finally:
+        if installed:
+            signal.signal(signal.SIGINT, previous)
+
+
 def extract_questions(
     specs: Sequence[QuestionSpec],
     *,
@@ -3089,8 +3163,12 @@ def extract_questions(
 
     total = len(specs)
     failures: dict[str, BaseException] = {}
-    # Set by the first failing question; read by every question before it starts.
+    # Set by the first failing question, or by a Ctrl-C; read by every question
+    # before it starts.
     halt = threading.Event()
+    # Set only by a Ctrl-C, so the pass can tell the operator's stop from a
+    # failure once it has drained.
+    interrupted = threading.Event()
 
     def run(numbered: tuple[int, QuestionSpec]) -> QuestionExtraction:
         position, spec = numbered
@@ -3135,8 +3213,11 @@ def extract_questions(
     numbered = list(enumerate(specs, 1))
     if workers == 1:
         # A generator, so a question runs, reports, and only then does the next
-        # one begin — the pinned pass's own rhythm, on the caller's thread.
-        outcomes = drain(run(item) for item in numbered)
+        # one begin — the pinned pass's own rhythm, on the caller's thread. The
+        # interrupt is deferred around it rather than inside it, because the
+        # boundary being protected is between questions, not inside one.
+        with _interrupt_at_question_boundary(halt, interrupted):
+            outcomes = drain(run(item) for item in numbered)
     else:
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="extract"
@@ -3145,8 +3226,26 @@ def extract_questions(
             # so the merge is the iteration and no sorting is needed.
             outcomes = drain(pool.map(run, numbered))
 
+    not_started = [outcome.question_id for outcome in outcomes if not outcome.started]
+    if interrupted.is_set():
+        # Ahead of the failures: the operator asked for this one, and a Ctrl-C
+        # reported as a question failure would send them looking for a fault.
+        # What they failed at is named in the message all the same.
+        progress(
+            f"interrupted: stopped at a question boundary, {len(not_started)} "
+            "question(s) not started"
+        )
+        raise KeyboardInterrupt(
+            "extraction was interrupted and stopped at a question boundary. The "
+            "question in flight was walked to its end, "
+            f"{len(not_started)} question(s) were never started and "
+            f"{len(failures)} failed. Everything already extracted is durable — "
+            "re-run to resume from it."
+        )
     if failures:
-        raise QuestionExtractionError(failures) from next(iter(failures.values()))
+        raise QuestionExtractionError(
+            failures, not_started=not_started
+        ) from next(iter(failures.values()))
     return outcomes
 
 
