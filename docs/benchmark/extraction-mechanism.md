@@ -357,18 +357,24 @@ Bounded at 2x, on a phase this mechanism is not the guard for.
 
 `QuestionExtraction.started` records that a question was never begun. It used to
 be written and never read: the only path that set it false also raised before any
-caller could reach the outcomes, so the fact had nowhere to go.
-`QuestionExtractionError.not_started` is now made of it, and the interrupt path
-counts it — the questions a re-run still has to get through, read off the
-outcomes rather than asserted in prose beside them.
+caller could reach the outcomes, so the fact had nowhere to go. It is read now,
+though never on its own — `QuestionExtraction.must_rerun` pairs it with `skipped`
+(`not started and not skipped`), because a question the cache already covers
+completely is owed to nobody however far behind the halt it sat, and reading
+`started` alone reported it as work.
+`QuestionExtractionError.not_started` is made of `must_rerun`, and the interrupt
+path counts the same list — the questions a re-run still has to get through, read
+off the outcomes rather than asserted in prose beside them. The attribute keeps
+the name `not_started`; what it holds is the narrower reading.
 
 Two halves that do not travel together, so it is worth being exact about which
 is which. The **boundary** holds at every width. The **naming** is the serial
 path's: at `N = 1` the interrupt is raised by `extract_questions` itself, after
-the drain, carrying the count of questions never started and preceded by a
+the drain, carrying the count of questions still to do (`must_rerun`, so a
+question the cache already covers completely is not among them) and preceded by a
 progress line saying so. Above 1 the exception is the pool's own — it escapes
 `drain()` before that raise is reached, so it arrives bare, with no message and
-no list, and what was not started has to be read off the cache instead. The
+no list, and what a re-run still owes has to be read off the cache instead. The
 failure path names them at any width; only the interrupt is asymmetric, and only
 away from the default (`DEFAULT_EXTRACT_WORKERS = 1`).
 
