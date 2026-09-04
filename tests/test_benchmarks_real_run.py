@@ -5425,7 +5425,7 @@ def test_a_failure_names_the_questions_it_never_started(tmp_path: Path) -> None:
         )
 
     assert raised.value.not_started == ["sched-3", "sched-4", "sched-5"]
-    assert "3 question(s) were never started" in str(raised.value)
+    assert "3 question(s) still to do" in str(raised.value)
 
 
 @pytest.mark.integration
@@ -5462,6 +5462,124 @@ def test_never_started_is_the_flag_and_not_merely_an_empty_outcome(
     assert set(raised.value.failures) == {"sched-3"}
     # sched-0 and sched-1 made no calls either, and are not in the list.
     assert raised.value.not_started == ["sched-4", "sched-5"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("started", "skipped", "owed"),
+    [
+        (True, False, False),  # walked to its end
+        (True, True, False),  # every session was already memoised
+        (False, True, False),  # the pass had stopped, but nothing was owed
+        (False, False, True),  # the pass had stopped and this one is still owed
+    ],
+)
+def test_only_an_unstarted_question_with_sessions_missing_is_owed(
+    started: bool, skipped: bool, owed: bool
+) -> None:
+    """Two flags, four states, and only one of them is work a re-run has to do.
+
+    ``started`` is a fact about this pass — whether the question came up before
+    the pass stopped — and ``skipped`` is a fact about the cache. Neither answers
+    the operator's question on its own, which is why reading ``started`` alone
+    reported cached questions as work owed, and why the read is a property rather
+    than a comprehension anyone can get wrong twice.
+    """
+    outcome = real_run.QuestionExtraction("q", started=started, skipped=skipped)
+    assert outcome.must_rerun is owed
+
+
+@pytest.mark.integration
+def test_a_cached_question_reached_after_the_halt_is_not_work_the_rerun_owes(
+    tmp_path: Path,
+) -> None:
+    """A non-prefix cache is the shape that told the operator to redo cached work.
+
+    The cache a resumed run inherits is not always a prefix of the question
+    order: an earlier pass at several workers stops with holes in it, and a
+    hand-pruned ``--out-dir`` can hold any subset at all. So a question AFTER the
+    failure can be one the cache already covers completely, and the halt path
+    used to answer for it without looking — reporting a fully cached question as
+    never started, in the very list that names what a re-run still has to get
+    through.
+
+    The re-run would skip it. ``not_started`` has to say so, because the
+    programmatic consumer (:class:`QuestionExtractionError`) is read by whoever
+    decides how much of the pass is left to pay for.
+    """
+    cfg = _sched_config(tmp_path, "cached-after-halt", 1)
+    real_run.extract_only(cfg, client_factory=_probe_factory([]))
+
+    # Keep a NON-PREFIX subset: the two before the failure and the last one
+    # behind it. sched-5 is fully cached and comes after the question that stops
+    # the pass, which is exactly the case the old halt path got wrong.
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    _rewrite(
+        path,
+        [
+            row
+            for row in real_run.read_jsonl(path)
+            if row["question_id"] in {"sched-0", "sched-1", "sched-5"}
+        ],
+    )
+
+    lines: list[str] = []
+    with pytest.raises(real_run.QuestionExtractionError) as raised:
+        real_run.extract_only(
+            cfg,
+            client_factory=_probe_factory([], fail_on="question 3 session 0"),
+            progress=lines.append,
+        )
+
+    assert set(raised.value.failures) == {"sched-3"}
+    # sched-4 is genuinely owed; sched-5 is already paid for.
+    assert raised.value.not_started == ["sched-4"]
+    assert "1 question(s) still to do" in str(raised.value)
+    assert "sched-5" not in str(raised.value)
+    # And the operator is told why the count is lower than the queue behind the
+    # failure, rather than left to guess at a silently missing question.
+    assert any("sched-5" in line and "already cached" in line for line in lines)
+
+
+@pytest.mark.integration
+def test_ctrl_c_counts_only_the_questions_a_rerun_still_owes(tmp_path: Path) -> None:
+    """The interrupt count is read off the same flags, so it inherits the same fix.
+
+    A Ctrl-C sets the same ``halt`` a failure sets, and the number it reports is
+    the operator's estimate of what stopping cost them. Counting a question the
+    cache already covers inflates that estimate — it is the one number they have,
+    and it was wrong in the direction that makes stopping look more expensive
+    than it was.
+    """
+    cfg = _sched_config(tmp_path, "ctrl-c-cached-after-halt", 1)
+    real_run.extract_only(cfg, client_factory=_probe_factory([]))
+
+    path = cfg.out_dir / real_run.EXTRACTIONS_NAME
+    _rewrite(
+        path,
+        [
+            row
+            for row in real_run.read_jsonl(path)
+            if row["question_id"] in {"sched-0", "sched-1", "sched-5"}
+        ],
+    )
+
+    def factory(pin: Any) -> _InterruptingChat:
+        return _InterruptingChat(pin, at_session="question 2 session 0")
+
+    lines: list[str] = []
+    with pytest.raises(KeyboardInterrupt) as raised:
+        real_run.extract_only(cfg, client_factory=factory, progress=lines.append)
+
+    # sched-2 was walked to its end; sched-3 and sched-4 are owed; sched-5 is not.
+    assert "2 question(s) still to do" in str(raised.value)
+    assert any(
+        "stopped at a question boundary, 2 question(s) still to do" in line
+        for line in lines
+    )
+    assert _rows_by_question(cfg)["sched-2"] == {
+        f"sched-2::s{index}" for index in range(_SCHED_SESSIONS)
+    }
 
 
 # One round of attempts against a wedge is unavoidable — it is how the wedge is
