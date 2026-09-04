@@ -263,3 +263,120 @@ time: against that configuration N concurrent questions simply queue at the
 endpoint and the pass takes as long as it always did. Raising N is worth doing
 only together with a serving configuration that admits concurrent sequences —
 and either way, the width that actually ran is on the record.
+
+---
+
+## 9. Stopping: the operator's Ctrl-C, and an endpoint that has gone dark (2026-08-31)
+
+§8 left three things open, and they are the same thing seen from three sides: a
+pass that is stopping has to stop at a place a resume can pick up from, and it
+has to be able to say what it did not get to.
+
+### Ctrl-C stops at a question boundary, at every width
+
+A question is either **walked to its end or not started** — §6's failure policy
+in one line, and what makes a resume cheap. A part-extracted question is not
+lost, because rows are durable the moment they are appended, but it *is* replayed
+from its first session on the next pass (§7: the priming vocabulary for a pending
+session is derived from the sessions before it), so every session dropped part
+way through a question is a session walked again next time.
+
+Above one worker the interrupt already landed at that boundary for free: it
+arrives in the main thread while it is draining the pool, the queued questions
+are dropped, and the running ones are allowed to finish before the exception
+leaves. At the default of one worker there is no pool and no such boundary — the
+question is being walked on the very thread the interrupt lands on, so it was
+abandoned mid-question, which is the one shape the policy says never happens.
+
+So SIGINT is now deferred around the serial path: the handler sets the same halt
+a failure sets, submission stops immediately, the question in flight is walked to
+its end, and `KeyboardInterrupt` is raised once the pass has drained. A **second**
+Ctrl-C is the interpreter's own again — an operator pressing it twice is no
+longer asking to stop tidily. Nothing is installed off the main thread, where
+CPython delivers no SIGINT to defer.
+
+### The retry budget belongs to the endpoint, not to each request
+
+Retries are for a *transient* refusal: re-send and it gets through, and a run
+measured in hours must not end on the first busy socket. A **wedged** endpoint is
+the other thing — every attempt costs the whole timeout and none of them will
+return — and against it the per-request budget is not resilience, it is a
+multiplier: at N workers every question in flight independently pays
+`attempts x timeout` to establish the one fact the first round of attempts
+already established. At the pinned 600 s and 3 attempts that is half an hour per
+question, all of it after the answer was known.
+
+`clients.EndpointCircuit` makes the budget the endpoint's. `attempts` consecutive
+failures with no answer between them — however they were spread across whatever
+was in flight — and the endpoint is presumed wedged; requests then fail
+immediately, as `EndpointWedgedError`, a `LocalModelTransportError` like any
+other except in what it cost to produce. What counts is the **absence of an
+answer**, which is narrower than failure: a server that answers with something
+this harness refuses is a server that is working (§6,
+`LocalModelResponseError`, deliberately never retried), and so is one that
+answers with a *status* — `HTTPError` is a `URLError` is an `OSError`, so a 400
+over an over-long prompt and a 503 from a model still loading reach the retry
+loop beside a refused connection, and are the opposite evidence. Both are
+recorded reachable, and neither can open the circuit. That is not tidiness: the
+error is fatal in every consumer — `extract_questions` halts the pass on it and
+`answer_questions` does not catch it at all — so a breaker tripped over a prompt
+ends the run, with no cooldown to recover into. The status is still retried,
+exactly as it always was; only what it is taken as *evidence of* has narrowed.
+
+The bound that leaves is general, and is stated rather than designed around: the
+circuit keys on **whether** an answer came, never on how long it took. So an
+endpoint that answers an error status *slowly* is unguarded — no proxy or gateway
+is required for this, an overloaded model server returning 503 straight down the
+wire is the whole of it. Measured: five requests at three attempts against an
+endpoint that always answers 503 send all fifteen attempts and never open the
+circuit; had each cost the full timeout, that is precisely the
+`attempts x timeout` stall this section set out to remove.
+
+It is left open on purpose, because both ways to close it are worse. Counting
+error statuses as unreachability is the defect the classification above exists to
+fix, and it ends a run over an over-long prompt. Giving the circuit a *time*
+dimension — so that a slow answer counts differently from a fast one — is a
+second mechanism with its own tuning, and belongs to a later change rather than
+bolted onto this one.
+
+The presumption is provisional, because the alternative is worse than the stall:
+an endpoint written off for the rest of an overnight run over one bad minute.
+After a cooldown exactly one request is let through as a probe — one, so a dead
+endpoint costs one timeout per window rather than one per request — and an answer
+closes the circuit. A probe that fails re-opens it and the window starts again.
+
+One circuit belongs to one client. That covers the extraction stage, which shares
+exactly one client across its workers. It does **not** make the presumption
+global, and the harness does hold two at once: `answer_questions` builds an
+extractor client and an answering client and keeps both live for the whole phase
+(`real_run.py:1546-1547`), and under the current pins both resolve to the same
+endpoint, so a wedge during answering is discovered twice rather than once.
+Bounded at 2x, on a phase this mechanism is not the guard for.
+
+### What a stopped pass reports
+
+`QuestionExtraction.started` records that a question was never begun. It used to
+be written and never read: the only path that set it false also raised before any
+caller could reach the outcomes, so the fact had nowhere to go.
+`QuestionExtractionError.not_started` is now made of it, and the interrupt path
+counts it — the questions a re-run still has to get through, read off the
+outcomes rather than asserted in prose beside them.
+
+Two halves that do not travel together, so it is worth being exact about which
+is which. The **boundary** holds at every width. The **naming** is the serial
+path's: at `N = 1` the interrupt is raised by `extract_questions` itself, after
+the drain, carrying the count of questions never started and preceded by a
+progress line saying so. Above 1 the exception is the pool's own — it escapes
+`drain()` before that raise is reached, so it arrives bare, with no message and
+no list, and what was not started has to be read off the cache instead. The
+failure path names them at any width; only the interrupt is asymmetric, and only
+away from the default (`DEFAULT_EXTRACT_WORKERS = 1`).
+
+### The cache this retires
+
+**Merging this change retires every extraction cache written before it**, exactly
+as §8's widening did and for the same reason: `real_run.py` and `clients.py` are
+both inside `_EXTRACTION_HARNESS_ROOTS`, so `extraction_harness_sha256` moves and
+`extraction_identity` moves with it. The ways forward are the ones §8 names — a
+new `--out-dir`, or re-running under the revision the record was written under —
+and none of them carries a pre-merge cache across at half price.

@@ -33,6 +33,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -421,6 +423,20 @@ DEFAULT_TIMEOUT_SECONDS = 600.0
 # refuses to interpret, and repeating them would only hide them.
 DEFAULT_ATTEMPTS = 3
 
+# Consecutive failed attempts against one endpoint, with no answer between them,
+# after which it is presumed wedged rather than busy. One whole retry budget's
+# worth of evidence — but pooled across everything in flight instead of counted
+# per request, which is the entire point: N requests against one dead endpoint
+# otherwise each pay `attempts x timeout` to establish what the first round
+# already did (:class:`EndpointCircuit`).
+DEFAULT_CIRCUIT_THRESHOLD = DEFAULT_ATTEMPTS
+
+# How long a presumed-wedged endpoint is left alone before one request is let
+# through to see whether it came back. Long beside the seconds a healthy
+# completion takes and short beside a run measured in hours, so a server that is
+# merely restarting costs one probe per window rather than the rest of the run.
+DEFAULT_CIRCUIT_COOLDOWN_SECONDS = 30.0
+
 # A transport takes (url, request body, timeout) and returns the raw response
 # bytes. Injectable so tests exercise request construction and response parsing
 # without a socket.
@@ -447,6 +463,140 @@ class LocalModelResponseError(LocalModelError):
     budget was spent on the analysis channel, and silently recording "" would
     enter a plumbing failure into the results as a wrong answer.
     """
+
+
+class EndpointWedgedError(LocalModelTransportError):
+    """The endpoint is presumed dead, so this request was never sent.
+
+    A transport error like any other as far as a caller is concerned — same base
+    class, same handling — differing only in what it cost to produce: nothing.
+    That is the whole of what the circuit buys.
+    """
+
+
+class EndpointCircuit:
+    """A shared, thread-safe presumption about whether one endpoint answers.
+
+    Retries exist for a *transient* refusal: the same request, re-sent, gets
+    through, and a run spanning hours must not end on the first busy socket. A
+    wedged endpoint is the other thing — every attempt costs the whole timeout
+    and none of them will ever return — and against it the per-request retry
+    budget is not resilience, it is a multiplier. Under the extraction scheduler
+    (:func:`benchmarks.longmemeval.real_run.extract_questions`) every question in
+    flight is a request against the same endpoint, so each one independently pays
+    ``attempts x timeout`` to establish the single fact that the first round of
+    attempts already established.
+
+    So the budget is made the **endpoint's** rather than each request's:
+    ``threshold`` consecutive failures with no answer between them — however they
+    were spread across whatever was in flight — and the endpoint is presumed
+    wedged. Requests then fail immediately instead of paying the timeout again.
+
+    The presumption is provisional, because the alternative would be worse than
+    the stall it fixes: an endpoint written off for the rest of a multi-hour run
+    over one bad minute. After ``cooldown_seconds`` exactly one request is let
+    through as a probe — one, so a dead endpoint costs one timeout per window
+    rather than one per request — and an answer closes the circuit. A probe that
+    fails re-opens it and the window starts again.
+
+    Only the **absence of an answer** counts, which is a narrower thing than
+    failure. A refused body is the server working and this harness declining what
+    it said (:class:`LocalModelResponseError`, deliberately never retried), and
+    so is a refused *status*: ``HTTPError`` is a ``URLError`` is an ``OSError``,
+    so a 400 over an over-long prompt and a 503 from a model that is still
+    loading arrive at the retry loop beside a refused connection, and are the
+    opposite evidence — a reply, on a round trip, having cost none of the time
+    this exists to save. Both are recorded as reachable. Neither can open the
+    circuit, because opening it over a prompt would end the run: every consumer
+    treats the error as fatal (``extract_questions`` halts the pass on it, and
+    ``answer_questions`` does not catch it at all), so there is no cooldown to
+    recover into.
+
+    The bound that leaves is general, and worth stating plainly rather than as a
+    corner case: this keys on *whether* an answer came, never on how long it took
+    to come. So an endpoint that answers an error status **slowly** is unguarded
+    — no proxy or gateway required, an overloaded model server returning 503
+    straight down the wire is the whole of it. Measured: five requests at three
+    attempts against an endpoint that always answers 503 send all fifteen
+    attempts and never open the circuit, and had each cost the full timeout that
+    is precisely the ``attempts x timeout`` stall this exists to remove.
+
+    Left unguarded on purpose, because the two ways to close it are both worse.
+    Counting error statuses as unreachability is the bug this classification was
+    written to fix — it ends a run over an over-long prompt. Adding a *time*
+    dimension, so that a slow answer counts differently from a fast one, is a
+    second mechanism with its own tuning, and is a candidate for later rather
+    than something to bolt on here.
+
+    One circuit belongs to one client. That covers the extraction stage, which
+    shares exactly one client across its workers (``extract_only`` builds one and
+    hands it to every question). It does **not** make the presumption global:
+    :func:`benchmarks.longmemeval.real_run.answer_questions` holds an extractor
+    client and an answering client at once, and under the current pins both
+    resolve to the same endpoint, so two circuits there hold independent
+    presumptions about one server and a wedge is discovered twice rather than
+    once. Bounded at 2x, on a phase this mechanism is not the guard for, and
+    stated rather than designed around.
+    """
+
+    def __init__(
+        self,
+        *,
+        threshold: int = DEFAULT_CIRCUIT_THRESHOLD,
+        cooldown_seconds: float = DEFAULT_CIRCUIT_COOLDOWN_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if threshold < 1:
+            raise ValueError(
+                f"circuit threshold must be at least 1, got {threshold}: a "
+                "threshold of zero presumes every endpoint dead before it has "
+                "been asked anything"
+            )
+        self._threshold = threshold
+        self._cooldown_seconds = cooldown_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._opened_at: float | None = None
+        self._probing = False
+
+    def before_attempt(self, url: str) -> None:
+        """Allow one attempt through, or refuse it without touching the socket."""
+        with self._lock:
+            if self._opened_at is None:
+                return
+            dark_for = self._clock() - self._opened_at
+            if self._probing or dark_for < self._cooldown_seconds:
+                raise EndpointWedgedError(
+                    f"{url}: not sent. The endpoint failed {self._failures} "
+                    "consecutive attempt(s) with no answer between them and is "
+                    f"presumed wedged; it is left alone for "
+                    f"{self._cooldown_seconds}s at a time, and {dark_for:.1f}s "
+                    "of that has passed. Sending this one would cost it the "
+                    "full timeout to learn what those attempts already "
+                    "established, which is how one dead endpoint stalls "
+                    "everything in flight against it."
+                )
+            # Half open: exactly one request goes through to find out.
+            self._probing = True
+
+    def record_reachable(self) -> None:
+        """The endpoint answered. Whatever it said, it is not wedged."""
+        with self._lock:
+            self._failures = 0
+            self._opened_at = None
+            self._probing = False
+
+    def record_unreachable(self) -> None:
+        """One attempt produced no response at all."""
+        with self._lock:
+            self._failures += 1
+            if self._probing:
+                # The probe settled it: still dark, and the window restarts.
+                self._probing = False
+                self._opened_at = self._clock()
+            elif self._failures >= self._threshold:
+                self._opened_at = self._clock()
 
 
 def model_matches(pinned: str, available: str) -> bool:
@@ -588,12 +738,23 @@ class LocalChatClient:
     attempts: int = DEFAULT_ATTEMPTS
     transport: Transport = _urlopen_transport
     get_transport: Transport = _urlget_transport
+    # Shared by every request this client makes, and by every thread making one:
+    # the retry budget is the endpoint's, not each request's. compare=False keeps
+    # a mutable presumption out of the frozen dataclass's identity.
+    circuit: EndpointCircuit = field(
+        default_factory=EndpointCircuit, compare=False, repr=False
+    )
 
     def _url(self, path: str) -> str:
         return self.pin.endpoint.rstrip("/") + path
 
     def _request(self, transport: Transport, url: str, payload: bytes) -> Any:
         """Send one request with bounded retries and decode its JSON body.
+
+        The retries are bounded twice: by this request's own ``attempts``, and by
+        what the endpoint has just done to everything else in flight against it
+        (:class:`EndpointCircuit`). The second bound is what keeps one wedged
+        endpoint from costing every concurrent question the whole budget.
 
         The body is decoded as **strict** UTF-8. ``errors="replace"`` is refused
         throughout this module: a replacement character inside a model's answer
@@ -605,14 +766,35 @@ class LocalChatClient:
         raw: bytes | None = None
         for _ in range(attempts):
             try:
+                self.circuit.before_attempt(url)
+            except EndpointWedgedError as wedged:
+                # Chained, so the log still shows what the endpoint last did
+                # rather than only that it is presumed to be doing it still.
+                raise wedged from last
+            try:
                 raw = transport(url, payload, self.timeout_seconds)
-                break
             # HTTPError and URLError are both OSError subclasses, so this one
             # clause covers refused connections, timeouts and error statuses
             # alike — every failure mode where re-sending an identical request is
             # the right response.
             except OSError as exc:
                 last = exc
+                # Retried the same either way; classified oppositely. An HTTP
+                # status is the server ANSWERING — badly, but on a round trip,
+                # having cost none of the time the circuit exists to save — so a
+                # 400 over an over-long prompt or a 503 from a model still
+                # loading must not be evidence that the endpoint is gone.
+                # HTTPError is a URLError, so it has to be asked about first.
+                if isinstance(exc, urllib.error.HTTPError):
+                    self.circuit.record_reachable()
+                else:
+                    self.circuit.record_unreachable()
+                continue
+            # Reachable is all this records. Whether the body is usable is the
+            # next paragraph's business, and a body this harness refuses is not
+            # evidence that the endpoint is down.
+            self.circuit.record_reachable()
+            break
         if raw is None:
             raise LocalModelTransportError(
                 f"{url}: {attempts} attempt(s) failed; last error: {last}"
@@ -748,6 +930,9 @@ class ChatCompletionsClient:
     attempts: int = DEFAULT_ATTEMPTS
     transport: Transport = _urlopen_transport
     get_transport: Transport = _urlget_transport
+    circuit: EndpointCircuit = field(
+        default_factory=EndpointCircuit, compare=False, repr=False
+    )
 
     @property
     def pin(self) -> ModelPin:
@@ -757,12 +942,16 @@ class ChatCompletionsClient:
         return self.pin.endpoint.rstrip("/") + path
 
     def _request(self, transport: Transport, url: str, payload: bytes) -> Any:
+        # The delegate is rebuilt per request, so the circuit has to be handed
+        # down explicitly: a fresh one each time would remember nothing, and
+        # remembering across requests is the whole mechanism.
         return LocalChatClient(
             pin=self.pin,
             timeout_seconds=self.timeout_seconds,
             attempts=self.attempts,
             transport=self.transport,
             get_transport=self.get_transport,
+            circuit=self.circuit,
         )._request(transport, url, payload)
 
     def chat(self, messages: Sequence[Mapping[str, str]]) -> str:
