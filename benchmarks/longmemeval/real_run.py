@@ -2953,8 +2953,10 @@ class QuestionExtractionError(RuntimeError):
     which question it was.
 
     ``not_started`` names the questions that stop bought: the ones a re-run still
-    has to get through, read off each outcome's ``started`` flag rather than
-    asserted in the message beside them.
+    has to get through, read off each outcome (:attr:`QuestionExtraction.must_rerun`)
+    rather than asserted in the message beside them. A question the pass never
+    reached but the cache already covers is not among them — the re-run skips it,
+    so listing it would name work nobody owes.
     """
 
     def __init__(
@@ -2966,7 +2968,7 @@ class QuestionExtractionError(RuntimeError):
         self.failures = dict(failures)
         # Which questions those were, not merely that there were some: it is the
         # list the re-run still has to get through, and it is read off the
-        # outcomes' own ``started`` flag rather than asserted in this sentence.
+        # outcomes themselves rather than asserted in this sentence.
         self.not_started = list(not_started)
         detail = "; ".join(
             f"{question_id}: {error!r}" for question_id, error in self.failures.items()
@@ -2990,16 +2992,50 @@ class QuestionExtraction:
     sessions_extracted: int = 0
     calls: int = 0
     # Every session was already memoised, so the question was not walked at all.
+    # A fact about the CACHE, and true whether the question came up in a running
+    # pass or in a stopped one.
     skipped: bool = False
     # False when the pass had already stopped — a failure elsewhere, or the
-    # operator's Ctrl-C — and this question was therefore never begun. Not an
-    # error of its own, and not work either. Read by :func:`extract_questions`,
-    # which turns the false ones into the list a stopped pass reports
-    # (:class:`QuestionExtractionError.not_started`): the questions a re-run
-    # still has to get through.
+    # operator's Ctrl-C — and this question was therefore never begun. A fact
+    # about the PASS: not an error of its own, and not work either. On its own it
+    # does not say whether a re-run owes the question, because a question the
+    # cache already covers completely is owed to nobody; that reading is
+    # :attr:`must_rerun`, which is what :func:`extract_questions` lists.
     started: bool = True
     error: BaseException | None = None
     message: str = ""
+
+    @property
+    def must_rerun(self) -> bool:
+        """True only for a question the next pass still has to get through.
+
+        The two flags answer different questions and the list needs both. Reading
+        ``started`` alone was the defect: on a cache that is not a prefix of the
+        question order — an earlier multi-worker pass stopped with holes in it, a
+        hand-pruned ``--out-dir`` — a fully cached question sitting behind the
+        halt was reported as never started, which is true, and as work the re-run
+        still has to pay for, which is not.
+        """
+        return not self.started and not self.skipped
+
+
+def _question_is_fully_cached(spec: QuestionSpec, cache: ExtractionCache) -> bool:
+    """Is every one of this question's sessions already memoised?
+
+    The one place that asks, so the running pass and the stopped one cannot drift
+    into asking it differently — which is precisely what had happened: the halt
+    path did not ask at all.
+
+    A snapshot, deliberately. Under more than one worker a question already in
+    flight may memoise sessions while this is being read, so an answer of False
+    means "not cached as of now" and never "will still be missing later". That is
+    the same tolerance :func:`_extract_question` has always run under, and it errs
+    the safe way: a re-run that is told about a question it turns out to skip
+    costs a cache lookup, while the reverse would cost the question.
+    """
+    return all(
+        cache.get(spec.question_id, session.id) is not None for session in spec.sessions
+    )
 
 
 def _extract_question(
@@ -3028,10 +3064,7 @@ def _extract_question(
     original run never sent.
     """
     label = f"  [{position}/{total}] {spec.question_id} ({spec.split}): "
-    if all(
-        cache.get(spec.question_id, session.id) is not None
-        for session in spec.sessions
-    ):
+    if _question_is_fully_cached(spec, cache):
         return QuestionExtraction(
             question_id=spec.question_id,
             skipped=True,
@@ -3195,6 +3228,23 @@ def extract_questions(
     def run(numbered: tuple[int, QuestionSpec]) -> QuestionExtraction:
         position, spec = numbered
         if halt.is_set():
+            # Not walked — the pass has stopped — but whether the re-run OWES it
+            # is a question about the cache, and answering it without looking is
+            # what reported cached work as outstanding. The cache the run
+            # inherits need not be a prefix of the question order, so a question
+            # behind the halt can be one that is already wholly paid for. Same
+            # check the running path makes, one call site for both.
+            if _question_is_fully_cached(spec, cache):
+                return QuestionExtraction(
+                    question_id=spec.question_id,
+                    started=False,
+                    skipped=True,
+                    message=(
+                        f"  [{position}/{total}] {spec.question_id} "
+                        f"({spec.split}): not started, "
+                        f"{len(spec.sessions)} session(s) already cached"
+                    ),
+                )
             return QuestionExtraction(question_id=spec.question_id, started=False)
         try:
             return _extract_question(
@@ -3248,7 +3298,7 @@ def extract_questions(
             # so the merge is the iteration and no sorting is needed.
             outcomes = drain(pool.map(run, numbered))
 
-    not_started = [outcome.question_id for outcome in outcomes if not outcome.started]
+    not_started = [outcome.question_id for outcome in outcomes if outcome.must_rerun]
     if interrupted.is_set():
         # Ahead of the failures: the operator asked for this one, and a Ctrl-C
         # reported as a question failure would send them looking for a fault.
