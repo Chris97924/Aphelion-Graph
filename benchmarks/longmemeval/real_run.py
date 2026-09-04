@@ -2975,10 +2975,10 @@ class QuestionExtractionError(RuntimeError):
         )
         super().__init__(
             f"{len(self.failures)} question(s) failed to extract and "
-            f"{len(self.not_started)} question(s) were never started, because "
+            f"{len(self.not_started)} question(s) still to do, because "
             "submission stops at the first failure while every question already "
             "running is allowed to finish — so what they wrote is durable, "
-            f"re-run to resume from it. Failures: {detail}. Never started: "
+            f"re-run to resume from it. Failures: {detail}. Still to do: "
             f"{', '.join(self.not_started) or 'none'}"
         )
 
@@ -3305,12 +3305,12 @@ def extract_questions(
         # What they failed at is named in the message all the same.
         progress(
             f"interrupted: stopped at a question boundary, {len(not_started)} "
-            "question(s) not started"
+            "question(s) still to do"
         )
         raise KeyboardInterrupt(
             "extraction was interrupted and stopped at a question boundary. The "
             "question in flight was walked to its end, "
-            f"{len(not_started)} question(s) were never started and "
+            f"{len(not_started)} question(s) still to do and "
             f"{len(failures)} failed. Everything already extracted is durable — "
             "re-run to resume from it."
         )

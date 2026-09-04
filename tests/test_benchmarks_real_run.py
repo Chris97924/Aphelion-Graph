@@ -5425,7 +5425,7 @@ def test_a_failure_names_the_questions_it_never_started(tmp_path: Path) -> None:
         )
 
     assert raised.value.not_started == ["sched-3", "sched-4", "sched-5"]
-    assert "3 question(s) were never started" in str(raised.value)
+    assert "3 question(s) still to do" in str(raised.value)
 
 
 @pytest.mark.integration
@@ -5534,7 +5534,7 @@ def test_a_cached_question_reached_after_the_halt_is_not_work_the_rerun_owes(
     assert set(raised.value.failures) == {"sched-3"}
     # sched-4 is genuinely owed; sched-5 is already paid for.
     assert raised.value.not_started == ["sched-4"]
-    assert "1 question(s) were never started" in str(raised.value)
+    assert "1 question(s) still to do" in str(raised.value)
     assert "sched-5" not in str(raised.value)
     # And the operator is told why the count is lower than the queue behind the
     # failure, rather than left to guess at a silently missing question.
@@ -5572,9 +5572,9 @@ def test_ctrl_c_counts_only_the_questions_a_rerun_still_owes(tmp_path: Path) -> 
         real_run.extract_only(cfg, client_factory=factory, progress=lines.append)
 
     # sched-2 was walked to its end; sched-3 and sched-4 are owed; sched-5 is not.
-    assert "2 question(s) were never started" in str(raised.value)
+    assert "2 question(s) still to do" in str(raised.value)
     assert any(
-        "stopped at a question boundary, 2 question(s) not started" in line
+        "stopped at a question boundary, 2 question(s) still to do" in line
         for line in lines
     )
     assert _rows_by_question(cfg)["sched-2"] == {
