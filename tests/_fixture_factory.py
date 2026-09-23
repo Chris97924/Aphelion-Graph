@@ -11,6 +11,7 @@ import io
 import json
 import shutil
 import tarfile
+import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -626,21 +627,44 @@ CASES: list[tuple[FixtureCase, Callable[[Path], None]]] = [
 ]
 
 
+def _sync(built: Path, dest: Path) -> None:
+    """Make dest equal built, writing a file only where its bytes differ."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for have in dest.iterdir():
+        want = built / have.name
+        if not want.exists() or want.is_dir() != have.is_dir():
+            if have.is_dir():
+                shutil.rmtree(have)
+            else:
+                have.unlink()
+    for want in built.iterdir():
+        have = dest / want.name
+        if want.is_dir():
+            _sync(want, have)
+        elif not have.is_file() or have.read_bytes() != want.read_bytes():
+            have.write_bytes(want.read_bytes())
+
+
 def materialize_all(root: Path) -> list[FixtureCase]:
-    """Write every fixture under root/<category>/<name>/ and return metadata."""
+    """Make every root/<category>/<name>/ equal its factory output; return metadata.
+
+    Each case is built in a scratch directory and copied over only where the bytes
+    differ; files the factory does not produce are removed. A tree that already
+    matches is left untouched, so a run does not dirty a checkout that was right.
+    """
     meta: list[FixtureCase] = []
-    for case, builder in CASES:
-        dest = root / case.category / case.name
-        if dest.exists():
-            shutil.rmtree(dest)
-        dest.mkdir(parents=True, exist_ok=True)
-        builder(dest)
-        readme = (
-            f"# {case.category}/{case.name}\n"
-            f"expected_exit: {case.expected_exit}\n"
-            f"expected_code: {case.expected_code or '-'}\n"
-            f"description: {case.description}\n"
-        )
-        (dest / "README.md").write_text(readme, encoding="utf-8", newline="\n")
-        meta.append(case)
+    with tempfile.TemporaryDirectory() as scratch:
+        for case, builder in CASES:
+            built = Path(scratch) / case.category / case.name
+            built.mkdir(parents=True)
+            builder(built)
+            readme = (
+                f"# {case.category}/{case.name}\n"
+                f"expected_exit: {case.expected_exit}\n"
+                f"expected_code: {case.expected_code or '-'}\n"
+                f"description: {case.description}\n"
+            )
+            (built / "README.md").write_text(readme, encoding="utf-8", newline="\n")
+            _sync(built, root / case.category / case.name)
+            meta.append(case)
     return meta
