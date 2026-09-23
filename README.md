@@ -297,9 +297,9 @@ flight, not counted per request — and further requests then fail at once inste
 of each paying `attempts x timeout` to learn the same thing; one request per
 cooldown is let through to see whether it came back. Only silence counts: a
 refused body and a refused HTTP status are both the server answering, and neither
-opens the circuit. What a stopped pass could not get to is named by the failure
+opens the circuit. The work a re-run still owes is named by the failure
 path at any `N`, and by the interrupt at the default `N = 1`; above 1 the
-interrupt is the thread pool's own and arrives bare, so what was not started is
+interrupt is the thread pool's own and arrives bare, so what a re-run still owes is
 read off the cache. See `docs/benchmark/extraction-mechanism.md` §9, which also
 retires pre-merge extraction caches for the reason §8 gives.
 
