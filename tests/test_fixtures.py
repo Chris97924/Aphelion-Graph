@@ -316,3 +316,33 @@ def test_materialize_restores_the_exact_name_of_an_entry_that_differs_only_by_ca
     names = os.listdir(right.parent)
     assert right.name in names and wrong.name not in names
     assert _tree(tmp_path) == expected
+
+
+# The same one level up: a category or case directory that differs from the factory's
+# name only by case is replaced by the exactly named one. Entries the factory does not
+# name at those levels are left alone. On a case-sensitive filesystem the renamed copy
+# is a second directory, removed only because it matches a produced name ignoring case.
+@pytest.mark.parametrize(
+    "rel",
+    [
+        pytest.param("valid/minimal-single-claim", id="case-dir"),
+        pytest.param("valid", id="category-dir"),
+    ],
+)
+def test_materialize_restores_the_exact_name_of_a_directory_that_differs_only_by_case(
+    tmp_path: Path, rel: str
+) -> None:
+    materialize_all(tmp_path)
+    unrelated = [tmp_path / "notes" / "keep.md", tmp_path / "round-trip" / "keep.md"]
+    for p in unrelated:
+        p.parent.mkdir(exist_ok=True)
+        p.write_bytes(b"not a factory output\n")
+    expected = _tree(tmp_path)
+    right = tmp_path / rel
+    wrong = right.with_name(right.name.upper())
+    right.rename(wrong)
+    assert wrong.name in os.listdir(right.parent)
+    materialize_all(tmp_path)
+    names = os.listdir(right.parent)
+    assert right.name in names and wrong.name not in names
+    assert _tree(tmp_path) == expected
