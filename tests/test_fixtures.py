@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -159,3 +160,65 @@ def test_round_trip_byte_equal(tmp_path: Path, name: str) -> None:
     h1 = hashlib.sha256(arc1.read_bytes()).hexdigest()
     h2 = hashlib.sha256(arc2.read_bytes()).hexdigest()
     assert h1 == h2, f"{name}: pack->unpack->pack not byte-equal: {h1} vs {h2}"
+
+
+# ---------- materialize ----------
+#
+# materialize_all runs at every session start into the tracked tests/fixtures, so
+# it has to converge on the factory output while writing only what differs: a
+# tree that already matches must come out of a run untouched, or every run
+# dirties a checkout whose bytes were already right.
+
+_STAMP_NS = 1_000_000_000 * 1_000_000_000  # 2001-09-09; any write moves a file past it
+
+
+def _tree(root: Path) -> dict[str, Optional[bytes]]:
+    """Every path under root, mapped to its bytes (None for a directory)."""
+    return {
+        p.relative_to(root).as_posix(): p.read_bytes() if p.is_file() else None
+        for p in root.rglob("*")
+    }
+
+
+def test_materialize_second_run_writes_nothing(tmp_path: Path) -> None:
+    materialize_all(tmp_path)
+    files = [p for p in tmp_path.rglob("*") if p.is_file()]
+    for p in files:
+        os.utime(p, ns=(_STAMP_NS, _STAMP_NS))
+    materialize_all(tmp_path)
+    written = [
+        p.relative_to(tmp_path).as_posix()
+        for p in files
+        if not p.is_file() or p.stat().st_mtime_ns != _STAMP_NS
+    ]
+    assert written == [], f"second run rewrote {len(written)} of {len(files)} files"
+
+
+def test_materialize_rewrites_a_fixture_whose_bytes_differ(tmp_path: Path) -> None:
+    materialize_all(tmp_path)
+    expected = _tree(tmp_path)
+    target = tmp_path / "valid" / "minimal-single-claim" / "manifest.json"
+    # The form a core.autocrlf=true checkout hands over.
+    target.write_bytes(target.read_bytes().replace(b"\n", b"\r\n"))
+    assert _tree(tmp_path) != expected
+    materialize_all(tmp_path)
+    assert _tree(tmp_path) == expected
+
+
+def test_materialize_removes_a_file_the_factory_does_not_produce(tmp_path: Path) -> None:
+    materialize_all(tmp_path)
+    expected = _tree(tmp_path)
+    case = tmp_path / "valid" / "minimal-single-claim"
+    (case / "stray.md").write_bytes(b"not a factory output\n")
+    (case / "stray-dir").mkdir()
+    (case / "stray-dir" / "stray.json").write_bytes(b"{}\n")
+    materialize_all(tmp_path)
+    assert _tree(tmp_path) == expected
+
+
+def test_materialize_recreates_a_missing_file(tmp_path: Path) -> None:
+    materialize_all(tmp_path)
+    expected = _tree(tmp_path)
+    (tmp_path / "valid" / "minimal-single-claim" / "provenance.jsonl").unlink()
+    materialize_all(tmp_path)
+    assert _tree(tmp_path) == expected
