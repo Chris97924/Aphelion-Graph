@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
+import stat
 import tarfile
 import tempfile
 import unicodedata
@@ -627,16 +629,37 @@ CASES: list[tuple[FixtureCase, Callable[[Path], None]]] = [
 ]
 
 
+def _is_link(path: Path) -> bool:
+    """True for a symlink or a Windows junction, dangling or not; never follows it."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return os.name == "nt" and st.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
 def _sync(built: Path, dest: Path) -> None:
-    """Make dest equal built, writing a file only where its bytes differ."""
+    """Make dest equal built, writing a file only where its bytes differ.
+
+    A link in dest (symlink or junction, dangling or not) is unlinked, never
+    followed: through one, the removals and writes below would land outside the
+    fixture tree. Each entry is checked with lstat before anything else reads it.
+    """
+    if _is_link(dest):
+        dest.unlink()
     dest.mkdir(parents=True, exist_ok=True)
     for have in dest.iterdir():
         want = built / have.name
-        if not want.exists() or want.is_dir() != have.is_dir():
+        if _is_link(have):
+            have.unlink()
+        elif not want.exists() or want.is_dir() != have.is_dir():
             if have.is_dir():
                 shutil.rmtree(have)
             else:
                 have.unlink()
+    # No entry of dest is a link any more, so nothing below can leave the tree.
     for want in built.iterdir():
         have = dest / want.name
         if want.is_dir():
@@ -665,6 +688,9 @@ def materialize_all(root: Path) -> list[FixtureCase]:
                 f"description: {case.description}\n"
             )
             (built / "README.md").write_text(readme, encoding="utf-8", newline="\n")
-            _sync(built, root / case.category / case.name)
+            category = root / case.category
+            if _is_link(category):
+                category.unlink()
+            _sync(built, category / case.name)
             meta.append(case)
     return meta
