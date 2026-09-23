@@ -222,3 +222,50 @@ def test_materialize_recreates_a_missing_file(tmp_path: Path) -> None:
     (tmp_path / "valid" / "minimal-single-claim" / "provenance.jsonl").unlink()
     materialize_all(tmp_path)
     assert _tree(tmp_path) == expected
+
+
+# A link in the fixture tree points outside it. Following one would delete what the
+# factory does not produce and write fixture bytes there, so each is replaced by
+# the real entry and whatever it pointed at is left exactly as it was.
+_LINKS = [
+    pytest.param("valid", "dir", id="category-dir-symlink"),
+    pytest.param("valid/minimal-single-claim", "dir", id="case-dir-symlink"),
+    pytest.param("valid/minimal-single-claim/claims", "dir", id="subdir-symlink"),
+    pytest.param("valid/minimal-single-claim/manifest.json", "file", id="file-symlink"),
+    pytest.param("valid/minimal-single-claim/manifest.json", "dangling", id="dangling-file-symlink"),
+]
+if os.name == "nt":
+    # A junction needs no symlink privilege and is not a symlink to Path.is_symlink().
+    _LINKS.append(pytest.param("valid/minimal-single-claim", "junction", id="case-dir-junction"))
+
+
+@pytest.mark.parametrize(("rel", "kind"), _LINKS)
+def test_materialize_replaces_a_destination_link_without_following_it(
+    tmp_path: Path, rel: str, kind: str
+) -> None:
+    fixtures = tmp_path / "fixtures"
+    materialize_all(fixtures)
+    expected = _tree(fixtures)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel.md").write_bytes(b"not a fixture\n")
+    untouched = _tree(outside)
+    link = fixtures / rel
+    if link.is_dir():
+        shutil.rmtree(link)
+    else:
+        link.unlink()
+    if kind == "junction":
+        import _winapi
+
+        _winapi.CreateJunction(str(outside), str(link))
+    else:
+        target = {"dir": outside, "file": outside / "sentinel.md", "dangling": outside / "absent.md"}
+        try:
+            link.symlink_to(target[kind], target_is_directory=kind == "dir")
+        except OSError:
+            pytest.skip("this platform/user cannot create symlinks")
+    materialize_all(fixtures)
+    assert _tree(outside) == untouched
+    assert not link.is_symlink()
+    assert _tree(fixtures) == expected
