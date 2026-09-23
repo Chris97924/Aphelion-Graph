@@ -646,15 +646,18 @@ def _sync(built: Path, dest: Path) -> None:
     A link in dest (symlink or junction, dangling or not) is unlinked, never
     followed: through one, the removals and writes below would land outside the
     fixture tree. Each entry is checked with lstat before anything else reads it.
+    Names are compared exactly, so an entry that differs only by case is replaced;
+    a differing file is unlinked before it is written, so a hard link is broken.
     """
     if _is_link(dest):
         dest.unlink()
     dest.mkdir(parents=True, exist_ok=True)
+    produced = {want.name for want in built.iterdir()}
     for have in dest.iterdir():
         want = built / have.name
         if _is_link(have):
             have.unlink()
-        elif not want.exists() or want.is_dir() != have.is_dir():
+        elif have.name not in produced or want.is_dir() != have.is_dir():
             if have.is_dir():
                 shutil.rmtree(have)
             else:
@@ -665,6 +668,7 @@ def _sync(built: Path, dest: Path) -> None:
         if want.is_dir():
             _sync(want, have)
         elif not have.is_file() or have.read_bytes() != want.read_bytes():
+            have.unlink(missing_ok=True)  # a new file: writing in place would go through a hard link
             have.write_bytes(want.read_bytes())
 
 
