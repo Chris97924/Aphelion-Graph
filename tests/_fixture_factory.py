@@ -672,6 +672,25 @@ def _sync(built: Path, dest: Path) -> None:
             have.write_bytes(want.read_bytes())
 
 
+def _exact(parent: Path, name: str) -> Path:
+    """Return parent/name after removing any entry of parent that differs from name only by case.
+
+    On a case-insensitive filesystem such an entry would resolve as parent/name and
+    keep its wrong name. It is removed like any other entry: a link is unlinked,
+    never followed, and only a real directory is removed recursively. Entries whose
+    names differ otherwise are left alone.
+    """
+    if parent.is_dir():
+        for entry in os.listdir(parent):
+            if entry != name and entry.casefold() == name.casefold():
+                wrong = parent / entry
+                if not _is_link(wrong) and wrong.is_dir():
+                    shutil.rmtree(wrong)
+                else:
+                    wrong.unlink()
+    return parent / name
+
+
 def materialize_all(root: Path) -> list[FixtureCase]:
     """Make every root/<category>/<name>/ equal its factory output; return metadata.
 
@@ -692,9 +711,9 @@ def materialize_all(root: Path) -> list[FixtureCase]:
                 f"description: {case.description}\n"
             )
             (built / "README.md").write_text(readme, encoding="utf-8", newline="\n")
-            category = root / case.category
+            category = _exact(root, case.category)
             if _is_link(category):
                 category.unlink()
-            _sync(built, category / case.name)
+            _sync(built, _exact(category, case.name))
             meta.append(case)
     return meta
