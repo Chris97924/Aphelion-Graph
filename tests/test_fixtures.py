@@ -269,3 +269,50 @@ def test_materialize_replaces_a_destination_link_without_following_it(
     assert _tree(outside) == untouched
     assert not link.is_symlink()
     assert _tree(fixtures) == expected
+
+
+# A fixture file hard-linked to a file outside the tree shares that file's bytes:
+# writing the factory bytes through it would overwrite the outside file too, so a
+# differing file is replaced by a new one, never rewritten in place.
+def test_materialize_replaces_a_hard_linked_fixture_instead_of_writing_through_it(
+    tmp_path: Path,
+) -> None:
+    fixtures = tmp_path / "fixtures"
+    materialize_all(fixtures)
+    expected = _tree(fixtures)
+    outside = tmp_path / "outside" / "shared.json"
+    outside.parent.mkdir()
+    outside.write_bytes(b"not a fixture\n")
+    target = fixtures / "valid" / "minimal-single-claim" / "manifest.json"
+    target.unlink()
+    os.link(outside, target)
+    assert os.path.samefile(outside, target)
+    materialize_all(fixtures)
+    assert outside.read_bytes() == b"not a fixture\n"
+    assert not os.path.samefile(outside, target)
+    assert _tree(fixtures) == expected
+
+
+# Names are compared exactly. On a case-insensitive filesystem an entry that differs
+# from the factory's only by case resolves to it, and would otherwise keep the wrong
+# name; on a case-sensitive one it is simply an entry the factory does not produce.
+@pytest.mark.parametrize(
+    "rel",
+    [
+        pytest.param("valid/minimal-single-claim/manifest.json", id="file"),
+        pytest.param("valid/minimal-single-claim/claims", id="dir"),
+    ],
+)
+def test_materialize_restores_the_exact_name_of_an_entry_that_differs_only_by_case(
+    tmp_path: Path, rel: str
+) -> None:
+    materialize_all(tmp_path)
+    expected = _tree(tmp_path)
+    right = tmp_path / rel
+    wrong = right.with_name(right.name.upper())
+    right.rename(wrong)
+    assert wrong.name in os.listdir(right.parent)
+    materialize_all(tmp_path)
+    names = os.listdir(right.parent)
+    assert right.name in names and wrong.name not in names
+    assert _tree(tmp_path) == expected
