@@ -676,12 +676,9 @@ def _exact(parent: Path, name: str) -> Path:
     """Return parent/name after settling any entry of parent that differs from name only by case.
 
     On a case-insensitive filesystem such an entry would resolve as parent/name and
-    keep its wrong name. A real directory that is parent/name under that spelling (the
-    same directory, not just a name that folds alike) is renamed, keeping everything in
-    it. One that is a distinct sibling, as on a case-sensitive filesystem, is not the
-    factory's and is left alone; parent/name is made beside it. Nothing is removed
-    recursively here: only a file or a link (never followed) is unlinked. Entries whose
-    names differ otherwise are left alone.
+    keep its wrong name. A real directory is settled by _settle_case_dir, which never
+    removes it. Nothing is removed recursively here: only a file or a link (never
+    followed) is unlinked. Entries whose names differ otherwise are left alone.
     """
     exact = parent / name
     if parent.is_dir():
@@ -689,20 +686,37 @@ def _exact(parent: Path, name: str) -> Path:
             if entry != name and entry.casefold() == name.casefold():
                 wrong = parent / entry
                 if not _is_link(wrong) and wrong.is_dir():
-                    try:
-                        alias = not _is_link(exact) and os.path.samefile(wrong, exact)
-                    except FileNotFoundError:  # case-sensitive: nothing is spelled name yet
-                        alias = False
-                    if alias:
-                        # Through a free sibling name, so the move never depends on the
-                        # filesystem accepting a rename that changes only case.
-                        hop = Path(tempfile.mkdtemp(prefix=f"{name}.case-rename-", dir=parent))
-                        hop.rmdir()  # only its name is wanted: a rename onto a directory fails on Windows
-                        wrong.rename(hop)
-                        hop.rename(exact)
+                    _settle_case_dir(wrong, exact)
                 else:
                     wrong.unlink()
     return exact
+
+
+def _settle_case_dir(wrong: Path, exact: Path) -> None:
+    """Settle the real directory wrong, whose name the caller matched to exact's ignoring case.
+
+    What the two paths are decides it, never their names. If exact reaches the same
+    directory (an alias, as on a case-insensitive filesystem), wrong is renamed to it,
+    keeping everything in it. Otherwise wrong is a distinct sibling, as on a
+    case-sensitive filesystem, that the factory did not produce: it is left alone and
+    exact is made beside it, unless exact is a link, which the caller replaces without
+    following it.
+    """
+    if _is_link(exact):
+        return
+    try:
+        alias = os.path.samefile(wrong, exact)
+    except FileNotFoundError:  # nothing is spelled like exact yet: wrong is a sibling
+        alias = False
+    if not alias:
+        exact.mkdir(exist_ok=True)
+        return
+    # Through a free sibling name, so the move never depends on the filesystem
+    # accepting a rename that changes only case.
+    hop = Path(tempfile.mkdtemp(prefix=f"{exact.name}.case-rename-", dir=exact.parent))
+    hop.rmdir()  # only its name is wanted: a rename onto a directory fails on Windows
+    wrong.rename(hop)
+    hop.rename(exact)
 
 
 def materialize_all(root: Path) -> list[FixtureCase]:

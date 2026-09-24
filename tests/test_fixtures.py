@@ -18,7 +18,7 @@ from typing import Optional
 import pytest
 
 from aphelion.cli import main as cli_main
-from tests._fixture_factory import CASES, materialize_all
+from tests._fixture_factory import CASES, _settle_case_dir, materialize_all
 
 
 ROOT = Path(__file__).resolve().parent
@@ -319,9 +319,10 @@ def test_materialize_restores_the_exact_name_of_an_entry_that_differs_only_by_ca
 
 
 # The same one level up: a category or case directory that differs from the factory's
-# name only by case is renamed to the exact name. Entries the factory does not name at
-# those levels are left alone. On a case-sensitive filesystem the renamed copy is a
-# second directory, not an alias, and is left alone too: see the sibling test below.
+# name only by case. On a case-insensitive filesystem it is the factory's own directory
+# under another spelling and gets the exact name back; on a case-sensitive one it is a
+# distinct sibling, left exactly as it was, and the exact directory is rebuilt beside
+# it. Entries the factory does not name at those levels are left alone.
 @pytest.mark.parametrize(
     "rel",
     [
@@ -339,15 +340,19 @@ def test_materialize_restores_the_exact_name_of_a_directory_that_differs_only_by
         p.write_bytes(b"not a factory output\n")
     expected = _tree(tmp_path)
     right = tmp_path / rel
+    produced = _tree(right)
     wrong = right.with_name(right.name.upper())
     right.rename(wrong)
     assert wrong.name in os.listdir(right.parent)
-    if not right.exists():
-        pytest.skip("case-sensitive filesystem: the renamed directory is a sibling, not an alias")
+    alias = right.exists()  # the exact spelling still reaches it only where case is ignored
     materialize_all(tmp_path)
     names = os.listdir(right.parent)
-    assert right.name in names and wrong.name not in names
-    assert _tree(tmp_path) == expected
+    if alias:
+        assert right.name in names and wrong.name not in names
+        assert _tree(tmp_path) == expected
+    else:
+        assert right.name in names and wrong.name in names
+        assert _tree(wrong) == produced and _tree(right) == produced
 
 
 # A category renamed so its name differs only by case, holding entries the factory
@@ -384,31 +389,37 @@ def test_materialize_renames_a_category_that_differs_only_by_case_keeping_what_i
     assert _tree(tmp_path) == expected
 
 
-# On a case-sensitive filesystem such a directory is a distinct sibling, not an alias:
-# the factory did not produce it, so it is left exactly as it was and the factory's own
-# directory is made beside it. The alias check reports two different directories here,
-# which is what it finds on such a filesystem.
-@pytest.mark.parametrize(
-    "rel",
-    [
-        pytest.param("valid/minimal-single-claim", id="case-dir"),
-        pytest.param("valid", id="category-dir"),
-    ],
-)
-def test_materialize_leaves_a_distinct_sibling_that_differs_only_by_case_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rel: str
+# Where the exact path does not reach the mis-cased directory, as on a case-sensitive
+# filesystem, that directory is a distinct sibling the factory did not produce: it is
+# left exactly as it was and the exact directory is made beside it (a link there is left
+# for the caller to replace). _settle_case_dir decides by what the two paths are, not by
+# their names, so two names that differ by more than case stand in for valid and VALID
+# and the same code runs on every filesystem.
+@pytest.mark.parametrize("exact_kind", ["absent", "directory", "link"])
+def test_settle_case_dir_leaves_a_distinct_sibling_untouched_and_makes_the_exact_dir_beside_it(
+    tmp_path: Path, exact_kind: str
 ) -> None:
-    materialize_all(tmp_path)
-    right = tmp_path / rel
-    produced = _tree(right)
-    for p in [tmp_path / "valid" / "notes.md", tmp_path / "valid" / "stale-case" / "keep.md"]:
-        p.parent.mkdir(exist_ok=True)
+    sibling = tmp_path / "VALID-sibling"
+    for p in [sibling / "notes.md", sibling / "stale-case" / "keep.md"]:
+        p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"not a factory output\n")
-    wrong = right.with_name(right.name.upper())
-    right.rename(wrong)
-    sibling = _tree(wrong)
-    monkeypatch.setattr(os.path, "samefile", lambda a, b: False)
-    materialize_all(tmp_path)
-    assert wrong.name in os.listdir(right.parent)
-    assert _tree(wrong) == sibling
-    assert produced.items() <= _tree(right).items()
+    kept = _tree(sibling)
+    exact = tmp_path / "valid"
+    if exact_kind == "directory":
+        exact.mkdir()
+        (exact / "own.md").write_bytes(b"its own\n")
+    elif exact_kind == "link":
+        if os.name == "nt":
+            import _winapi
+
+            _winapi.CreateJunction(str(sibling), str(exact))
+        else:
+            exact.symlink_to(sibling, target_is_directory=True)
+    _settle_case_dir(sibling, exact)
+    assert sorted(os.listdir(tmp_path)) == ["VALID-sibling", "valid"]
+    assert _tree(sibling) == kept
+    if exact_kind == "link":
+        assert os.path.samefile(exact, sibling)
+    else:
+        assert exact.is_dir() and not os.path.samefile(exact, sibling)
+        assert _tree(exact) == ({"own.md": b"its own\n"} if exact_kind == "directory" else {})
