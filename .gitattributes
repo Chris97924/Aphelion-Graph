@@ -8,3 +8,9 @@ benchmarks/longmemeval/split_manifest.json text eol=lf
 # Same contract, same reason: the smoke's results files are written with write_bytes
 # precisely so a rerun is byte-identical across runs and operating systems.
 benchmarks/longmemeval/*.jsonl text eol=lf
+
+# Same contract again: every test session rewrites tests/fixtures from
+# tests/_fixture_factory.py, LF, so a CRLF checkout of them is dirty after one run.
+# The evil.tar archives are binary and stay out of any line-ending conversion.
+tests/fixtures/** text eol=lf
+tests/fixtures/**/*.tar -text

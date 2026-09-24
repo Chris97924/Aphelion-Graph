@@ -9,8 +9,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
+import stat
 import tarfile
+import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -626,21 +629,119 @@ CASES: list[tuple[FixtureCase, Callable[[Path], None]]] = [
 ]
 
 
+def _is_link(path: Path) -> bool:
+    """True for a symlink or a Windows junction, dangling or not; never follows it."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return os.name == "nt" and st.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
+def _sync(built: Path, dest: Path) -> None:
+    """Make dest equal built, writing a file only where its bytes differ.
+
+    A link in dest (symlink or junction, dangling or not) is unlinked, never
+    followed: through one, the removals and writes below would land outside the
+    fixture tree. Each entry is checked with lstat before anything else reads it.
+    Names are compared exactly, so an entry that differs only by case is replaced;
+    a differing file is unlinked before it is written, so a hard link is broken.
+    """
+    if _is_link(dest):
+        dest.unlink()
+    dest.mkdir(parents=True, exist_ok=True)
+    produced = {want.name for want in built.iterdir()}
+    for have in dest.iterdir():
+        want = built / have.name
+        if _is_link(have):
+            have.unlink()
+        elif have.name not in produced or want.is_dir() != have.is_dir():
+            if have.is_dir():
+                shutil.rmtree(have)
+            else:
+                have.unlink()
+    # No entry of dest is a link any more, so nothing below can leave the tree.
+    for want in built.iterdir():
+        have = dest / want.name
+        if want.is_dir():
+            _sync(want, have)
+        elif not have.is_file() or have.read_bytes() != want.read_bytes():
+            have.unlink(missing_ok=True)  # a new file: writing in place would go through a hard link
+            have.write_bytes(want.read_bytes())
+
+
+def _exact(parent: Path, name: str) -> Path:
+    """Return parent/name after settling any entry of parent that differs from name only by case.
+
+    On a case-insensitive filesystem such an entry would resolve as parent/name and
+    keep its wrong name. A real directory is settled by _settle_case_dir, which never
+    removes it. Nothing is removed recursively here: only a file or a link (never
+    followed) is unlinked. Entries whose names differ otherwise are left alone.
+    """
+    exact = parent / name
+    if parent.is_dir():
+        for entry in os.listdir(parent):
+            if entry != name and entry.casefold() == name.casefold():
+                wrong = parent / entry
+                if not _is_link(wrong) and wrong.is_dir():
+                    _settle_case_dir(wrong, exact)
+                else:
+                    wrong.unlink()
+    return exact
+
+
+def _settle_case_dir(wrong: Path, exact: Path) -> None:
+    """Settle the real directory wrong, whose name the caller matched to exact's ignoring case.
+
+    What the two paths are decides it, never their names. If exact reaches the same
+    directory (an alias, as on a case-insensitive filesystem), wrong is renamed to it,
+    keeping everything in it. Otherwise wrong is a distinct sibling, as on a
+    case-sensitive filesystem, that the factory did not produce: it is left alone and
+    exact is made beside it, unless exact is a link, which the caller replaces without
+    following it.
+    """
+    if _is_link(exact):
+        return
+    try:
+        alias = os.path.samefile(wrong, exact)
+    except FileNotFoundError:  # nothing is spelled like exact yet: wrong is a sibling
+        alias = False
+    if not alias:
+        exact.mkdir(exist_ok=True)
+        return
+    # Through a free sibling name, so the move never depends on the filesystem
+    # accepting a rename that changes only case.
+    hop = Path(tempfile.mkdtemp(prefix=f"{exact.name}.case-rename-", dir=exact.parent))
+    hop.rmdir()  # only its name is wanted: a rename onto a directory fails on Windows
+    wrong.rename(hop)
+    hop.rename(exact)
+
+
 def materialize_all(root: Path) -> list[FixtureCase]:
-    """Write every fixture under root/<category>/<name>/ and return metadata."""
+    """Make every root/<category>/<name>/ equal its factory output; return metadata.
+
+    Each case is built in a scratch directory and copied over only where the bytes
+    differ; files the factory does not produce are removed. A tree that already
+    matches is left untouched, so a run does not dirty a checkout that was right.
+    """
     meta: list[FixtureCase] = []
-    for case, builder in CASES:
-        dest = root / case.category / case.name
-        if dest.exists():
-            shutil.rmtree(dest)
-        dest.mkdir(parents=True, exist_ok=True)
-        builder(dest)
-        readme = (
-            f"# {case.category}/{case.name}\n"
-            f"expected_exit: {case.expected_exit}\n"
-            f"expected_code: {case.expected_code or '-'}\n"
-            f"description: {case.description}\n"
-        )
-        (dest / "README.md").write_text(readme, encoding="utf-8", newline="\n")
-        meta.append(case)
+    with tempfile.TemporaryDirectory() as scratch:
+        for case, builder in CASES:
+            built = Path(scratch) / case.category / case.name
+            built.mkdir(parents=True)
+            builder(built)
+            readme = (
+                f"# {case.category}/{case.name}\n"
+                f"expected_exit: {case.expected_exit}\n"
+                f"expected_code: {case.expected_code or '-'}\n"
+                f"description: {case.description}\n"
+            )
+            (built / "README.md").write_text(readme, encoding="utf-8", newline="\n")
+            category = _exact(root, case.category)
+            if _is_link(category):
+                category.unlink()
+            _sync(built, _exact(category, case.name))
+            meta.append(case)
     return meta
