@@ -673,22 +673,36 @@ def _sync(built: Path, dest: Path) -> None:
 
 
 def _exact(parent: Path, name: str) -> Path:
-    """Return parent/name after removing any entry of parent that differs from name only by case.
+    """Return parent/name after settling any entry of parent that differs from name only by case.
 
     On a case-insensitive filesystem such an entry would resolve as parent/name and
-    keep its wrong name. It is removed like any other entry: a link is unlinked,
-    never followed, and only a real directory is removed recursively. Entries whose
+    keep its wrong name. A real directory that is parent/name under that spelling (the
+    same directory, not just a name that folds alike) is renamed, keeping everything in
+    it. One that is a distinct sibling, as on a case-sensitive filesystem, is not the
+    factory's and is left alone; parent/name is made beside it. Nothing is removed
+    recursively here: only a file or a link (never followed) is unlinked. Entries whose
     names differ otherwise are left alone.
     """
+    exact = parent / name
     if parent.is_dir():
         for entry in os.listdir(parent):
             if entry != name and entry.casefold() == name.casefold():
                 wrong = parent / entry
                 if not _is_link(wrong) and wrong.is_dir():
-                    shutil.rmtree(wrong)
+                    try:
+                        alias = not _is_link(exact) and os.path.samefile(wrong, exact)
+                    except FileNotFoundError:  # case-sensitive: nothing is spelled name yet
+                        alias = False
+                    if alias:
+                        # Through a free sibling name, so the move never depends on the
+                        # filesystem accepting a rename that changes only case.
+                        hop = Path(tempfile.mkdtemp(prefix=f"{name}.case-rename-", dir=parent))
+                        hop.rmdir()  # only its name is wanted: a rename onto a directory fails on Windows
+                        wrong.rename(hop)
+                        hop.rename(exact)
                 else:
                     wrong.unlink()
-    return parent / name
+    return exact
 
 
 def materialize_all(root: Path) -> list[FixtureCase]:

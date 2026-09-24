@@ -319,9 +319,9 @@ def test_materialize_restores_the_exact_name_of_an_entry_that_differs_only_by_ca
 
 
 # The same one level up: a category or case directory that differs from the factory's
-# name only by case is replaced by the exactly named one. Entries the factory does not
-# name at those levels are left alone. On a case-sensitive filesystem the renamed copy
-# is a second directory, removed only because it matches a produced name ignoring case.
+# name only by case is renamed to the exact name. Entries the factory does not name at
+# those levels are left alone. On a case-sensitive filesystem the renamed copy is a
+# second directory, not an alias, and is left alone too: see the sibling test below.
 @pytest.mark.parametrize(
     "rel",
     [
@@ -342,6 +342,8 @@ def test_materialize_restores_the_exact_name_of_a_directory_that_differs_only_by
     wrong = right.with_name(right.name.upper())
     right.rename(wrong)
     assert wrong.name in os.listdir(right.parent)
+    if not right.exists():
+        pytest.skip("case-sensitive filesystem: the renamed directory is a sibling, not an alias")
     materialize_all(tmp_path)
     names = os.listdir(right.parent)
     assert right.name in names and wrong.name not in names
