@@ -346,3 +346,67 @@ def test_materialize_restores_the_exact_name_of_a_directory_that_differs_only_by
     names = os.listdir(right.parent)
     assert right.name in names and wrong.name not in names
     assert _tree(tmp_path) == expected
+
+
+# A category renamed so its name differs only by case, holding entries the factory
+# does not produce there: on a case-insensitive filesystem it is the factory's own
+# directory under another spelling. It gets the exact name back with everything in
+# it; nothing in it is removed, and the tree it leaves is one a rerun does not touch.
+def test_materialize_renames_a_category_that_differs_only_by_case_keeping_what_it_holds(
+    tmp_path: Path,
+) -> None:
+    materialize_all(tmp_path)
+    right = tmp_path / "valid"
+    for p in [right / "notes.md", right / "stale-case" / "keep.md"]:
+        p.parent.mkdir(exist_ok=True)
+        p.write_bytes(b"not a factory output\n")
+    expected = _tree(tmp_path)  # the full fixture set plus both unrelated files' bytes
+    wrong = tmp_path / "VALID"
+    right.rename(wrong)
+    if not right.exists():
+        pytest.skip("case-sensitive filesystem: VALID is a sibling of valid, not an alias")
+    materialize_all(tmp_path)
+    names = os.listdir(tmp_path)
+    assert "valid" in names and "VALID" not in names
+    assert _tree(tmp_path) == expected
+    files = [p for p in tmp_path.rglob("*") if p.is_file()]
+    for p in files:
+        os.utime(p, ns=(_STAMP_NS, _STAMP_NS))
+    materialize_all(tmp_path)
+    written = [
+        p.relative_to(tmp_path).as_posix()
+        for p in files
+        if not p.is_file() or p.stat().st_mtime_ns != _STAMP_NS
+    ]
+    assert written == [], f"second run rewrote {len(written)} of {len(files)} files"
+    assert _tree(tmp_path) == expected
+
+
+# On a case-sensitive filesystem such a directory is a distinct sibling, not an alias:
+# the factory did not produce it, so it is left exactly as it was and the factory's own
+# directory is made beside it. The alias check reports two different directories here,
+# which is what it finds on such a filesystem.
+@pytest.mark.parametrize(
+    "rel",
+    [
+        pytest.param("valid/minimal-single-claim", id="case-dir"),
+        pytest.param("valid", id="category-dir"),
+    ],
+)
+def test_materialize_leaves_a_distinct_sibling_that_differs_only_by_case_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rel: str
+) -> None:
+    materialize_all(tmp_path)
+    right = tmp_path / rel
+    produced = _tree(right)
+    for p in [tmp_path / "valid" / "notes.md", tmp_path / "valid" / "stale-case" / "keep.md"]:
+        p.parent.mkdir(exist_ok=True)
+        p.write_bytes(b"not a factory output\n")
+    wrong = right.with_name(right.name.upper())
+    right.rename(wrong)
+    sibling = _tree(wrong)
+    monkeypatch.setattr(os.path, "samefile", lambda a, b: False)
+    materialize_all(tmp_path)
+    assert wrong.name in os.listdir(right.parent)
+    assert _tree(wrong) == sibling
+    assert produced.items() <= _tree(right).items()
