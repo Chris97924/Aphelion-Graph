@@ -29,3 +29,7 @@ markers = [
     "unit: fast unit tests with no I/O",
     "integration: tests that require external resources",
 ]
+
+# Library, not an application: CI installs with pip; uv.lock pins the dev environment only.
+[tool.uv]
+exclude-newer = "7 days"
