@@ -14,6 +14,7 @@ jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       id-token: write   # REQUIRED for PyPI Trusted Publisher (OIDC); do not remove
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
