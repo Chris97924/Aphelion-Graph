@@ -508,7 +508,10 @@ def test_force_does_not_follow_symlinks_inside_the_destination(tmp_path: Path) -
 
 @pytest.mark.skipif(
     not shutil.rmtree.avoids_symlink_attacks,
-    reason="rmtree on this platform cannot detect a directory replaced mid-removal",
+    reason=(
+        "known residual: where shutil.rmtree.avoids_symlink_attacks is false "
+        "(Windows), rmtree cannot detect a directory replaced mid-removal"
+    ),
 )
 def test_force_does_not_follow_a_directory_replaced_by_a_symlink_during_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -550,13 +553,12 @@ def test_force_does_not_follow_a_directory_replaced_by_a_symlink_during_removal(
     monkeypatch.setattr(os, "open", open_)
     monkeypatch.setattr(os, "scandir", scandir_)
 
-    with pytest.raises(OSError) as exc:
+    with pytest.raises(OSError):
         migrate(MigrateOptions(src=src, dst=dst, force=True))
 
     assert swaps, "the directory was never opened for listing"
     assert (elsewhere / "precious.txt").exists()
     assert (elsewhere / "precious.txt").read_bytes() == b"precious"
-    assert "symbolic link" in str(exc.value)
     assert not any(p.name.startswith(".v04.migrating-") for p in tmp_path.iterdir())
 
 

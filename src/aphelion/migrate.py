@@ -185,7 +185,12 @@ def _is_link(st: os.stat_result) -> bool:
 
 
 def _remove_no_follow(path: Path) -> None:
-    """Delete ``path``; a symlink or junction anywhere is unlinked, never followed."""
+    """Delete ``path``; a symlink or junction anywhere is unlinked, never followed.
+
+    Where ``shutil.rmtree.avoids_symlink_attacks`` is false (Windows), rmtree
+    walks by path, so a directory that another process replaces with a link
+    while the tree is being removed can still be followed: a known residual.
+    """
     st = os.lstat(path)
     if _is_link(st):
         # On Windows a directory symlink or junction is removed with rmdir,
@@ -201,7 +206,9 @@ def _remove_no_follow(path: Path) -> None:
         # Windows). Where shutil.rmtree.avoids_symlink_attacks is true it
         # also walks by file descriptor and checks each directory it opens is
         # the one it inspected, so a directory replaced by a symlink while
-        # the tree is being removed is refused, not followed.
+        # the tree is being removed is refused, not followed. Inside the
+        # tree, rmtree treats only symlink and junction (mount point) reparse
+        # points as links; other reparse point kinds are descended into.
         shutil.rmtree(path)
         return
     os.unlink(path)
