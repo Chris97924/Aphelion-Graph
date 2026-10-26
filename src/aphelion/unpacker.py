@@ -13,7 +13,10 @@ distinct PX_E_6NNN code (see :mod:`aphelion.error_codes`):
 
 from __future__ import annotations
 
+import os
 import re
+import secrets
+import shutil
 import tarfile
 import unicodedata
 from dataclasses import dataclass
@@ -237,13 +240,91 @@ def unpack(
 
     Uses a streaming tarfile.next() loop - NEVER tar.extractall(), because
     extractall won't catch zip-bomb-class expansion until it's already disk-bound.
+
+    All-or-nothing: members are extracted into a staging directory next to
+    ``dest_dir`` and moved into place only once every member has passed every
+    check. A failed unpack leaves ``dest_dir`` as it was, and removes any
+    parent directories it had to create. On success, archive files replace
+    same-named files in an existing ``dest_dir``; other files there are kept.
     """
     policy = policy or ExtractPolicy.default()
     archive = Path(archive_path)
     dest = Path(dest_dir)
-    dest.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and not dest.is_dir():
+        raise FileExistsError(f"unpack destination is not a directory: {dest}")
     dest_resolved = dest.resolve()
+    created = _first_missing_ancestor(dest_resolved)
+    dest_resolved.parent.mkdir(parents=True, exist_ok=True)
+    staging = _make_staging_dir(dest_resolved)
+    try:
+        _extract(archive, staging, dest_resolved, policy)
+        _move_into_place(staging, dest_resolved)
+    except BaseException:
+        # rmtree does not follow symlinks; staging and `created` only hold
+        # directories and files this call made.
+        shutil.rmtree(staging, ignore_errors=True)
+        if created is not None:
+            shutil.rmtree(created, ignore_errors=True)
+        raise
+    return dest
 
+
+def _first_missing_ancestor(path: Path) -> Path | None:
+    """The outermost of ``path`` and its parents that does not exist yet."""
+    missing = None
+    for candidate in (path, *path.parents):
+        if candidate.exists() or candidate.is_symlink():
+            break
+        missing = candidate
+    return missing
+
+
+def _make_staging_dir(dest: Path) -> Path:
+    # A sibling of dest, so the final move is a rename on the same filesystem.
+    # Path.mkdir (not tempfile.mkdtemp) keeps the umask-derived mode that dest
+    # would have had, since on success the staging dir may become dest.
+    while True:
+        staging = dest.parent / f".{dest.name}.unpacking-{secrets.token_hex(8)}"
+        try:
+            staging.mkdir()
+        except FileExistsError:  # pragma: no cover - 64-bit random collision
+            continue
+        return staging
+
+
+def _move_into_place(staging: Path, dest: Path) -> None:
+    """Move a fully extracted staging tree into ``dest``."""
+    if not dest.exists():
+        os.replace(staging, dest)
+        return
+    # Existing destination: merge. Check every target first so a conflict
+    # cannot leave a half-moved tree behind.
+    for root, dirnames, filenames in os.walk(staging):
+        rel_root = Path(root).relative_to(staging)
+        for name in dirnames:
+            target = dest / rel_root / name
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise FileExistsError(
+                    f"cannot unpack directory over existing non-directory: {target}"
+                )
+        for name in filenames:
+            target = dest / rel_root / name
+            if target.is_dir() and not target.is_symlink():
+                raise FileExistsError(
+                    f"cannot unpack file over existing directory: {target}"
+                )
+    for root, dirnames, filenames in os.walk(staging):
+        rel_root = Path(root).relative_to(staging)
+        for name in dirnames:
+            (dest / rel_root / name).mkdir(exist_ok=True)
+        for name in filenames:
+            os.replace(Path(root) / name, dest / rel_root / name)
+    shutil.rmtree(staging)
+
+
+def _extract(
+    archive: Path, staging: Path, dest_resolved: Path, policy: ExtractPolicy
+) -> None:
     total_bytes = 0
     archive_size = archive.stat().st_size
 
@@ -252,14 +333,16 @@ def unpack(
         # colliding or forbidden member late in the archive cannot ride on
         # members that were already extracted.
         for member, normalized in _scan_members(tar, policy):
-            target = (dest / normalized).resolve()
-            if dest_resolved not in target.parents and target != dest_resolved:
+            # Checked against the real destination: a symlink already inside
+            # dest must not carry a member outside it once moved into place.
+            final = (dest_resolved / normalized).resolve()
+            if dest_resolved not in final.parents and final != dest_resolved:
                 raise SecurityError(
                     code=ErrorCode.PATH_TRAVERSAL,
                     msg=f"resolved path escapes dest: {normalized!r}",
                     path=normalized,
                 )
-
+            target = staging / normalized
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
@@ -294,8 +377,7 @@ def unpack(
             written = 0
             chunk_size = 64 * 1024
             # Authoritative budget enforcement happens inside the read loop.
-            # On any SecurityError mid-stream, unlink the partial file so
-            # callers do not see a truncated output.
+            # A failure here discards the whole staging tree (see unpack).
             try:
                 with open(target, "wb") as out:
                     while True:
@@ -322,9 +404,6 @@ def unpack(
                                 ),
                             )
                         out.write(chunk)
-            except BaseException:
-                target.unlink(missing_ok=True)
-                raise
             finally:
                 src.close()
             total_bytes += written
@@ -341,7 +420,6 @@ def unpack(
                         f"{policy.max_compression_ratio}"
                     ),
                 )
-    return dest
 
 
 def extract_signatures_jsonl(tar_path: Path | str) -> bytes | None:

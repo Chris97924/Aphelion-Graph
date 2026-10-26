@@ -396,3 +396,115 @@ def test_explicit_directory_entries_do_not_count_as_collisions(tmp_path: Path) -
     unpack(archive, dest)
     assert (dest / "claims" / "a.md").read_bytes() == b"a"
     assert (dest / "manifest.json").read_bytes() == b"{}"
+
+
+# ---------- A8: a failed unpack leaves the destination as it was ----------
+
+
+def _tree(root: Path) -> dict[str, bytes | None]:
+    """Relative path -> bytes (files) or None (dirs), for exact comparison."""
+    if not root.exists():
+        return {}
+    return {
+        p.relative_to(root).as_posix(): (None if p.is_dir() else p.read_bytes())
+        for p in sorted(root.rglob("*"))
+    }
+
+
+def _fails_after_first_member(tmp_path: Path) -> tuple[Path, ExtractPolicy]:
+    """Archive whose first members extract fine and whose last member is over
+    the per-file budget, so the failure comes after files were written."""
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [
+            (_dir("claims"), None),
+            (_reg("claims/a.md"), b"new a"),
+            (_reg("manifest.json"), b"new manifest"),
+            (_reg("zz-big.bin"), b"B" * 4096),
+        ],
+    )
+    return archive, ExtractPolicy(max_file_bytes=1024)
+
+
+def test_failed_unpack_into_missing_dest_creates_nothing(tmp_path: Path) -> None:
+    archive, policy = _fails_after_first_member(tmp_path)
+    dest = tmp_path / "out" / "nested" / "dest"
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, dest, policy=policy)
+    assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
+    # Neither the destination nor the parents created for it remain.
+    assert not (tmp_path / "out").exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar"]
+
+
+def test_failed_unpack_into_existing_dest_leaves_it_unchanged(tmp_path: Path) -> None:
+    archive, policy = _fails_after_first_member(tmp_path)
+    dest = tmp_path / "dest"
+    (dest / "claims").mkdir(parents=True)
+    (dest / "claims" / "a.md").write_bytes(b"old a")
+    (dest / "keep.txt").write_bytes(b"keep")
+    before = _tree(dest)
+
+    with pytest.raises(SecurityError):
+        unpack(archive, dest, policy=policy)
+
+    assert _tree(dest) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
+
+
+def test_failed_unpack_on_compression_ratio_leaves_nothing(tmp_path: Path) -> None:
+    """The ratio check runs after a member is fully written (ratio 0, as in
+    test_compression_ratio_exceeded: a plain ustar archive never expands)."""
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [(_reg("one.txt"), b"1"), (_reg("two.txt"), b"A" * 2048)],
+    )
+    dest = tmp_path / "dest"
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, dest, policy=ExtractPolicy(max_compression_ratio=0))
+    assert exc.value.code == ErrorCode.COMPRESSION_RATIO_EXCEEDED
+    assert not dest.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar"]
+
+
+def test_failed_unpack_on_streamed_bomb_leaves_nothing(tmp_path: Path) -> None:
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [(_reg("one.txt"), b"1"), (_reg("two.txt"), b"x" * 2048)],
+    )
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    with pytest.raises(SecurityError):
+        unpack(archive, dest, policy=ExtractPolicy(max_total_bytes=1024))
+    assert _tree(dest) == {}
+
+
+def test_successful_unpack_into_existing_dest_merges_like_before(tmp_path: Path) -> None:
+    """Success keeps the old contract: archive files are written into dest,
+    replacing same-named files and leaving unrelated ones alone."""
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [(_dir("claims"), None), (_reg("claims/a.md"), b"new a"), (_reg("m.json"), b"{}")],
+    )
+    dest = tmp_path / "dest"
+    (dest / "claims").mkdir(parents=True)
+    (dest / "claims" / "a.md").write_bytes(b"old a")
+    (dest / "keep.txt").write_bytes(b"keep")
+
+    assert unpack(archive, dest) == dest
+
+    assert _tree(dest) == {
+        "claims": None,
+        "claims/a.md": b"new a",
+        "keep.txt": b"keep",
+        "m.json": b"{}",
+    }
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
+
+
+def test_successful_unpack_into_new_dest(tmp_path: Path) -> None:
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("claims/a.md"), b"a")])
+    dest = tmp_path / "new" / "dest"
+    unpack(archive, dest)
+    assert _tree(dest) == {"claims": None, "claims/a.md": b"a"}
+    assert sorted(p.name for p in (tmp_path / "new").iterdir()) == ["dest"]
