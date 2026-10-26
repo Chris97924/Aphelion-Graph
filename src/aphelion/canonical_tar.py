@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
+from aphelion.unpacker import WINDOWS_DRIVE_RE, MemberNames, path_parts
 
 
 MODE_FILE = 0o644
@@ -40,20 +41,56 @@ class TarMember:
         return unicodedata.normalize("NFC", self.path)
 
 
+def _check_member_path(path: str) -> str:
+    """Reject a member path that names something outside the archive root."""
+    if not path:
+        raise SchemaError(code=ErrorCode.EMPTY_MEMBER_NAME, msg="empty archive member path")
+    if "\\" in path:
+        raise SchemaError(
+            code=ErrorCode.WINDOWS_BACKSLASH,
+            msg=f"backslash in archive member path: {path!r}",
+        )
+    if path.startswith("/"):
+        raise SchemaError(
+            code=ErrorCode.ABSOLUTE_PATH,
+            msg=f"absolute archive member path: {path!r}",
+        )
+    if WINDOWS_DRIVE_RE.match(path):
+        raise SchemaError(
+            code=ErrorCode.WINDOWS_DRIVE,
+            msg=f"Windows drive prefix in archive member path: {path!r}",
+        )
+    if ".." in path.split("/"):
+        raise SchemaError(
+            code=ErrorCode.PATH_TRAVERSAL,
+            msg=f"'..' segment in archive member path: {path!r}",
+        )
+    return path
+
+
 def pack(members: list[TarMember]) -> bytes:
     """Pack members into a canonical uncompressed .tar byte string.
 
-    Raises SchemaError on any member type violation or inconsistency.
+    Raises SchemaError on any member type violation or inconsistency, on a
+    path the unpacker would refuse (absolute, drive-prefixed, backslash,
+    ``..``), and on two paths that collide once normalized
+    (see :class:`aphelion.unpacker.MemberNames`).
     """
-    seen: set[str] = set()
+    names = MemberNames()
     for member in members:
         norm = member.normalized_path()
-        if norm in seen:
+        parts = path_parts(_check_member_path(norm))
+        if not parts and not member.is_dir:
+            raise SchemaError(
+                code=ErrorCode.EMPTY_MEMBER_NAME,
+                msg=f"regular-file member has no name: {norm!r}",
+            )
+        other = names.add(parts, is_dir=member.is_dir)
+        if other is not None:
             raise SchemaError(
                 code=ErrorCode.DUPLICATE_MEMBER_PATH,
-                msg=f"duplicate archive member path after NFC: {norm!r}",
+                msg=f"archive member path {norm!r} collides with {other!r} after normalization",
             )
-        seen.add(norm)
         if member.is_dir and member.data is not None:
             raise SchemaError(
                 code=ErrorCode.DISALLOWED_MEMBER_TYPE,

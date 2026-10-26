@@ -277,6 +277,28 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
     from aphelion.sig_pack import write_signatures_jsonl, read_signatures_jsonl
     import datetime
 
+    # signers/<signer_id>.json must stay one file inside signers/ (spec v0.5
+    # §2.3: signer_id is the path stem), so the id is a single path component.
+    signer_id = args.signer_id
+    if (
+        not signer_id
+        or signer_id in (".", "..")
+        or any(sep in signer_id for sep in ("/", "\\", "\0"))
+    ):
+        # Local imports, like the guards below: those make these names
+        # function-local for the whole of _cmd_sign.
+        from aphelion.errors import SchemaError, EXIT_VALIDATION
+        from aphelion.error_codes import ErrorCode
+        from aphelion.errors import emit_error
+        emit_error(SchemaError(
+            code=ErrorCode.PATH_TRAVERSAL,
+            msg=(
+                f"--signer-id {signer_id!r} must be a single path component "
+                "(no '/', '\\', NUL, and not '.' or '..')"
+            ),
+        ))
+        return EXIT_VALIDATION
+
     pkg_path = _Path(args.package)
     if not pkg_path.exists():
         from aphelion.errors import SchemaError, EXIT_VALIDATION
@@ -295,7 +317,6 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
 
     key_bytes = key_path.read_bytes()
     algorithm = args.algorithm
-    signer_id = args.signer_id
 
     # Build the signer
     try:

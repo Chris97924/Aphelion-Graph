@@ -707,3 +707,36 @@ def test_sign_malformed_ed25519_key_emits_signer_malformed(
     assert payload is not None
     assert payload["code"] == "E_SIGNER_MALFORMED"
     assert not out.exists()
+
+
+# ---------- A7: --signer-id must name a file inside signers/ ----------
+
+
+@pytest.mark.parametrize(
+    "signer_id",
+    ["../x", "../../x", "..", ".", "", "a/b", "a\\b", "/abs", "sub/../../x"],
+)
+def test_sign_rejects_signer_id_that_is_not_a_single_path_component(
+    tmp_path: Path, signer_id: str
+) -> None:
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(HMAC_KEY)
+    out = tmp_path / "out" / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", signer_id,
+            "--algorithm", "ed25519",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    assert code == EXIT_VALIDATION, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.PATH_TRAVERSAL.value
+    assert not out.exists()

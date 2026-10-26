@@ -91,7 +91,7 @@ def _check_path(raw_name: str, policy: ExtractPolicy) -> str:
     return normalized
 
 
-def _path_parts(normalized: str) -> list[str]:
+def path_parts(normalized: str) -> list[str]:
     """Split a checked member path into its real components.
 
     Empty and ``.`` segments name no directory level (``./a``, ``a//b`` and
@@ -117,12 +117,51 @@ def member_path_key(parts: list[str]) -> str:
     return "/".join(folded)
 
 
-def _collision(path: str, other: str) -> SecurityError:
-    return SecurityError(
-        code=ErrorCode.DUPLICATE_MEMBER_PATH,
-        msg=f"member path {path!r} collides with {other!r} after normalization",
-        path=path,
-    )
+class MemberNames:
+    """Tracks member paths and reports the first collision.
+
+    ``add`` returns ``None`` when the path is new, or the earlier spelling it
+    collides with: the same file twice, two spellings of one directory, or a
+    file and a directory under one key. Shared by :func:`unpack` and
+    :func:`aphelion.canonical_tar.pack`, so the writer refuses exactly the
+    names the reader would.
+    """
+
+    def __init__(self) -> None:
+        # key -> spelling, so two spellings of one directory are caught as
+        # well as two members for one file.
+        self._dirs: dict[str, str] = {}
+        self._explicit_dirs: set[str] = set()
+        self._files: dict[str, str] = {}
+
+    def _claim_dir(self, spelling: str, key: str) -> str | None:
+        if key in self._files:
+            return self._files[key]
+        known = self._dirs.setdefault(key, spelling)
+        return known if known != spelling else None
+
+    def add(self, parts: list[str], *, is_dir: bool) -> str | None:
+        for depth in range(1, len(parts)):
+            other = self._claim_dir("/".join(parts[:depth]), member_path_key(parts[:depth]))
+            if other is not None:
+                return other
+        rel = "/".join(parts)
+        key = member_path_key(parts)
+        if is_dir:
+            if not parts:
+                return None  # the archive root itself (``.``)
+            if key in self._explicit_dirs:
+                return self._dirs.get(key, rel)
+            other = self._claim_dir(rel, key)
+            if other is not None:
+                return other
+            self._explicit_dirs.add(key)
+            return None
+        other = self._files.get(key, self._dirs.get(key))
+        if other is not None:
+            return other
+        self._files[key] = rel
+        return None
 
 
 def _scan_members(
@@ -135,18 +174,7 @@ def _scan_members(
     directory entry naming the archive root itself (``.``).
     """
     scanned: list[tuple[tarfile.TarInfo, str]] = []
-    # key -> spelling, so two spellings of one directory are caught as well
-    # as two members for one file.
-    dir_spellings: dict[str, str] = {}
-    explicit_dirs: set[str] = set()
-    files: dict[str, str] = {}
-
-    def claim_dir(spelling: str, key: str) -> None:
-        if key in files:
-            raise _collision(spelling, files[key])
-        known = dir_spellings.setdefault(key, spelling)
-        if known != spelling:
-            raise _collision(spelling, known)
+    names = MemberNames()
 
     while True:
         member = tar.next()
@@ -168,29 +196,21 @@ def _scan_members(
                 ),
                 path=member.name,
             )
-        parts = _path_parts(_check_path(member.name, policy))
+        parts = path_parts(_check_path(member.name, policy))
         if not parts and not member.isdir():
             raise SecurityError(
                 code=ErrorCode.EMPTY_MEMBER_NAME,
                 msg=f"regular file member has no name: {member.name!r}",
                 path=member.name,
             )
-        for depth in range(1, len(parts)):
-            claim_dir("/".join(parts[:depth]), member_path_key(parts[:depth]))
         rel = "/".join(parts)
-        key = member_path_key(parts)
-        if member.isdir():
-            if parts:
-                if key in explicit_dirs:
-                    raise _collision(rel, dir_spellings.get(key, rel))
-                claim_dir(rel, key)
-                explicit_dirs.add(key)
-        else:
-            if key in files:
-                raise _collision(rel, files[key])
-            if key in dir_spellings:
-                raise _collision(rel, dir_spellings[key])
-            files[key] = rel
+        other = names.add(parts, is_dir=member.isdir())
+        if other is not None:
+            raise SecurityError(
+                code=ErrorCode.DUPLICATE_MEMBER_PATH,
+                msg=f"member path {rel!r} collides with {other!r} after normalization",
+                path=rel,
+            )
         scanned.append((member, rel))
     return scanned
 
