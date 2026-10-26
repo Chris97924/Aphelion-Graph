@@ -305,6 +305,9 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
             _require_cryptography()
             priv_b64 = _base64.standard_b64encode(key_bytes).decode("ascii")
             signer = Ed25519Signer(signer_id=signer_id, private_key_b64=priv_b64)
+            # Derives the public key, so a key file that is not a raw 32-byte
+            # Ed25519 key fails here with E_SIGNER_MALFORMED.
+            manifest_record = signer.manifest()
         else:
             from aphelion.errors import SchemaError, EXIT_VALIDATION
             from aphelion.error_codes import ErrorCode
@@ -353,7 +356,6 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
 
     signed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     envelope = signer.sign(package_canonical_hash=pkg_hash, signed_at_iso=signed_at)
-    manifest_record = signer.manifest()
 
     # Merge with existing signatures if present
     existing_sigs_bytes: bytes | None = None

@@ -113,6 +113,99 @@ def compute_key_fingerprint(public_key_bytes: bytes) -> str:
     return hashlib.sha256(public_key_bytes).hexdigest()
 
 
+def _b64decode_strict(value: object, *, code: str, label: str) -> bytes:
+    """Decode base64-standard, raising ``SignerVerificationError(code)``.
+
+    ``validate=True``: the default decoder silently drops characters outside
+    the alphabet, so a key or signature with trailing junk would still decode
+    to the genuine bytes. Non-``str`` input (a JSON number, list or null from
+    a crafted file) is rejected here instead of surfacing as ``TypeError``.
+    """
+    if not isinstance(value, str):
+        raise SignerVerificationError(
+            code, f"{label} must be a base64 string, got {type(value).__name__}"
+        )
+    try:
+        return base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise SignerVerificationError(code, f"{label} not valid base64: {exc}") from exc
+
+
+def _require_hex64(value: object, *, code: str, label: str) -> str:
+    """Require 64 lowercase hex characters (§2.1 / §2.3).
+
+    Checked before ``hmac.compare_digest``, which raises a raw ``TypeError``
+    on non-ASCII or non-``str`` input.
+    """
+    if not isinstance(value, str) or not _HEX64_RE.fullmatch(value):
+        raise SignerVerificationError(
+            code, f"{label} must be 64 lowercase hex chars; got {value!r}"
+        )
+    return value
+
+
+def parse_signer_manifest(raw: bytes, *, signer_id: str) -> SignerManifest:
+    """Parse ``signers/<signer_id>.json`` strictly against §2.3.
+
+    Raises ``SignerVerificationError("E_SIGNER_MALFORMED", ...)`` for anything
+    that is not a JSON object with string ``signer_id`` (equal to the path
+    stem), ``algorithm``, base64-standard ``public_key_b64`` and 64-hex
+    ``key_fingerprint``, plus an optional string-or-null ``notary_uri``.
+    Whether the fingerprint matches the key is checked by the verifier.
+    """
+    where = f"signers/{signer_id}.json"
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SignerVerificationError(
+            "E_SIGNER_MALFORMED", f"{where} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise SignerVerificationError(
+            "E_SIGNER_MALFORMED",
+            f"{where} must be a JSON object, got {type(payload).__name__}",
+        )
+    required = ("signer_id", "algorithm", "public_key_b64", "key_fingerprint")
+    missing = [name for name in required if name not in payload]
+    if missing:
+        raise SignerVerificationError(
+            "E_SIGNER_MALFORMED", f"{where} missing required fields: {missing}"
+        )
+    for name in ("signer_id", "algorithm"):
+        if not isinstance(payload[name], str):
+            raise SignerVerificationError(
+                "E_SIGNER_MALFORMED",
+                f"{where} field {name!r} must be string, "
+                f"got {type(payload[name]).__name__}",
+            )
+    if payload["signer_id"] != signer_id:
+        raise SignerVerificationError(
+            "E_SIGNER_MALFORMED",
+            f"{where} declares signer_id {payload['signer_id']!r}; "
+            "it must equal the path stem",
+        )
+    _b64decode_strict(
+        payload["public_key_b64"], code="E_SIGNER_MALFORMED", label="public_key_b64"
+    )
+    _require_hex64(
+        payload["key_fingerprint"], code="E_SIGNER_MALFORMED", label="key_fingerprint"
+    )
+    notary_uri = payload.get("notary_uri")
+    if notary_uri is not None and not isinstance(notary_uri, str):
+        raise SignerVerificationError(
+            "E_SIGNER_MALFORMED",
+            f"{where} field 'notary_uri' must be string or null, "
+            f"got {type(notary_uri).__name__}",
+        )
+    return SignerManifest(
+        signer_id=payload["signer_id"],
+        algorithm=payload["algorithm"],
+        public_key_b64=payload["public_key_b64"],
+        key_fingerprint=payload["key_fingerprint"],
+        notary_uri=notary_uri,
+    )
+
+
 def compute_package_canonical_hash(
     *,
     format_version: str,
@@ -286,8 +379,15 @@ class Ed25519Signer:
 
     def _private_key(self) -> object:
         Ed25519PrivateKey, _ = _require_cryptography()
-        raw = base64.standard_b64decode(self.private_key_b64)
-        return Ed25519PrivateKey.from_private_bytes(raw)
+        raw = _b64decode_strict(
+            self.private_key_b64, code="E_SIGNER_MALFORMED", label="private_key_b64"
+        )
+        try:
+            return Ed25519PrivateKey.from_private_bytes(raw)
+        except ValueError as exc:  # wrong length
+            raise SignerVerificationError(
+                "E_SIGNER_MALFORMED", f"not a raw ed25519 private key: {exc}"
+            ) from exc
 
     def sign(
         self, *, package_canonical_hash: str, signed_at_iso: str
@@ -329,12 +429,21 @@ class Ed25519Verifier:
 
     def _public_key(self) -> object:
         _, Ed25519PublicKey = _require_cryptography()
-        raw = base64.standard_b64decode(self.public_key_b64)
-        return Ed25519PublicKey.from_public_bytes(raw)
+        raw = _b64decode_strict(
+            self.public_key_b64, code="E_SIGNER_MALFORMED", label="public_key_b64"
+        )
+        try:
+            return Ed25519PublicKey.from_public_bytes(raw)
+        except ValueError as exc:  # wrong length
+            raise SignerVerificationError(
+                "E_SIGNER_MALFORMED", f"not a raw ed25519 public key: {exc}"
+            ) from exc
 
     def build_manifest(self, *, signer_id: str) -> SignerManifest:
         """Convenience: construct a ``SignerManifest`` from this verifier's public key."""
-        pub_raw = base64.standard_b64decode(self.public_key_b64)
+        pub_raw = _b64decode_strict(
+            self.public_key_b64, code="E_SIGNER_MALFORMED", label="public_key_b64"
+        )
         return SignerManifest(
             signer_id=signer_id,
             algorithm="ed25519",
@@ -380,12 +489,12 @@ class Ed25519Verifier:
                 f"got {envelope.package_canonical_hash!r}",
             )
 
-        try:
-            pub_raw = base64.standard_b64decode(manifest.public_key_b64)
-        except (ValueError, binascii.Error) as exc:
-            raise SignerVerificationError(
-                "E_SIGNER_MALFORMED", f"public_key_b64 not valid base64: {exc}"
-            ) from exc
+        pub_raw = _b64decode_strict(
+            manifest.public_key_b64, code="E_SIGNER_MALFORMED", label="public_key_b64"
+        )
+        _require_hex64(
+            manifest.key_fingerprint, code="E_SIGNER_MALFORMED", label="key_fingerprint"
+        )
 
         recomputed_fp = compute_key_fingerprint(pub_raw)
         if not hmac.compare_digest(recomputed_fp, manifest.key_fingerprint):
@@ -403,13 +512,9 @@ class Ed25519Verifier:
                 "envelope package_canonical_hash does not match recomputed value",
             )
 
-        try:
-            signature = base64.standard_b64decode(envelope.signature_b64)
-        except (ValueError, binascii.Error) as exc:
-            raise SignerVerificationError(
-                "E_SIGNATURE_MALFORMED",
-                f"signature_b64 not valid base64: {exc}",
-            ) from exc
+        signature = _b64decode_strict(
+            envelope.signature_b64, code="E_SIGNATURE_MALFORMED", label="signature_b64"
+        )
 
         pub = self._public_key()
         try:
@@ -465,12 +570,12 @@ class HMACVerifier:
                 f"got {envelope.package_canonical_hash!r}",
             )
 
-        try:
-            secret = base64.standard_b64decode(manifest.public_key_b64)
-        except (ValueError, binascii.Error) as exc:
-            raise SignerVerificationError(
-                "E_SIGNER_MALFORMED", f"public_key_b64 not valid base64: {exc}"
-            ) from exc
+        secret = _b64decode_strict(
+            manifest.public_key_b64, code="E_SIGNER_MALFORMED", label="public_key_b64"
+        )
+        _require_hex64(
+            manifest.key_fingerprint, code="E_SIGNER_MALFORMED", label="key_fingerprint"
+        )
 
         recomputed_fp = compute_key_fingerprint(secret)
         if not hmac.compare_digest(recomputed_fp, manifest.key_fingerprint):
@@ -488,13 +593,9 @@ class HMACVerifier:
                 "envelope package_canonical_hash does not match recomputed value",
             )
 
-        try:
-            signature = base64.standard_b64decode(envelope.signature_b64)
-        except (ValueError, binascii.Error) as exc:
-            raise SignerVerificationError(
-                "E_SIGNATURE_MALFORMED",
-                f"signature_b64 not valid base64: {exc}",
-            ) from exc
+        signature = _b64decode_strict(
+            envelope.signature_b64, code="E_SIGNATURE_MALFORMED", label="signature_b64"
+        )
 
         expected = hmac.new(
             secret, bytes.fromhex(package_canonical_hash), hashlib.sha256
@@ -520,4 +621,5 @@ __all__ = [
     "compute_key_fingerprint",
     "compute_package_canonical_hash",
     "parse_envelope_line",
+    "parse_signer_manifest",
 ]

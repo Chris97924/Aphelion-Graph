@@ -969,3 +969,98 @@ def test_ed25519_verifier_rejects_malformed_signature_b64() -> None:
             bad_env, manifest, package_canonical_hash=PACKAGE_HASH
         )
     assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+# ---------------------------------------------------------------------------
+# A5: verifiers raise typed errors on malformed manifests / envelopes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    ["é" * 64, 12345, None, "F" * 64],
+    ids=["non-ascii", "int", "none", "uppercase"],
+)
+def test_hmac_verifier_malformed_fingerprint_is_signer_malformed(
+    fingerprint: object,
+) -> None:
+    signer, manifest = _genuine_signer_pair()
+    env = signer.sign(package_canonical_hash=PACKAGE_HASH, signed_at_iso=SIGNED_AT)
+    bad = dataclasses.replace(manifest, key_fingerprint=fingerprint)  # type: ignore[arg-type]
+    with pytest.raises(SignerVerificationError) as exc:
+        HMACVerifier().verify(env, bad, package_canonical_hash=PACKAGE_HASH)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+@pytest.mark.parametrize("value", [12345, None, b"AAAA"], ids=["int", "none", "bytes"])
+def test_hmac_verifier_non_string_public_key_is_signer_malformed(value: object) -> None:
+    signer, manifest = _genuine_signer_pair()
+    env = signer.sign(package_canonical_hash=PACKAGE_HASH, signed_at_iso=SIGNED_AT)
+    bad = dataclasses.replace(manifest, public_key_b64=value)  # type: ignore[arg-type]
+    with pytest.raises(SignerVerificationError) as exc:
+        HMACVerifier().verify(env, bad, package_canonical_hash=PACKAGE_HASH)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+def test_hmac_verifier_rejects_trailing_junk_in_base64() -> None:
+    signer, manifest = _genuine_signer_pair()
+    env = signer.sign(package_canonical_hash=PACKAGE_HASH, signed_at_iso=SIGNED_AT)
+    with pytest.raises(SignerVerificationError) as exc:
+        HMACVerifier().verify(
+            env,
+            dataclasses.replace(manifest, public_key_b64=manifest.public_key_b64 + "!!"),
+            package_canonical_hash=PACKAGE_HASH,
+        )
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+    with pytest.raises(SignerVerificationError) as exc:
+        HMACVerifier().verify(
+            dataclasses.replace(env, signature_b64=env.signature_b64 + "\n"),
+            manifest,
+            package_canonical_hash=PACKAGE_HASH,
+        )
+    assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"not json",
+        b"\xff\xfe",
+        b"[]",
+        b'{"signer_id": "s"}',
+        b'{"signer_id": "other", "algorithm": "ed25519", "public_key_b64": "AAAA",'
+        b' "key_fingerprint": "' + b"0" * 64 + b'"}',
+    ],
+    ids=["not-json", "not-utf8", "not-object", "missing-fields", "stem-mismatch"],
+)
+def test_parse_signer_manifest_rejects_malformed_input(raw: bytes) -> None:
+    from aphelion.signer import parse_signer_manifest
+
+    with pytest.raises(SignerVerificationError) as exc:
+        parse_signer_manifest(raw, signer_id="s")
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+def test_parse_signer_manifest_round_trips_a_genuine_manifest() -> None:
+    from aphelion.signer import parse_signer_manifest
+
+    _, manifest = _genuine_signer_pair()
+    raw = json.dumps(dataclasses.asdict(manifest)).encode("utf-8")
+    assert parse_signer_manifest(raw, signer_id=manifest.signer_id) == manifest
+
+
+@pytest.mark.parametrize(
+    "priv_b64",
+    [
+        base64.standard_b64encode(b"x" * 31).decode("ascii"),
+        base64.standard_b64encode(b"x" * 32).decode("ascii") + "!!",
+    ],
+    ids=["wrong-length", "trailing-junk"],
+)
+def test_ed25519_signer_malformed_private_key_is_signer_malformed(priv_b64: str) -> None:
+    pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
+    from aphelion.signer import Ed25519Signer
+
+    with pytest.raises(SignerVerificationError) as exc:
+        Ed25519Signer(signer_id="s", private_key_b64=priv_b64).manifest()
+    assert exc.value.code == "E_SIGNER_MALFORMED"

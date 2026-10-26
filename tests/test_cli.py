@@ -676,3 +676,34 @@ def test_sign_cmd_refuses_hmac_even_when_called_directly(
     assert payload is not None
     assert payload["code"] == ErrorCode.ENUM_INVALID.value
     assert not out.exists()
+
+
+# ---------- A5: malformed signer key -> typed error ----------
+
+
+@pytest.mark.parametrize("key", [b"x" * 31, b"x" * 33], ids=["short", "long"])
+def test_sign_malformed_ed25519_key_emits_signer_malformed(
+    tmp_path: Path, key: bytes
+) -> None:
+    pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(key)
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "s1",
+            "--algorithm", "ed25519",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    assert code == EXIT_VALIDATION, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == "E_SIGNER_MALFORMED"
+    assert not out.exists()

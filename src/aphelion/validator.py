@@ -11,9 +11,6 @@ All raised codes come from :class:`aphelion.error_codes.ErrorCode`.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 import re
 from pathlib import Path
 from typing import Any
@@ -338,11 +335,13 @@ def _validate_signatures_full(
     from aphelion.sig_pack import read_signatures_jsonl
     from aphelion.signer import (
         HMACVerifier,
-        SignerManifest,
         SignerVerificationError,
         _REGISTRY,
+        _b64decode_strict,
+        _require_hex64,
         compute_key_fingerprint,
         compute_package_canonical_hash,
+        parse_signer_manifest,
     )
 
     # Everything below looks members up by name. Reject archives whose member
@@ -413,40 +412,16 @@ def _validate_signatures_full(
                 f"no signer manifest found for signer_id={signer_id!r}",
             )
 
-        # Parse signer manifest
-        try:
-            raw = json.loads(signer_manifests_raw[signer_id].decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise SignerVerificationError(
-                "E_SIGNER_MALFORMED",
-                f"signers/{signer_id}.json is not valid JSON: {exc}",
-            ) from exc
-
-        try:
-            sm = SignerManifest(
-                signer_id=raw["signer_id"],
-                algorithm=raw["algorithm"],
-                public_key_b64=raw["public_key_b64"],
-                key_fingerprint=raw["key_fingerprint"],
-                notary_uri=raw.get("notary_uri"),
-            )
-        except (KeyError, TypeError) as exc:
-            raise SignerVerificationError(
-                "E_SIGNER_MALFORMED",
-                f"signers/{signer_id}.json missing required fields: {exc}",
-            ) from exc
-
+        # Parse signer manifest strictly (§2.3): wrong JSON types, a
+        # non-hex fingerprint or non-standard base64 are E_SIGNER_MALFORMED,
+        # never a raw TypeError/ValueError.
+        sm = parse_signer_manifest(signer_manifests_raw[signer_id], signer_id=signer_id)
         signer_manifests_by_id[signer_id] = sm
 
         # §5 rule: key_fingerprint recomputes
-        try:
-            pub_raw = base64.standard_b64decode(sm.public_key_b64)
-        except (ValueError, binascii.Error) as exc:
-            raise SignerVerificationError(
-                "E_SIGNER_MALFORMED",
-                f"public_key_b64 not valid base64: {exc}",
-            ) from exc
-
+        pub_raw = _b64decode_strict(
+            sm.public_key_b64, code="E_SIGNER_MALFORMED", label="public_key_b64"
+        )
         recomputed_fp = compute_key_fingerprint(pub_raw)
         import hmac as _hmac
         if not _hmac.compare_digest(recomputed_fp, sm.key_fingerprint):
@@ -455,7 +430,13 @@ def _validate_signatures_full(
                 f"recomputed fingerprint {recomputed_fp!r} != declared {sm.key_fingerprint!r}",
             )
 
-        # §5 rule: package_canonical_hash recomputes
+        # §5 rule: package_canonical_hash recomputes (format first: §2.2 says
+        # 64 lowercase hex, and compare_digest rejects non-ASCII with TypeError)
+        _require_hex64(
+            envelope.package_canonical_hash,
+            code="E_SIGNATURE_MALFORMED",
+            label="package_canonical_hash",
+        )
         if not _hmac.compare_digest(envelope.package_canonical_hash, expected_hash):
             raise SignerVerificationError(
                 "E_SIGNATURE_HASH_MISMATCH",

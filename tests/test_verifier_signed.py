@@ -1360,3 +1360,174 @@ def test_validate_signatures_rejects_colliding_member_names(tmp_path: Path) -> N
     with pytest.raises(SecurityError) as exc:
         validate_signatures(tar_path)
     assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+
+
+# ---------------------------------------------------------------------------
+# A5: malformed signer input yields typed errors, never raw TypeError /
+# ValueError, and base64 is decoded strictly.
+# ---------------------------------------------------------------------------
+
+
+def _rewrite_member(tar_path: Path, name: str, data: bytes) -> None:
+    from aphelion.canonical_tar import TarMember, read_members
+    from aphelion.canonical_tar import pack as tar_pack
+
+    members = [m for m in read_members(tar_path.read_bytes()) if m.path != name]
+    members.append(TarMember(path=name, data=data, is_dir=False))
+    tar_path.write_bytes(tar_pack(members))
+
+
+def _signer_manifest_dict(tar_path: Path) -> dict:
+    from aphelion.canonical_tar import read_members
+
+    member = next(
+        m for m in read_members(tar_path.read_bytes())
+        if m.path == f"signers/{SIGNER_ID}.json"
+    )
+    assert member.data is not None
+    return json.loads(member.data)
+
+
+def _with_signer_fields(tar_path: Path, **fields: object) -> None:
+    raw = _signer_manifest_dict(tar_path)
+    raw.update(fields)
+    _rewrite_member(
+        tar_path,
+        f"signers/{SIGNER_ID}.json",
+        json.dumps(raw, sort_keys=True).encode("utf-8"),
+    )
+
+
+def _with_envelope_fields(tar_path: Path, **fields: str) -> None:
+    from aphelion.canonical_tar import read_members
+
+    member = next(
+        m for m in read_members(tar_path.read_bytes()) if m.path == "signatures.jsonl"
+    )
+    assert member.data is not None
+    raw = json.loads(member.data)
+    raw.update(fields)
+    _rewrite_member(
+        tar_path,
+        "signatures.jsonl",
+        json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n",
+    )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"public_key_b64": 12345},
+        {"public_key_b64": None},
+        {"public_key_b64": ["AAAA"]},
+        {"key_fingerprint": 12345},
+        {"key_fingerprint": "é" * 64},
+        {"key_fingerprint": "A" * 64},  # upper-case hex is not §2.3 form
+        {"signer_id": 7},
+        {"algorithm": ["hmac-sha256"]},
+        {"notary_uri": 42},
+    ],
+    ids=[
+        "pubkey-int", "pubkey-null", "pubkey-list", "fp-int", "fp-non-ascii",
+        "fp-uppercase", "signer-id-int", "algorithm-list", "notary-uri-int",
+    ],
+)
+def test_malformed_signer_manifest_fields_raise_signer_malformed(
+    tmp_path: Path, fields: dict
+) -> None:
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    _with_signer_fields(tar_path, **fields)
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"[]", b"null", b'"x"', b"42"],
+    ids=["list", "null", "string", "number"],
+)
+def test_signer_manifest_that_is_not_an_object_raises_signer_malformed(
+    tmp_path: Path, payload: bytes
+) -> None:
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    _rewrite_member(tar_path, f"signers/{SIGNER_ID}.json", payload)
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+@pytest.mark.parametrize("junk", ["!!", "\n", " ", "*"])
+def test_public_key_b64_with_trailing_junk_rejected(tmp_path: Path, junk: str) -> None:
+    """A lenient decoder drops non-alphabet characters, so the fingerprint would
+    still recompute; the spec requires base64-standard, so reject."""
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    raw = _signer_manifest_dict(tar_path)
+    _with_signer_fields(tar_path, public_key_b64=raw["public_key_b64"] + junk)
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+def test_signature_b64_with_trailing_junk_rejected(tmp_path: Path) -> None:
+    from aphelion.verifier import verify_package
+
+    from aphelion.canonical_tar import read_members
+
+    tar_path = _make_signed_tar(tmp_path)
+
+    env = json.loads(next(
+        m.data for m in read_members(tar_path.read_bytes()) if m.path == "signatures.jsonl"
+    ))
+    _with_envelope_fields(tar_path, signature_b64=env["signature_b64"] + "!!")
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+def test_non_ascii_envelope_hash_raises_signature_malformed(tmp_path: Path) -> None:
+    """hmac.compare_digest raises TypeError on non-ASCII str input."""
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    _with_envelope_fields(tar_path, package_canonical_hash="é" * 64)
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+def test_ed25519_public_key_of_wrong_length_raises_signer_malformed(
+    tmp_path: Path,
+) -> None:
+    """A 31-byte key with a matching fingerprint reaches from_public_bytes,
+    which raises a raw ValueError."""
+    pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
+    from aphelion.signer import Ed25519Signer
+    from aphelion.verifier import verify_package
+
+    signer = Ed25519Signer(
+        signer_id=SIGNER_ID,
+        private_key_b64=base64.standard_b64encode(SHARED_SECRET).decode("ascii"),
+    )
+    tar_path = _make_signed_tar(tmp_path, signer=signer)  # type: ignore[arg-type]
+    short = b"\x01" * 31
+    _with_signer_fields(
+        tar_path,
+        public_key_b64=base64.standard_b64encode(short).decode("ascii"),
+        key_fingerprint=compute_key_fingerprint(short),
+    )
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
