@@ -1395,18 +1395,23 @@ def test_unpack_refuses_a_link_to_a_directory_as_destination(
 # ---------- member names must be portable ----------
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "old.txt:evil",  # NTFS alternate data stream
-        "a<b", "a>b", 'a"b', "a|b", "a?b", "a*b",
-        "a\x01b", "a\x1fb",
-        "CON", "con.txt", "Nul.tar.gz", "AUX", "PRN", "COM1", "com9.md", "LPT1", "lpt9",
-        "COM¹", "CON .txt",
-        "dir./f.md", "dir /f.md", "f.md.", "f.md ",
-        "claims/NUL",
-    ],
+NON_PORTABLE_NAMES = [
+    "old.txt:evil",  # NTFS alternate data stream
+    "a<b", "a>b", 'a"b', "a|b", "a?b", "a*b",
+    "a\x01b", "a\x1fb",
+    "CON", "con.txt", "Nul.tar.gz", "AUX", "PRN", "COM1", "com9.md", "LPT1", "lpt9",
+    "COM¹", "CON .txt",
+    "dir./f.md", "dir /f.md", "f.md.", "f.md ",
+    "claims/NUL",
+]
+NEAR_DEVICE_NAMES = ["CONSOLE.md", "con-x.md", "COM10", "LPT0", "a.b.c", "nul_file"]
+ONLY_WINDOWS_REFUSES = pytest.mark.skipif(
+    sys.platform != "win32", reason="only Windows refuses names Win32 cannot create as files"
 )
+
+
+@ONLY_WINDOWS_REFUSES
+@pytest.mark.parametrize("name", NON_PORTABLE_NAMES)
 def test_non_portable_member_name_is_refused(tmp_path: Path, name: str) -> None:
     archive = _write_tar(tmp_path / "a.tar", [(_reg(name), b"x")])
     dest = tmp_path / "dest"
@@ -1419,13 +1424,60 @@ def test_non_portable_member_name_is_refused(tmp_path: Path, name: str) -> None:
     assert not dest.exists()
 
 
-@pytest.mark.parametrize("name", ["CONSOLE.md", "con-x.md", "COM10", "LPT0", "a.b.c", "nul_file"])
+@pytest.mark.parametrize("name", NEAR_DEVICE_NAMES)
 def test_portable_names_near_device_names_are_accepted(tmp_path: Path, name: str) -> None:
     archive = _write_tar(tmp_path / "a.tar", [(_reg(name), b"x")])
     unpack(archive, tmp_path / "dest")
     assert (tmp_path / "dest" / name).read_bytes() == b"x"
 
 
+@pytest.mark.parametrize("name", [*NON_PORTABLE_NAMES, *NEAR_DEVICE_NAMES, "a:b.md"])
+def test_pack_refuses_exactly_the_names_unpack_refuses(tmp_path: Path, name: str) -> None:
+    """All platforms: whatever this platform's unpack refuses, pack refuses
+    too, with the same code, and the other way round."""
+    from aphelion.canonical_tar import TarMember, pack
+    from aphelion.errors import SchemaError
+
+    try:
+        pack([TarMember(path=name, data=b"x")])
+        packed = None
+    except SchemaError as exc:
+        packed = exc.code
+    archive = _write_tar(tmp_path / "a.tar", [(_reg(name), b"x")])
+    try:
+        unpack(archive, tmp_path / "dest")
+        unpacked = None
+    except SecurityError as exc:
+        unpacked = exc.code
+
+    assert packed == unpacked
+    if name == "a:b.md":  # a drive prefix: refused everywhere, as it always was
+        assert packed == ErrorCode.WINDOWS_DRIVE
+    else:
+        refused = sys.platform == "win32" and name in NON_PORTABLE_NAMES
+        assert packed == (ErrorCode.PATH_TRAVERSAL if refused else None)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Win32 cannot create these names; Windows refuses them"
+)
+@pytest.mark.parametrize(
+    "name", ["schemas/con.json", "signers/aux.json", "claims/a:b.md", "trail.", *NON_PORTABLE_NAMES]
+)
+def test_names_only_windows_refuses_work_elsewhere(tmp_path: Path, name: str) -> None:
+    """POSIX only: a name Win32 cannot create as a file is an ordinary name
+    here, and is packed, validated and unpacked as before."""
+    from aphelion.canonical_tar import TarMember, pack
+    from aphelion.unpacker import check_member_names
+
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(pack([TarMember(path=name, data=b"x")]))
+    check_member_names(archive)
+    unpack(archive, tmp_path / "dest")
+    assert (tmp_path / "dest" / name).read_bytes() == b"x"
+
+
+@ONLY_WINDOWS_REFUSES
 def test_stream_name_does_not_replace_an_existing_file(tmp_path: Path) -> None:
     archive = _write_tar(tmp_path / "a.tar", [(_reg("old.txt:evil"), b"x")])
     dest = tmp_path / "dest"

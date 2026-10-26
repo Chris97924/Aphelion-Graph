@@ -37,6 +37,7 @@ WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 # address an NTFS alternate data stream of another file), device names with or
 # without an extension, and a trailing dot or space, which Win32 drops.
 WINDOWS_RESERVED_CHARS = frozenset('<>:"|?*') | frozenset(map(chr, range(32)))
+# With an extension too (con.txt): Windows 10 and earlier open the device; conservative.
 WINDOWS_DEVICE_RE = re.compile(
     r"^(CON|PRN|AUX|NUL|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3]) *(\..*)?$",
     re.IGNORECASE,
@@ -106,28 +107,26 @@ def _check_path(raw_name: str, policy: ExtractPolicy) -> str:
     return normalized
 
 
-def _check_portable(parts: list[str], raw_name: str) -> None:
-    """Refuse a component Win32 cannot create as the plain file it names.
+def non_portable_component(parts: list[str]) -> str | None:
+    """The first component Win32 cannot create as the plain file it names.
 
     On Windows such a component names a device, a stream of another file, or
-    a different file than the archive says. It is refused on every platform,
-    so an archive unpacks to the same files everywhere.
+    a different file than the archive says, so it is returned there. On other
+    platforms these are ordinary names and None is returned. Shared by
+    :func:`unpack` (and :func:`check_member_names`) and
+    :func:`aphelion.canonical_tar.pack`, so on each platform the writer
+    refuses exactly the names the reader would.
     """
+    if sys.platform != "win32":
+        return None
     for part in parts:
         if (
             not WINDOWS_RESERVED_CHARS.isdisjoint(part)
             or part[-1] in " ."
             or WINDOWS_DEVICE_RE.match(part)
         ):
-            raise SecurityError(
-                code=ErrorCode.PATH_TRAVERSAL,
-                msg=(
-                    f"member path component {part!r} is not a portable file name "
-                    f"(Windows-reserved character or device name, or trailing dot "
-                    f"or space): {raw_name!r}"
-                ),
-                path=raw_name,
-            )
+            return part
+    return None
 
 
 def path_parts(normalized: str) -> list[str]:
@@ -250,7 +249,17 @@ def _scan_members(
                 msg=f"member path {rel!r} collides with {other!r} after normalization",
                 path=rel,
             )
-        _check_portable(parts, member.name)
+        bad = non_portable_component(parts)
+        if bad is not None:
+            raise SecurityError(
+                code=ErrorCode.PATH_TRAVERSAL,
+                msg=(
+                    f"member path component {bad!r} is not a portable file name "
+                    f"(Windows-reserved character or device name, or trailing dot "
+                    f"or space): {member.name!r}"
+                ),
+                path=member.name,
+            )
         scanned.append((member, rel))
     return scanned
 

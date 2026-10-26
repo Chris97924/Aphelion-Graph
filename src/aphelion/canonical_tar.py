@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
-from aphelion.unpacker import WINDOWS_DRIVE_RE, MemberNames, path_parts
+from aphelion.unpacker import WINDOWS_DRIVE_RE, MemberNames, non_portable_component, path_parts
 
 
 MODE_FILE = 0o644
@@ -73,8 +73,9 @@ def pack(members: list[TarMember]) -> bytes:
 
     Raises SchemaError on any member type violation or inconsistency, on a
     path the unpacker would refuse (absolute, drive-prefixed, backslash,
-    ``..``), and on two paths that collide once normalized
-    (see :class:`aphelion.unpacker.MemberNames`).
+    ``..``, and on Windows a name Win32 cannot create; see
+    :func:`aphelion.unpacker.non_portable_component`), and on two paths that
+    collide once normalized (see :class:`aphelion.unpacker.MemberNames`).
     """
     names = MemberNames()
     for member in members:
@@ -90,6 +91,12 @@ def pack(members: list[TarMember]) -> bytes:
             raise SchemaError(
                 code=ErrorCode.DUPLICATE_MEMBER_PATH,
                 msg=f"archive member path {norm!r} collides with {other!r} after normalization",
+            )
+        bad = non_portable_component(parts)
+        if bad is not None:
+            raise SchemaError(
+                code=ErrorCode.PATH_TRAVERSAL,
+                msg=f"archive member path component {bad!r} is not a portable file name: {norm!r}",
             )
         if member.is_dir and member.data is not None:
             raise SchemaError(
