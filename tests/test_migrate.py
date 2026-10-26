@@ -587,6 +587,34 @@ def test_force_keeps_destination_when_source_is_not_migratable(tmp_path: Path) -
     assert _snapshot(dst) == {"keep.txt": b"keep"}
 
 
+def test_migrate_stops_when_the_destination_cannot_be_looked_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: an error other than "no such file" while checking
+    whether the destination exists (a transient I/O error, say) fails the
+    migration before anything is written; it is not taken as "absent"."""
+    import errno
+    import os
+
+    src, dst, before = _force_setup(tmp_path)
+    real_lstat = os.lstat
+
+    def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
+        if os.path.abspath(os.fspath(path)) == str(dst):
+            raise OSError(errno.EIO, "simulated I/O error", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+    with pytest.raises(OSError) as exc:
+        migrate(MigrateOptions(src=src, dst=dst))
+    monkeypatch.undo()
+
+    assert exc.value.errno == errno.EIO
+    assert _snapshot(dst) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["v03", "v04"]
+
+
 def test_force_refuses_archive_destination_that_is_the_source(tmp_path: Path) -> None:
     archive = tmp_path / "in.aphelion.tar"
     _write_v03_archive(tmp_path / "pkg_v03", archive)

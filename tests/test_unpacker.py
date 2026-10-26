@@ -1176,6 +1176,72 @@ def test_undo_stopped_at_any_step_loses_nothing(
                 assert left.get(path) == data or data in kept, (where, path, left, named)
 
 
+# ---------- an error while looking at the tree is never skipped ----------
+
+
+@pytest.mark.parametrize("listing", [1, 2], ids=["pre-move-check", "merge"])
+def test_unpack_fails_when_a_staged_directory_cannot_be_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: int
+) -> None:
+    """All platforms: a staged directory that cannot be listed (too many open
+    files, a filter driver refusing access) fails the unpack, in the check
+    before any move or in the merge, and dest is left as it was. It used to
+    be skipped, and the unpack reported success with files missing."""
+    archive, dest, before = _merge_archive(tmp_path)
+    real_scandir = os.scandir
+    listed: list[str] = []
+
+    def scandir(*args: object) -> object:
+        if args and isinstance(args[0], (str, os.PathLike)):
+            path = os.fspath(args[0])
+            if ".unpacking-" in path and os.path.basename(path) == "new":
+                listed.append(path)
+                if len(listed) == listing:
+                    raise PermissionError(errno.EACCES, "Permission denied", path)
+        return real_scandir(*args)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+    with pytest.raises(PermissionError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert exc.value.filename == listed[listing - 1]
+    assert _tree(dest) == before
+
+
+@pytest.mark.parametrize(
+    "call, name",
+    [("lstat", "dest"), ("lstat", "z.md"), ("samefile", "z.md")],
+    ids=["dest-link-check", "existing-target", "staging-identity-check"],
+)
+def test_unpack_fails_when_an_entry_cannot_be_looked_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, call: str, name: str
+) -> None:
+    """All platforms: an error other than "no such file" while looking at dest
+    or at a file in it (a transient I/O error, say) fails the unpack and
+    leaves dest as it was. Taken as "not there", it let a file be replaced
+    without a backup, or a check pass that never ran."""
+    archive, dest, before = _merge_archive(tmp_path)
+    broken = os.path.normcase(dest if name == "dest" else dest / name)
+    module = os if call == "lstat" else os.path
+    real = getattr(module, call)
+
+    def failing(path: str, *args: object, **kwargs: object) -> object:
+        if os.path.normcase(os.path.abspath(os.fspath(path))) == broken:
+            raise OSError(errno.EIO, "simulated I/O error", os.fspath(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(module, call, failing)
+
+    with pytest.raises(OSError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert exc.value.errno == errno.EIO
+    assert _tree(dest) == before
+
+
 # ---------- the destination itself must not be a link ----------
 
 

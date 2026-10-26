@@ -339,16 +339,16 @@ def _is_link(st: os.stat_result) -> bool:
 
 
 def _is_link_entry(path: Path) -> bool:
-    try:
-        return _is_link(os.lstat(path))
-    except OSError:
-        return False
+    st = _lstat(path)
+    return st is not None and _is_link(st)
 
 
 def _same_entry(a: Path, b: Path) -> bool:
+    # Only "no such entry" means "not the same": any other error fails the
+    # call, since an identity check that cannot run must not pass.
     try:
-        return os.path.lexists(a) and os.path.samefile(a, b)
-    except OSError:
+        return os.path.samefile(a, b)
+    except (FileNotFoundError, NotADirectoryError):
         return False
 
 
@@ -427,7 +427,9 @@ class _Replacement:
             raise
 
     def put(self, src: Path, target: Path) -> None:
-        saved = self.backup / str(len(self._log)) if os.path.lexists(target) else None
+        # _lstat, not os.path.lexists: a target that cannot be looked at
+        # must fail the call, not be overwritten without a backup.
+        saved = self.backup / str(len(self._log)) if _lstat(target) is not None else None
         self._log.append((src, target, saved))
         if saved is not None:
             os.replace(target, saved)
@@ -635,9 +637,12 @@ def _move_into_place(staging: Path, dest: Path, backup: Path | None) -> None:
         os.replace(staging, dest)
         return
 
+    def fail(err: OSError) -> None:
+        raise err  # os.walk would skip a directory it cannot list
+
     def staged() -> Iterator[tuple[Path, Path, list[str], list[str]]]:
         # Every staged entry except the backup directory, found by identity.
-        for root, dirnames, filenames in os.walk(staging):
+        for root, dirnames, filenames in os.walk(staging, onerror=fail):
             rel_root = Path(root).relative_to(staging)
             if rel_root == Path("."):
                 dirnames[:] = [n for n in dirnames if not _same_entry(staging / n, backup)]

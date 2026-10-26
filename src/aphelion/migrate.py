@@ -28,7 +28,7 @@ from aphelion.canonical_json import loads as canonical_loads
 from aphelion.canonical_json import normalize
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
-from aphelion.unpacker import _discard_backup, _remove_or_warn, _Replacement
+from aphelion.unpacker import _discard_backup, _lstat, _remove_or_warn, _Replacement
 
 TARGET_FORMAT_VERSION = "2.0"
 TARGET_SPEC_VERSION = "0.4.0"
@@ -121,7 +121,7 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
         )
     new_manifest = migrate_v03_to_v04(canonical_loads(manifest_in.read_bytes()))
     _refuse_overlap(src_path, dst_path)
-    dst_present = os.path.lexists(dst_path)
+    dst_present = _lstat(dst_path) is not None  # an unreadable entry is not "absent"
     if dst_present and not force:
         raise SchemaError(
             code=ErrorCode.INIT_REFUSES_EXISTING,
@@ -171,7 +171,7 @@ def _same_entry(a: Path, b: Path) -> bool:
         return True
     try:
         return os.path.samefile(a, b)
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):  # any other error fails the check
         return False
 
 
