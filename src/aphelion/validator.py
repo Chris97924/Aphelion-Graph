@@ -330,7 +330,11 @@ def _validate_signatures_full(
     resolution so signer manifests are neither re-extracted from the tar nor
     re-parsed once per envelope.
     """
-    from aphelion.unpacker import extract_signatures_jsonl, extract_signer_manifests
+    from aphelion.unpacker import (
+        check_member_names,
+        extract_signatures_jsonl,
+        extract_signer_manifests,
+    )
     from aphelion.sig_pack import read_signatures_jsonl
     from aphelion.signer import (
         HMACVerifier,
@@ -340,6 +344,11 @@ def _validate_signatures_full(
         compute_key_fingerprint,
         compute_package_canonical_hash,
     )
+
+    # Everything below looks members up by name. Reject archives whose member
+    # names collide after normalization first, so the manifest read here is
+    # the one an extraction of the same archive would produce.
+    check_member_names(tar_path)
 
     # §5 rule 2 (implicit): read signatures.jsonl; if absent → unsigned-valid
     sig_content = extract_signatures_jsonl(tar_path)

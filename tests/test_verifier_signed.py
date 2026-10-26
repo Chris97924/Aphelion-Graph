@@ -23,6 +23,7 @@ import pytest
 
 from aphelion.canonical_json import dumps as canonical_dumps
 from aphelion.canonical_json import normalize
+from aphelion.error_codes import ErrorCode
 from aphelion.signer import (
     HMACSigner,
     SignatureEnvelope,
@@ -1270,3 +1271,90 @@ def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
     with contextlib.redirect_stdout(out2), contextlib.redirect_stderr(err2):
         code2 = main(["verify", str(signed_path), "--require-signed"])
     assert code2 == 0, f"aphe verify --require-signed failed: {err2.getvalue()}"
+
+
+# ---------------------------------------------------------------------------
+# A1: member names that collide after normalisation are rejected before
+# verification and before extraction.
+# ---------------------------------------------------------------------------
+
+
+def _append_members(tar_path: Path, members: list[tuple[str, bytes]]) -> None:
+    """Append raw members after the existing ones (bypasses canonical_tar)."""
+    import tarfile
+
+    with tarfile.open(tar_path, mode="a", format=tarfile.USTAR_FORMAT) as tar:
+        for name, data in members:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(data))
+
+
+def _replacement_manifest_and_claim() -> tuple[bytes, bytes]:
+    """A self-consistent manifest + claim that differ from the signed ones."""
+    claim = _claim_bytes(title="Replaced Claim")
+    manifest = {
+        "aphelion_spec_version": "0.4.0",
+        "claims": [
+            {
+                "claim_id": UUID_CLAIM_A,
+                "claim_instance_id": UUID_INSTANCE_A,
+                "hash": hashlib.sha256(claim).hexdigest(),
+                "path": f"claims/{UUID_CLAIM_A}.md",
+                "state": "active",
+            }
+        ],
+        "created_at": "2026-04-21T00:00:00Z",
+        "format_version": "2.0",
+        "license": "Apache-2.0",
+        "package_id": UUID_PKG,
+        "producer": "aphelion-test",
+        "provenance_path": "provenance.jsonl",
+    }
+    return canonical_dumps(normalize(manifest)), claim
+
+
+@pytest.mark.parametrize(
+    "manifest_name, claim_name",
+    [
+        ("./manifest.json", f"./claims/{UUID_CLAIM_A}.md"),
+        ("Manifest.json", f"Claims/{UUID_CLAIM_A}.md"),
+        ("MANIFEST.JSON", f"claims//{UUID_CLAIM_A}.md"),
+        ("./manifest.json", f"claims/./{UUID_CLAIM_A}.md"),
+        ("manifest.json.", f"claims/{UUID_CLAIM_A}.md "),
+    ],
+)
+def test_signed_package_with_colliding_second_manifest_rejected(
+    tmp_path: Path, manifest_name: str, claim_name: str
+) -> None:
+    """Appending a second manifest + claim under a name that only differs by
+    a leading ./, a doubled or ./ separator, case, or a Windows-stripped
+    trailing dot/space must not pass signed verification."""
+    from aphelion.errors import SecurityError
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    assert verify_package(tar_path, require_signed=True).envelopes  # sanity
+
+    manifest, claim = _replacement_manifest_and_claim()
+    _append_members(tar_path, [(manifest_name, manifest), (claim_name, claim)])
+
+    with pytest.raises(SecurityError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+
+
+def test_validate_signatures_rejects_colliding_member_names(tmp_path: Path) -> None:
+    """validate_signatures is public and reads the tar directly, so it must
+    apply the same collision check rather than trust getmember()."""
+    from aphelion.errors import SecurityError
+    from aphelion.validator import validate_signatures
+
+    tar_path = _make_signed_tar(tmp_path)
+    manifest, _ = _replacement_manifest_and_claim()
+    _append_members(tar_path, [("./manifest.json", manifest)])
+
+    with pytest.raises(SecurityError) as exc:
+        validate_signatures(tar_path)
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH

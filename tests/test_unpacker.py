@@ -323,3 +323,76 @@ def test_compression_ratio_exceeded(tmp_path: Path) -> None:
     with pytest.raises(SecurityError) as exc:
         unpack(archive, tmp_path / "dest", policy=policy)
     assert exc.value.code == ErrorCode.COMPRESSION_RATIO_EXCEEDED
+
+
+# ---------- A1: collisions after normalisation ----------
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        ("manifest.json", "./manifest.json"),
+        ("./manifest.json", "././manifest.json"),
+        ("claims/a.md", "claims//a.md"),
+        ("claims/a.md", "claims/./a.md"),
+        ("manifest.json", "MANIFEST.json"),
+        ("claims/a.md", "Claims/a.md"),
+        ("straße.md", "STRASSE.md"),  # casefold, not lower()
+        ("café.md", "café.md"),  # NFC vs NFD
+        ("manifest.json", "manifest.json."),  # Windows strips trailing dots
+        ("manifest.json", "manifest.json "),  # ... and trailing spaces
+    ],
+)
+def test_names_colliding_after_normalisation_rejected(
+    tmp_path: Path, first: str, second: str
+) -> None:
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [(_reg(first), b"first"), (_reg(second), b"second")],
+    )
+    dest = tmp_path / "dest"
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, dest)
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+    # Rejected before extraction: nothing from the archive was written.
+    assert not dest.exists() or not any(dest.iterdir())
+
+
+def test_directory_component_colliding_by_case_rejected(tmp_path: Path) -> None:
+    """``Claims/a.md`` and ``claims/b.md`` share one directory on NTFS/APFS
+    but two on ext4, so the extracted tree would differ by platform."""
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [(_reg("Claims/a.md"), b"a"), (_reg("claims/b.md"), b"b")],
+    )
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, tmp_path / "dest")
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+
+
+def test_file_and_directory_with_same_name_rejected(tmp_path: Path) -> None:
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [(_reg("claims"), b"x"), (_reg("claims/a.md"), b"a")],
+    )
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, tmp_path / "dest")
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+
+
+def test_explicit_directory_entries_do_not_count_as_collisions(tmp_path: Path) -> None:
+    """A directory member plus files inside it (and ``./`` prefixes as plain
+    ``tar -C dir .`` produces) is a normal archive, not a collision."""
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [
+            (_dir("."), None),
+            (_dir("./claims"), None),
+            (_reg("./claims/a.md"), b"a"),
+            (_reg("./manifest.json"), b"{}"),
+        ],
+    )
+    dest = tmp_path / "dest"
+    unpack(archive, dest)
+    assert (dest / "claims" / "a.md").read_bytes() == b"a"
+    assert (dest / "manifest.json").read_bytes() == b"{}"

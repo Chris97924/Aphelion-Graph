@@ -3,7 +3,9 @@
 Every known tar-extraction attack is rejected with a SecurityError and a
 distinct PX_E_6NNN code (see :mod:`aphelion.error_codes`):
   * path traversal ('..' / absolute / Windows drive / backslash)
-  * duplicate normalized paths
+  * member names that collide once normalized the way any supported
+    filesystem would see them (leading ``./``, repeated or ``.`` separators,
+    Unicode NFC, case folding, Windows trailing dots/spaces)
   * disallowed member types (symlink, hardlink, device, fifo)
   * zip-bomb (enforced streaming, per-file and per-total budgets)
   * too many files, overly long paths
@@ -89,6 +91,123 @@ def _check_path(raw_name: str, policy: ExtractPolicy) -> str:
     return normalized
 
 
+def _path_parts(normalized: str) -> list[str]:
+    """Split a checked member path into its real components.
+
+    Empty and ``.`` segments name no directory level (``./a``, ``a//b`` and
+    ``a/./b`` are ``a`` and ``a/b`` on every filesystem), so they are dropped.
+    """
+    return [part for part in normalized.split("/") if part not in ("", ".")]
+
+
+def member_path_key(parts: list[str]) -> str:
+    """Collision key for a member path, as a case-insensitive filesystem sees it.
+
+    Two members with the same key land on the same file on at least one
+    supported platform: NTFS and APFS compare names case-insensitively, APFS
+    is also normalization-insensitive, and Win32 drops trailing dots and
+    spaces from each component.
+    """
+    folded = []
+    for part in parts:
+        part = part.rstrip(" .") or part
+        folded.append(
+            unicodedata.normalize("NFC", unicodedata.normalize("NFC", part).casefold())
+        )
+    return "/".join(folded)
+
+
+def _collision(path: str, other: str) -> SecurityError:
+    return SecurityError(
+        code=ErrorCode.DUPLICATE_MEMBER_PATH,
+        msg=f"member path {path!r} collides with {other!r} after normalization",
+        path=path,
+    )
+
+
+def _scan_members(
+    tar: tarfile.TarFile, policy: ExtractPolicy
+) -> list[tuple[tarfile.TarInfo, str]]:
+    """Check every member header before anything is read or written.
+
+    Returns ``(member, relative_path)`` pairs, where ``relative_path`` drops
+    ``./`` and empty segments. ``relative_path`` is ``""`` only for a
+    directory entry naming the archive root itself (``.``).
+    """
+    scanned: list[tuple[tarfile.TarInfo, str]] = []
+    # key -> spelling, so two spellings of one directory are caught as well
+    # as two members for one file.
+    dir_spellings: dict[str, str] = {}
+    explicit_dirs: set[str] = set()
+    files: dict[str, str] = {}
+
+    def claim_dir(spelling: str, key: str) -> None:
+        if key in files:
+            raise _collision(spelling, files[key])
+        known = dir_spellings.setdefault(key, spelling)
+        if known != spelling:
+            raise _collision(spelling, known)
+
+    while True:
+        member = tar.next()
+        if member is None:
+            break
+        if len(scanned) >= policy.max_files:
+            raise SecurityError(
+                code=ErrorCode.FILE_COUNT_EXCEEDED,
+                msg=f"archive exceeds {policy.max_files} files",
+            )
+        # Reject disallowed member types BEFORE path checks to catch hardlinks
+        # whose link target points outside dest (member.isfile() would NOT catch these).
+        if not (member.isreg() or member.isdir()):
+            raise SecurityError(
+                code=ErrorCode.DISALLOWED_MEMBER_TYPE,
+                msg=(
+                    f"disallowed member type for {member.name!r}: "
+                    f"type={member.type!r} (symlink/hardlink/device/fifo forbidden)"
+                ),
+                path=member.name,
+            )
+        parts = _path_parts(_check_path(member.name, policy))
+        if not parts and not member.isdir():
+            raise SecurityError(
+                code=ErrorCode.EMPTY_MEMBER_NAME,
+                msg=f"regular file member has no name: {member.name!r}",
+                path=member.name,
+            )
+        for depth in range(1, len(parts)):
+            claim_dir("/".join(parts[:depth]), member_path_key(parts[:depth]))
+        rel = "/".join(parts)
+        key = member_path_key(parts)
+        if member.isdir():
+            if parts:
+                if key in explicit_dirs:
+                    raise _collision(rel, dir_spellings.get(key, rel))
+                claim_dir(rel, key)
+                explicit_dirs.add(key)
+        else:
+            if key in files:
+                raise _collision(rel, files[key])
+            if key in dir_spellings:
+                raise _collision(rel, dir_spellings[key])
+            files[key] = rel
+        scanned.append((member, rel))
+    return scanned
+
+
+def check_member_names(
+    archive_path: Path | str, policy: ExtractPolicy | None = None
+) -> None:
+    """Run the header checks of :func:`unpack` without extracting anything.
+
+    Anything that reads an archive by member name (signature validation,
+    signer-manifest lookup) must call this first: once no two members collide,
+    a name lookup and an extraction can no longer see different files.
+    """
+    with tarfile.open(Path(archive_path), mode="r") as tar:
+        _scan_members(tar, policy or ExtractPolicy.default())
+
+
 def unpack(
     archive_path: Path | str,
     dest_dir: Path | str,
@@ -105,42 +224,14 @@ def unpack(
     dest.mkdir(parents=True, exist_ok=True)
     dest_resolved = dest.resolve()
 
-    file_count = 0
     total_bytes = 0
-    seen_paths: set[str] = set()
     archive_size = archive.stat().st_size
 
     with tarfile.open(archive, mode="r") as tar:
-        while True:
-            member = tar.next()
-            if member is None:
-                break
-            file_count += 1
-            if file_count > policy.max_files:
-                raise SecurityError(
-                    code=ErrorCode.FILE_COUNT_EXCEEDED,
-                    msg=f"archive exceeds {policy.max_files} files",
-                )
-            # Reject disallowed member types BEFORE path checks to catch hardlinks
-            # whose link target points outside dest (member.isfile() would NOT catch these).
-            if not (member.isreg() or member.isdir()):
-                raise SecurityError(
-                    code=ErrorCode.DISALLOWED_MEMBER_TYPE,
-                    msg=(
-                        f"disallowed member type for {member.name!r}: "
-                        f"type={member.type!r} (symlink/hardlink/device/fifo forbidden)"
-                    ),
-                    path=member.name,
-                )
-            normalized = _check_path(member.name, policy)
-            if normalized in seen_paths:
-                raise SecurityError(
-                    code=ErrorCode.DUPLICATE_MEMBER_PATH,
-                    msg=f"duplicate member path: {normalized!r}",
-                    path=normalized,
-                )
-            seen_paths.add(normalized)
-
+        # Every header is checked before the first byte is written, so a
+        # colliding or forbidden member late in the archive cannot ride on
+        # members that were already extracted.
+        for member, normalized in _scan_members(tar, policy):
             target = (dest / normalized).resolve()
             if dest_resolved not in target.parents and target != dest_resolved:
                 raise SecurityError(
