@@ -302,7 +302,8 @@ def unpack(
     Parent directories this call created are removed again. Staging that
     cannot be removed is named in a RuntimeWarning and, on Python 3.11+, in
     a note on the raised error. ``dest_dir`` itself must not be a symlink or
-    junction; a mounted folder is fine.
+    junction. Nor can it be a Windows mounted folder, which is the same kind
+    of reparse point as a junction: unpack into a directory inside it instead.
 
     Known limits: there is no journal, so a killed process or a power loss
     can leave a ``.unpacking-*`` directory (with replaced files in it) behind,
@@ -316,10 +317,8 @@ def unpack(
     policy = policy or ExtractPolicy.default()
     archive = Path(archive_path)
     dest = Path(dest_dir)
-    # resolve() would follow a link, also when dangling, and unpack elsewhere.
-    # A mounted folder (a Windows volume mount point) is a reparse point too,
-    # but it is the mounted volume itself, not a way to somewhere else.
-    if _is_link_entry(dest) and not os.path.ismount(dest):
+    if _is_link_entry(dest):
+        # resolve() would follow it, also when dangling, and unpack elsewhere.
         raise FileExistsError(f"unpack destination is a symlink or junction: {dest}")
     if dest.exists() and not dest.is_dir():
         raise FileExistsError(f"unpack destination is not a directory: {dest}")
