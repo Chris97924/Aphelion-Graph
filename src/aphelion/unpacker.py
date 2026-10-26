@@ -241,9 +241,10 @@ def unpack(
     Uses a streaming tarfile.next() loop - NEVER tar.extractall(), because
     extractall won't catch zip-bomb-class expansion until it's already disk-bound.
 
-    All-or-nothing: members are extracted into a staging directory next to
-    ``dest_dir`` and moved into place only once every member has passed every
-    check. A failed unpack leaves ``dest_dir`` as it was, and removes any
+    All-or-nothing: members are extracted into a staging directory (inside
+    ``dest_dir`` if it exists, next to it otherwise) and moved into place only
+    once every member has passed every check. A failed unpack leaves
+    ``dest_dir`` as it was, including no staging directory, and removes any
     parent directories it had to create. On success, archive files replace
     same-named files in an existing ``dest_dir``; other files there are kept.
     """
@@ -280,11 +281,17 @@ def _first_missing_ancestor(path: Path) -> Path | None:
 
 
 def _make_staging_dir(dest: Path) -> Path:
-    # A sibling of dest, so the final move is a rename on the same filesystem.
-    # Path.mkdir (not tempfile.mkdtemp) keeps the umask-derived mode that dest
-    # would have had, since on success the staging dir may become dest.
+    # On dest's filesystem, so every move into place is a rename. An existing
+    # dest gets the staging dir inside it: dest may be a mount point, or sit
+    # in a directory the caller cannot write to. A new dest gets a sibling,
+    # which becomes dest by one rename; Path.mkdir (not tempfile.mkdtemp)
+    # keeps the umask-derived mode that dest would have had.
+    if dest.is_dir():
+        parent, prefix = dest, ".unpacking-"
+    else:
+        parent, prefix = dest.parent, f".{dest.name}.unpacking-"
     while True:
-        staging = dest.parent / f".{dest.name}.unpacking-{secrets.token_hex(8)}"
+        staging = parent / f"{prefix}{secrets.token_hex(8)}"
         try:
             staging.mkdir()
         except FileExistsError:  # pragma: no cover - 64-bit random collision
@@ -299,6 +306,16 @@ def _move_into_place(staging: Path, dest: Path) -> None:
         return
     # Existing destination: merge. Check every target first so a conflict
     # cannot leave a half-moved tree behind.
+    if staging.parent == dest:
+        # Staging sits inside dest; a top-level member with its name (or a
+        # spelling a case-insensitive filesystem treats as it) would be moved
+        # into the staging tree itself.
+        staging_key = member_path_key([staging.name])
+        for name in os.listdir(staging):
+            if member_path_key([name]) == staging_key:
+                raise FileExistsError(
+                    f"cannot unpack over the staging directory: {dest / name}"
+                )
     for root, dirnames, filenames in os.walk(staging):
         rel_root = Path(root).relative_to(staging)
         for name in dirnames:

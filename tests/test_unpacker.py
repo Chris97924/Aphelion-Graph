@@ -19,7 +19,9 @@ the remaining branches:
 
 from __future__ import annotations
 
+import errno
 import io
+import os
 import tarfile
 from pathlib import Path
 
@@ -508,3 +510,101 @@ def test_successful_unpack_into_new_dest(tmp_path: Path) -> None:
     unpack(archive, dest)
     assert _tree(dest) == {"claims": None, "claims/a.md": b"a"}
     assert sorted(p.name for p in (tmp_path / "new").iterdir()) == ["dest"]
+
+
+def test_unpack_into_existing_dest_moves_only_within_its_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing dest may be a mount point, where a rename from anywhere
+    outside it fails with EXDEV. Simulate that: the merge must not need one."""
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [(_dir("claims"), None), (_reg("claims/a.md"), b"a"), (_reg("m.json"), b"{}")],
+    )
+    dest = tmp_path / "mnt"
+    dest.mkdir()
+    (dest / "keep.txt").write_bytes(b"keep")
+    mount = dest.resolve()
+    real_replace = os.replace
+
+    def replace_within_mount(src: str, dst: str, **kwargs: object) -> None:
+        def on_mount(p: str) -> bool:
+            path = Path(os.path.abspath(p))
+            return path == mount or mount in path.parents
+
+        if on_mount(src) != on_mount(dst):
+            raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace_within_mount)
+
+    assert unpack(archive, dest) == dest
+
+    assert _tree(dest) == {
+        "claims": None,
+        "claims/a.md": b"a",
+        "keep.txt": b"keep",
+        "m.json": b"{}",
+    }
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "mnt"]
+
+
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 0)() == 0,
+    reason="directory write permission is only enforced on POSIX for non-root users",
+)
+def test_unpack_into_existing_dest_whose_parent_is_not_writable(tmp_path: Path) -> None:
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("claims/a.md"), b"a")])
+    parent = tmp_path / "read-only"
+    dest = parent / "dest"
+    dest.mkdir(parents=True)
+    (dest / "keep.txt").write_bytes(b"keep")
+    parent.chmod(0o555)
+    try:
+        unpack(archive, dest)
+    finally:
+        parent.chmod(0o755)
+
+    assert _tree(dest) == {"claims": None, "claims/a.md": b"a", "keep.txt": b"keep"}
+    assert sorted(p.name for p in parent.iterdir()) == ["dest"]
+
+
+def test_failed_merge_into_existing_dest_leaves_it_unchanged(tmp_path: Path) -> None:
+    """A conflict found by the pre-move check leaves no staging dir behind."""
+    archive = _write_tar(
+        tmp_path / "a.tar", [(_reg("a.md"), b"new a"), (_reg("claims"), b"file")]
+    )
+    dest = tmp_path / "dest"
+    (dest / "claims").mkdir(parents=True)
+    (dest / "a.md").write_bytes(b"old a")
+    before = _tree(dest)
+
+    with pytest.raises(FileExistsError) as exc:
+        unpack(archive, dest)
+
+    assert "cannot unpack file over existing directory" in str(exc.value)
+    assert _tree(dest) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
+
+
+@pytest.mark.parametrize(
+    "member", [".unpacking-0000000000000000/x", ".UNPACKING-0000000000000000/x"]
+)
+def test_member_named_like_the_staging_dir_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member: str
+) -> None:
+    """The staging dir inside dest has a random name; a member that guesses
+    it (in any case) must not be moved into the staging tree."""
+    import secrets
+
+    monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
+    archive = _write_tar(tmp_path / "a.tar", [(_reg(member), b"x")])
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "keep.txt").write_bytes(b"keep")
+
+    with pytest.raises(FileExistsError) as exc:
+        unpack(archive, dest)
+
+    assert "cannot unpack over the staging directory" in str(exc.value)
+    assert _tree(dest) == {"keep.txt": b"keep"}
