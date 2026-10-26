@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -503,6 +504,60 @@ def test_force_does_not_follow_symlinks_inside_the_destination(tmp_path: Path) -
     assert (elsewhere / "precious.txt").read_bytes() == b"precious"
     assert not (dst / "stale.txt").exists()
     assert not (dst / "linked").exists()
+
+
+@pytest.mark.skipif(
+    not shutil.rmtree.avoids_symlink_attacks,
+    reason="rmtree on this platform cannot detect a directory replaced mid-removal",
+)
+def test_force_does_not_follow_a_directory_replaced_by_a_symlink_during_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory inside the destination is replaced by a symlink after it
+    was inspected but before it is opened for listing, as another process
+    could do. The removal must stop instead of deleting through the link."""
+    import os
+
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "precious.txt").write_bytes(b"precious")
+    dst = tmp_path / "v04"
+    (dst / "swapped").mkdir(parents=True)
+    (dst / "swapped" / "stale.txt").write_bytes(b"stale")
+
+    real_open, real_scandir = os.open, os.scandir
+    swaps: list[object] = []
+
+    def swap_before_listing(path: object) -> None:
+        if swaps or not isinstance(path, (str, os.PathLike)):
+            return
+        if os.path.basename(os.fspath(path)) == "swapped":
+            os.rename(dst / "swapped", tmp_path / "moved-aside")
+            os.symlink(elsewhere, dst / "swapped", target_is_directory=True)
+            swaps.append(path)
+
+    def open_(path: object, *args: object, **kwargs: object) -> int:
+        swap_before_listing(path)
+        return real_open(path, *args, **kwargs)
+
+    def scandir_(*args: object) -> object:
+        if args:
+            swap_before_listing(args[0])
+        return real_scandir(*args)
+
+    monkeypatch.setattr(os, "open", open_)
+    monkeypatch.setattr(os, "scandir", scandir_)
+
+    with pytest.raises(OSError) as exc:
+        migrate(MigrateOptions(src=src, dst=dst, force=True))
+
+    assert swaps, "the directory was never opened for listing"
+    assert (elsewhere / "precious.txt").exists()
+    assert (elsewhere / "precious.txt").read_bytes() == b"precious"
+    assert "symbolic link" in str(exc.value)
+    assert not any(p.name.startswith(".v04.migrating-") for p in tmp_path.iterdir())
 
 
 def test_force_keeps_destination_when_source_is_not_migratable(tmp_path: Path) -> None:

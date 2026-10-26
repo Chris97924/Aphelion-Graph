@@ -197,11 +197,12 @@ def _remove_no_follow(path: Path) -> None:
             os.unlink(path)
         return
     if stat.S_ISDIR(st.st_mode):
-        with os.scandir(path) as it:
-            children = [Path(entry.path) for entry in it]
-        for child in children:
-            _remove_no_follow(child)
-        os.rmdir(path)
+        # rmtree unlinks links inside the tree (junctions included on
+        # Windows). Where shutil.rmtree.avoids_symlink_attacks is true it
+        # also walks by file descriptor and checks each directory it opens is
+        # the one it inspected, so a directory replaced by a symlink while
+        # the tree is being removed is refused, not followed.
+        shutil.rmtree(path)
         return
     os.unlink(path)
 
