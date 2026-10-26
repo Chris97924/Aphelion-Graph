@@ -257,17 +257,20 @@ def _cmd_verify(args: argparse.Namespace, writer: Writer) -> int:
 def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
     """Pack a signed .aphelion.tar from an existing package tar.
 
-    Reads the HMAC key (or Ed25519 private key) from --key-file,
-    computes the canonical package hash, produces a SignatureEnvelope,
-    writes/merges signatures.jsonl and signers/<signer_id>.json,
-    then repacks into --out.
+    Reads the raw Ed25519 private key from --key-file, computes the
+    canonical package hash, produces a SignatureEnvelope, writes/merges
+    signatures.jsonl and signers/<signer_id>.json, then repacks into --out.
+
+    hmac-sha256 is not offered: its signer manifest carries the shared
+    secret as public_key_b64 (spec/v0.5-signer-trust.md §3.2), so a package
+    signed with it would hand the signing key to every reader. The algorithm
+    stays available to library callers for test fixtures only.
     """
     from pathlib import Path as _Path
     from aphelion.canonical_tar import read_members, TarMember
     from aphelion.canonical_tar import pack as tar_pack
     from aphelion.canonical_json import loads as cj_loads, normalize, dumps as cj_dumps
     from aphelion.signer import (
-        HMACSigner,
         SignerVerificationError,
         compute_package_canonical_hash,
     )
@@ -296,9 +299,7 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
 
     # Build the signer
     try:
-        if algorithm == "hmac-sha256":
-            signer = HMACSigner(signer_id=signer_id, secret=key_bytes)
-        elif algorithm == "ed25519":
+        if algorithm == "ed25519":
             import base64 as _base64
             from aphelion.signer import Ed25519Signer, _require_cryptography
             _require_cryptography()
@@ -500,9 +501,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sign.add_argument("--signer-id", dest="signer_id", required=True, help="signer identity string")
     p_sign.add_argument(
         "--algorithm",
-        choices=["hmac-sha256", "ed25519"],
+        choices=["ed25519"],
         required=True,
-        help="signing algorithm",
+        help="signing algorithm (hmac-sha256 is test-only and cannot be used here)",
     )
     p_sign.add_argument("--key-file", dest="key_file", required=True, help="raw key bytes file")
     p_sign.add_argument("--out", required=True, help="output .aphelion.tar path")

@@ -1062,6 +1062,7 @@ def test_validate_signatures_algorithm_mismatch_envelope_ed25519_manifest_hmac(
 @pytest.mark.integration
 def test_cli_sign_twice_same_signer_preserves_both_envelopes(tmp_path: Path) -> None:
     """Re-signing with the same signer_id appends rather than replacing prior envelope."""
+    pytest.importorskip("cryptography", reason="aphe sign uses ed25519")
     import contextlib
 
     src = tmp_path / "src"
@@ -1083,7 +1084,7 @@ def test_cli_sign_twice_same_signer_preserves_both_envelopes(tmp_path: Path) -> 
             "sign",
             "--package", str(tar_path),
             "--signer-id", SIGNER_ID,
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(key_file),
             "--out", str(signed_v1),
         ])
@@ -1095,7 +1096,7 @@ def test_cli_sign_twice_same_signer_preserves_both_envelopes(tmp_path: Path) -> 
             "sign",
             "--package", str(signed_v1),
             "--signer-id", SIGNER_ID,
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(key_file),
             "--out", str(signed_v2),
         ])
@@ -1238,6 +1239,7 @@ def test_verify_package_extracts_signer_manifests_once(
 @pytest.mark.integration
 def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
     """aphe sign then aphe verify --require-signed → success end-to-end."""
+    pytest.importorskip("cryptography", reason="aphe sign uses ed25519")
     import contextlib
 
     src = tmp_path / "src"
@@ -1245,7 +1247,7 @@ def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
     tar_path = tmp_path / "pkg.tar"
     _pack_source(src, tar_path)
 
-    # Write HMAC key to file
+    # SHARED_SECRET is 32 bytes: a valid raw Ed25519 private key.
     key_file = tmp_path / "key.bin"
     key_file.write_bytes(SHARED_SECRET)
 
@@ -1260,7 +1262,7 @@ def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
             "sign",
             "--package", str(tar_path),
             "--signer-id", SIGNER_ID,
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(key_file),
             "--out", str(signed_path),
         ])
