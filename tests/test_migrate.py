@@ -516,9 +516,11 @@ def test_force_does_not_follow_symlinks_inside_the_destination(tmp_path: Path) -
 def test_force_does_not_follow_a_directory_replaced_by_a_symlink_during_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A directory inside the destination is replaced by a symlink after it
-    was inspected but before it is opened for listing, as another process
-    could do. The removal must stop instead of deleting through the link."""
+    """A directory inside the replaced destination is replaced by a symlink
+    after it was inspected but before it is opened for listing, as another
+    process could do. Removing the old tree (now in a backup directory) must
+    stop there instead of deleting through the link; that only warns, since
+    the new tree is already in place."""
     import os
 
     src = tmp_path / "v03"
@@ -537,9 +539,10 @@ def test_force_does_not_follow_a_directory_replaced_by_a_symlink_during_removal(
         if swaps or not isinstance(path, (str, os.PathLike)):
             return
         if os.path.basename(os.fspath(path)) == "swapped":
-            os.rename(dst / "swapped", tmp_path / "moved-aside")
-            os.symlink(elsewhere, dst / "swapped", target_is_directory=True)
             swaps.append(path)
+            victim = next(tmp_path.rglob("swapped"))  # wherever the old tree is now
+            os.rename(victim, tmp_path / "moved-aside")
+            os.symlink(elsewhere, victim, target_is_directory=True)
 
     def open_(path: object, *args: object, **kwargs: object) -> int:
         swap_before_listing(path)
@@ -553,12 +556,13 @@ def test_force_does_not_follow_a_directory_replaced_by_a_symlink_during_removal(
     monkeypatch.setattr(os, "open", open_)
     monkeypatch.setattr(os, "scandir", scandir_)
 
-    with pytest.raises(OSError):
+    with pytest.warns(RuntimeWarning):
         migrate(MigrateOptions(src=src, dst=dst, force=True))
 
     assert swaps, "the directory was never opened for listing"
     assert (elsewhere / "precious.txt").exists()
     assert (elsewhere / "precious.txt").read_bytes() == b"precious"
+    assert loads((dst / "manifest.json").read_bytes())["format_version"] == "2.0"
     assert not any(p.name.startswith(".v04.migrating-") for p in tmp_path.iterdir())
 
 
@@ -656,3 +660,93 @@ def test_force_onto_current_directory_spelled_dot(
 
     assert not (dst / "stale.txt").exists()
     assert loads((dst / "manifest.json").read_bytes())["format_version"] == "2.0"
+
+
+# ---------- --force keeps the old destination until the new one is in place ----------
+
+
+def _force_setup(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes | None]]:
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    dst = tmp_path / "v04"
+    (dst / "sub").mkdir(parents=True)
+    (dst / "keep.txt").write_bytes(b"keep")
+    (dst / "sub" / "stale.txt").write_bytes(b"stale")
+    return src, dst, _snapshot(dst)
+
+
+def _fail_replace(monkeypatch: pytest.MonkeyPatch, *prefixes: str) -> None:
+    """Make os.replace fail when its source name starts with one of ``prefixes``
+    or lies in a directory that does."""
+    import errno
+    import os
+
+    real_replace = os.replace
+
+    def replace(src: str, dst: str, **kwargs: object) -> None:
+        if any(p.startswith(prefixes) for p in Path(os.fspath(src)).parts):
+            raise OSError(errno.EIO, "simulated I/O error", os.fspath(dst))
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+
+def test_force_keeps_destination_when_the_new_tree_cannot_be_moved_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src, dst, before = _force_setup(tmp_path)
+    _fail_replace(monkeypatch, ".v04.migrating-")
+
+    with pytest.raises(OSError) as exc:
+        migrate(MigrateOptions(src=src, dst=dst, force=True))
+    monkeypatch.undo()
+
+    assert "simulated I/O error" in str(exc.value)
+    assert _snapshot(dst) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["v03", "v04"]
+
+
+def test_force_names_the_backup_when_the_destination_cannot_be_restored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src, dst, before = _force_setup(tmp_path)
+    _fail_replace(monkeypatch, ".v04.migrating-", ".v04.replaced-")
+
+    with pytest.raises(OSError) as exc:
+        migrate(MigrateOptions(src=src, dst=dst, force=True))
+    monkeypatch.undo()
+
+    backups = [p for p in tmp_path.iterdir() if p.name.startswith(".v04.replaced-")]
+    assert len(backups) == 1
+    assert str(backups[0]) in str(exc.value)
+    assert "could not undo" in str(exc.value)
+    (kept,) = backups[0].iterdir()
+    assert _snapshot(kept) == before
+
+
+def test_force_only_warns_when_the_old_destination_cannot_be_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The new tree is already in place, so a leftover of the old one (a file
+    held open, say) is reported, not raised."""
+    import errno
+    import os
+
+    src, dst, _ = _force_setup(tmp_path)
+    real_unlink = os.unlink
+
+    def unlink(path: str, *args: object, **kwargs: object) -> None:
+        if os.path.basename(os.fspath(path)) == "stale.txt":
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    monkeypatch.setattr(os, "remove", unlink)
+
+    with pytest.warns(RuntimeWarning, match="could not remove") as warned:
+        migrate(MigrateOptions(src=src, dst=dst, force=True))
+    monkeypatch.undo()
+
+    assert loads((dst / "manifest.json").read_bytes())["format_version"] == "2.0"
+    (backup,) = [p for p in tmp_path.iterdir() if p.name.startswith(".v04.replaced-")]
+    assert any(str(backup) in str(w.message) for w in warned)

@@ -18,7 +18,6 @@ import io
 import os
 import secrets
 import shutil
-import stat
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +28,7 @@ from aphelion.canonical_json import loads as canonical_loads
 from aphelion.canonical_json import normalize
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
+from aphelion.unpacker import _remove_or_warn, _Replacement
 
 TARGET_FORMAT_VERSION = "2.0"
 TARGET_SPEC_VERSION = "0.4.0"
@@ -99,8 +99,14 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
 
     Every check (source manifest, destination overlap, existing destination)
     runs before anything is written or removed. The new tree is built next
-    to ``dst`` and only then swapped in; an existing ``dst`` is removed
-    without following symlinks.
+    to ``dst`` and only then swapped in. An existing ``dst`` (or the link
+    that is ``dst``) is first renamed into a backup directory beside it and
+    deleted, without following links, only once the new tree is in place;
+    if that fails, the backup is named in a RuntimeWarning. After any
+    exception ``dst`` is as it was, or the error names the backup directory
+    that still holds it. The known limits are those of
+    :class:`aphelion.unpacker._Replacement`: no recovery after a killed
+    process or power loss, Windows files held open, one filesystem only.
     """
     src_path = Path(src)
     dst_path = Path(dst)
@@ -124,16 +130,26 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     dst_abs = Path(os.path.abspath(dst_path))
     dst_abs.parent.mkdir(parents=True, exist_ok=True)
     staging = dst_abs.with_name(f".{dst_abs.name}.migrating-{secrets.token_hex(8)}")
+    replacement = None
     try:
         shutil.copytree(src_path, staging)
         (staging / "manifest.json").write_bytes(canonical_dumps(normalize(new_manifest)))
         if dst_present:
-            _remove_no_follow(dst_abs)
-        os.replace(staging, dst_abs)
-    except BaseException:
-        if os.path.lexists(staging):
-            _remove_no_follow(staging)
+            backup = dst_abs.with_name(f".{dst_abs.name}.replaced-{secrets.token_hex(8)}")
+            backup.mkdir()
+            replacement = _Replacement(backup)
+            try:
+                replacement.put(staging, dst_abs)
+            except BaseException as exc:
+                replacement.rollback(exc)
+                raise
+        else:
+            os.replace(staging, dst_abs)
+    except BaseException as exc:
+        _remove_or_warn(staging, exc)
         raise
+    if replacement is not None:
+        replacement.commit()
     return dst_path
 
 
@@ -176,42 +192,6 @@ def _refuse_overlap(src: Path, dst: Path) -> None:
                 ),
                 path=str(dst),
             )
-
-
-def _is_link(st: os.stat_result) -> bool:
-    # A Windows junction is a reparse point but not S_ISLNK on Python < 3.12.
-    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse)
-
-
-def _remove_no_follow(path: Path) -> None:
-    """Delete ``path``; a symlink or junction anywhere is unlinked, never followed.
-
-    Where ``shutil.rmtree.avoids_symlink_attacks`` is false (Windows), rmtree
-    walks by path, so a directory that another process replaces with a link
-    while the tree is being removed can still be followed: a known residual.
-    """
-    st = os.lstat(path)
-    if _is_link(st):
-        # On Windows a directory symlink or junction is removed with rmdir,
-        # which deletes the link itself, not the directory it points to.
-        windows_dir = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0)
-        if getattr(st, "st_file_attributes", 0) & windows_dir:
-            os.rmdir(path)
-        else:
-            os.unlink(path)
-        return
-    if stat.S_ISDIR(st.st_mode):
-        # rmtree unlinks links inside the tree (junctions included on
-        # Windows). Where shutil.rmtree.avoids_symlink_attacks is true it
-        # also walks by file descriptor and checks each directory it opens is
-        # the one it inspected, so a directory replaced by a symlink while
-        # the tree is being removed is refused, not followed. Inside the
-        # tree, rmtree treats only symlink and junction (mount point) reparse
-        # points as links; other reparse point kinds are descended into.
-        shutil.rmtree(path)
-        return
-    os.unlink(path)
 
 
 def migrate_archive(src: Path, dst: Path, *, force: bool = False) -> Path:

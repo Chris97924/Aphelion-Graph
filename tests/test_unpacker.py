@@ -615,20 +615,17 @@ def _short_name(path: Path) -> str | None:
     return None if short == path.name else short
 
 
-def _staging_alias(dest: Path, kind: str) -> str:
-    """A spelling, other than through a link, that names the staging dir
-    unpack will create in ``dest``; skips when this filesystem has none."""
-    probe = dest / STAGING_NAME
+def _staging_alias(dest: Path, kind: str, name: str = STAGING_NAME) -> str:
+    """A spelling, other than through a link, that names the directory
+    ``name`` unpack will create in ``dest`` (the staging dir by default);
+    skips when this filesystem has none."""
+    probe = dest / name
     probe.mkdir()
     try:
         if kind == "8.3":
             alias = _short_name(probe)
         else:
-            alias = {
-                "exact": STAGING_NAME,
-                "case": STAGING_NAME.upper(),
-                "trailing-dot": STAGING_NAME + ".",
-            }[kind]
+            alias = {"exact": name, "case": name.upper(), "trailing-dot": name + "."}[kind]
         if alias is None:
             pytest.skip("this volume does not generate 8.3 short names")
         if not (os.path.lexists(dest / alias) and os.path.samefile(dest / alias, probe)):
@@ -699,8 +696,16 @@ def _fail_to_unlink(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
             raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
         real_unlink(path, *args, **kwargs)
 
+    real_rmdir = os.rmdir
+
+    def rmdir(path: str, *args: object, **kwargs: object) -> None:
+        if os.path.basename(os.fspath(path)) == name:
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        real_rmdir(path, *args, **kwargs)
+
     monkeypatch.setattr(os, "unlink", unlink)
     monkeypatch.setattr(os, "remove", unlink)
+    monkeypatch.setattr(os, "rmdir", rmdir)  # a directory link may go by rmdir
 
 
 def test_failed_unpack_names_a_staging_dir_it_cannot_remove(
@@ -739,13 +744,18 @@ def test_failed_unpack_keeps_its_error_when_warnings_are_errors(
     monkeypatch.undo()
 
     assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
+    if sys.version_info >= (3, 11):  # the warning was an error; a note still names it
+        leftover = [p for p in dest.resolve().iterdir() if p.name.startswith(".unpacking-")]
+        assert len(leftover) == 1
+        assert any(str(leftover[0]) in note for note in exc.value.__notes__)
 
 
 def test_failed_unpack_removes_read_only_staged_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A read-only file (the Windows attribute blocks deletion) in the staging
-    tree is made writable and removed, not left inside dest."""
+    tree is made writable and removed, not left inside dest. Guards Windows
+    only: POSIX deletes a read-only file in a writable directory anyway."""
     import aphelion.unpacker as unpacker
 
     real_extract = unpacker._extract
@@ -769,25 +779,50 @@ def test_failed_unpack_removes_read_only_staged_files(
     assert _tree(dest) == {"keep.txt": b"keep"}
 
 
+@pytest.mark.parametrize(
+    "link_kind",
+    [
+        "symlink",
+        pytest.param(
+            "junction",
+            marks=pytest.mark.skipif(
+                sys.platform != "win32", reason="junctions exist only on Windows"
+            ),
+        ),
+    ],
+)
 def test_failed_unpack_never_changes_a_link_target_in_staging(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str
 ) -> None:
     """A link in the staging tree that cannot be removed is reported, never
-    made writable: that would change the read-only file it points to."""
+    made writable: that would change the read-only entry it points to. The
+    symlink case guards POSIX, where chmod follows links; Windows chmod did
+    not change a symlink's target even before, and the junction case covers
+    the other kind of Windows link."""
     import aphelion.unpacker as unpacker
 
-    outside = tmp_path / "outside.txt"
-    outside.write_bytes(b"outside")
-    outside.chmod(stat.S_IREAD)
+    if link_kind == "symlink":
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(b"outside")
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+    outside.chmod(stat.S_IREAD | (stat.S_IEXEC if outside.is_dir() else 0))
     mode_before = stat.S_IMODE(outside.stat().st_mode)
     real_extract = unpacker._extract
 
     def extract_then_fail(*args: object) -> None:
         real_extract(*args)
+        link = args[1] / "link"  # args[1] is the staging dir
         try:
-            os.symlink(outside, args[1] / "link")  # args[1] is the staging dir
+            if link_kind == "junction":
+                import _winapi
+
+                _winapi.CreateJunction(str(outside), str(link))
+            else:
+                os.symlink(outside, link)
         except (OSError, NotImplementedError) as exc:  # Windows without the privilege
-            pytest.skip(f"cannot create symlinks here: {exc}")
+            pytest.skip(f"cannot create {link_kind}s here: {exc}")
         raise RuntimeError("failed after extraction")
 
     monkeypatch.setattr(unpacker, "_extract", extract_then_fail)
@@ -802,7 +837,249 @@ def test_failed_unpack_never_changes_a_link_target_in_staging(
     finally:
         monkeypatch.undo()
         mode_after = stat.S_IMODE(outside.stat().st_mode)
-        outside.chmod(stat.S_IREAD | stat.S_IWRITE)
+        outside.chmod(stat.S_IREAD | stat.S_IWRITE | stat.S_IEXEC)
 
     assert mode_after == mode_before
-    assert outside.read_bytes() == b"outside"
+    assert outside.exists()
+
+
+# ---------- a failure while moving into an existing dest is undone ----------
+
+
+def _merge_archive(tmp_path: Path) -> tuple[Path, Path, dict[str, bytes | None]]:
+    """An existing dest and an archive that replaces two of its files and adds
+    a directory, moved in that order (top-level files first)."""
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [
+            (_reg("a.md"), b"new a"),
+            (_reg("z.md"), b"new z"),
+            (_dir("new"), None),
+            (_reg("new/f.md"), b"new f"),
+        ],
+    )
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "a.md").write_bytes(b"old a")
+    (dest / "z.md").write_bytes(b"old z")
+    (dest / "keep.txt").write_bytes(b"keep")
+    return archive, dest, _tree(dest)
+
+
+def _fail_moves(
+    monkeypatch: pytest.MonkeyPatch, *, nth_staged: int, restores: bool = False
+) -> None:
+    """Fail the ``nth_staged`` move of an extracted file out of staging, and
+    with ``restores`` also every move back out of the backup directory."""
+    real_replace = os.replace
+    staged_moves = []
+
+    def replace(src: str, dst: str, **kwargs: object) -> None:
+        parts = Path(os.fspath(src)).parts
+        in_staging = any(p.startswith(".unpacking-") for p in parts)
+        in_backup = any(p.startswith(".backup-") for p in parts)
+        if in_staging and not in_backup:
+            staged_moves.append(src)
+            if len(staged_moves) == nth_staged:
+                raise OSError(errno.EIO, "simulated I/O error", os.fspath(dst))
+        if restores and in_backup:
+            raise OSError(errno.EIO, "simulated I/O error", os.fspath(dst))
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+
+def test_failed_move_into_existing_dest_is_undone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OS error after some files were replaced (a full disk, a file held
+    open on Windows) puts every replaced file back and removes what was added."""
+    archive, dest, before = _merge_archive(tmp_path)
+    _fail_moves(monkeypatch, nth_staged=3)  # after a.md and z.md were replaced
+
+    with pytest.raises(OSError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert "simulated I/O error" in str(exc.value)
+    assert _tree(dest) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
+
+
+def test_failed_undo_keeps_the_backup_and_names_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, dest, _ = _merge_archive(tmp_path)
+    _fail_moves(monkeypatch, nth_staged=3, restores=True)
+
+    with pytest.raises(OSError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    backups = list(dest.resolve().glob(".unpacking-*/.backup-*"))
+    assert len(backups) == 1
+    assert str(backups[0]) in str(exc.value)
+    assert "could not undo" in str(exc.value)
+    kept = sorted(p.read_bytes() for p in backups[0].iterdir())
+    assert kept == [b"old a", b"old z"]
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="only Windows refuses to rename a file that another handle holds open",
+)
+def test_unpack_over_a_file_held_open_leaves_dest_unchanged(tmp_path: Path) -> None:
+    archive, dest, before = _merge_archive(tmp_path)
+
+    with open(dest / "z.md", "rb"), pytest.raises(PermissionError) as exc:
+        unpack(archive, dest)
+
+    assert getattr(exc.value, "winerror", None) == 32  # sharing violation
+    assert _tree(dest) == before
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="only on Windows does the read-only attribute stop a file being replaced",
+)
+def test_unpack_replaces_a_read_only_file(tmp_path: Path) -> None:
+    archive, dest, _ = _merge_archive(tmp_path)
+    (dest / "z.md").chmod(stat.S_IREAD)
+
+    unpack(archive, dest)
+
+    assert (dest / "z.md").read_bytes() == b"new z"
+    assert not [p for p in dest.iterdir() if p.name.startswith(".unpacking-")]
+
+
+def test_staging_left_after_a_complete_merge_only_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dest is fully updated, so failing to remove the empty staging dir
+    afterwards must not report the unpack as failed."""
+    archive, dest, _ = _merge_archive(tmp_path)
+    real_rmdir = os.rmdir
+
+    def rmdir(path: str, *args: object, **kwargs: object) -> None:
+        if os.path.basename(os.fspath(path)).startswith(".unpacking-"):
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rmdir", rmdir)
+
+    with pytest.warns(RuntimeWarning, match="could not remove"):
+        assert unpack(archive, dest) == dest
+    monkeypatch.undo()
+
+    assert (dest / "a.md").read_bytes() == b"new a"
+    assert (dest / "new" / "f.md").read_bytes() == b"new f"
+
+
+BACKUP_NAME = ".backup-" + "00" * 8  # with secrets.token_hex patched to zeros
+
+
+@pytest.mark.parametrize("kind", STAGING_ALIASES)
+def test_member_reaching_the_backup_dir_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """The backup directory for replaced files sits in staging; a member that
+    reaches it under any spelling is refused before anything is moved."""
+    import secrets
+
+    monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
+    probe = tmp_path / "probe"  # empty, as staging is when the backup is made
+    probe.mkdir()
+    alias = _staging_alias(probe, kind, BACKUP_NAME)
+    _, dest, before = _merge_archive(tmp_path)
+    archive = _write_tar(tmp_path / "b.tar", [(_reg(f"{alias}/x"), b"x"), (_reg("a.md"), b"a")])
+
+    with pytest.raises(FileExistsError) as exc:
+        unpack(archive, dest)
+
+    assert "cannot unpack over the backup directory" in str(exc.value)
+    assert _tree(dest) == before
+
+
+# ---------- the destination itself must not be a link ----------
+
+
+def _link_or_skip(link: Path, target: Path, kind: str) -> None:
+    try:
+        if kind == "junction":
+            import _winapi
+
+            _winapi.CreateJunction(str(target), str(link))
+        else:
+            os.symlink(target, link, target_is_directory=True)
+    except (OSError, NotImplementedError, ImportError) as exc:
+        pytest.skip(f"cannot create {kind}s here: {exc}")
+
+
+LINK_KINDS = [
+    "symlink",
+    pytest.param(
+        "junction",
+        marks=pytest.mark.skipif(sys.platform != "win32", reason="junctions exist only on Windows"),
+    ),
+]
+
+
+@pytest.mark.parametrize("kind", LINK_KINDS)
+def test_unpack_refuses_a_dangling_link_as_destination(tmp_path: Path, kind: str) -> None:
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"a")])
+    target = tmp_path / "elsewhere" / "target"
+    target.mkdir(parents=True)  # a junction can only be made to an existing dir
+    dest = tmp_path / "dest"
+    _link_or_skip(dest, target, kind)
+    target.rmdir()
+    target.parent.rmdir()
+
+    with pytest.raises(FileExistsError) as exc:
+        unpack(archive, dest)
+
+    assert "symlink or junction" in str(exc.value)
+    assert not (tmp_path / "elsewhere").exists()
+
+
+@pytest.mark.parametrize("kind", LINK_KINDS)
+def test_unpack_refuses_a_link_to_a_directory_as_destination(
+    tmp_path: Path, kind: str
+) -> None:
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"a")])
+    target = tmp_path / "target"
+    target.mkdir()
+    dest = tmp_path / "dest"
+    _link_or_skip(dest, target, kind)
+
+    with pytest.raises(FileExistsError) as exc:
+        unpack(archive, dest)
+
+    assert "symlink or junction" in str(exc.value)
+    assert list(target.iterdir()) == []
+
+
+# ---------- only directories this call created are removed ----------
+
+
+def test_failed_unpack_keeps_a_parent_another_process_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, policy = _fails_after_first_member(tmp_path)
+    shared = tmp_path / "shared"
+    dest = shared / "mine" / "dest"
+    real_mkdir = Path.mkdir
+
+    def mkdir(self: Path, *args: object, **kwargs: object) -> None:
+        if self == shared and not shared.exists():
+            os.mkdir(shared)  # another process gets there first
+            (shared / "theirs.txt").write_bytes(b"theirs")
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, dest, policy=policy)
+    monkeypatch.undo()
+
+    assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
+    assert _tree(shared) == {"theirs.txt": b"theirs"}

@@ -25,7 +25,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Callable, Iterator, Mapping
 
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SecurityError
@@ -248,42 +248,176 @@ def unpack(
     into place only once every member has passed every check. For an existing
     ``dest_dir`` the staging directory is a hidden ``.unpacking-*`` directory
     inside it, visible there while the unpack runs; otherwise it sits next to
-    ``dest_dir`` and is renamed to it. A failed unpack leaves the contents of
-    ``dest_dir`` as they were (its own timestamps may change) and removes any
-    parent directories it had to create. If the staging directory cannot be
-    removed, a RuntimeWarning names it and the original error is still raised;
-    an interrupted process can also leave one behind. On success, archive
-    files replace same-named files in an existing ``dest_dir``; other files
-    there are kept.
+    ``dest_dir`` and is renamed to it. Files an existing ``dest_dir`` already
+    has are moved aside into the staging directory before being replaced, so
+    an error while moving puts them back (see :class:`_Replacement`).
+
+    After any exception the contents of ``dest_dir`` are as they were (its
+    own timestamps may change), or the error names the directory that still
+    holds the original files. Parent directories this call created are
+    removed again. Staging that cannot be removed is named in a
+    RuntimeWarning and, on Python 3.11+, in a note on the raised error.
+    ``dest_dir`` itself must not be a symlink or junction.
+
+    Known limits: there is no journal, so a killed process or a power loss
+    can leave a ``.unpacking-*`` directory (with replaced files in it) behind;
+    a file Windows holds open without delete sharing can stop both the move
+    and the undo; staging is always on ``dest_dir``'s own filesystem, so a
+    separate mount inside ``dest_dir`` makes the move fail (and be undone).
+    On success, archive files replace same-named files in an existing
+    ``dest_dir``; other files there are kept.
     """
     policy = policy or ExtractPolicy.default()
     archive = Path(archive_path)
     dest = Path(dest_dir)
+    if _is_link_entry(dest):
+        # resolve() would follow it, also when dangling, and unpack elsewhere.
+        raise FileExistsError(f"unpack destination is a symlink or junction: {dest}")
     if dest.exists() and not dest.is_dir():
         raise FileExistsError(f"unpack destination is not a directory: {dest}")
     dest_resolved = dest.resolve()
-    created = _first_missing_ancestor(dest_resolved)
-    dest_resolved.parent.mkdir(parents=True, exist_ok=True)
+    made = _make_parents(dest_resolved.parent)
     staging = _make_staging_dir(dest_resolved)
     try:
-        _extract(archive, staging, dest_resolved, policy)
-        _move_into_place(staging, dest_resolved)
-    except BaseException:
-        # staging and `created` only hold directories and files this call made.
-        _remove_tree_or_warn(staging)
-        if created is not None:
-            _remove_tree_or_warn(created)
+        backup = None
+        if staging.parent == dest_resolved:
+            backup = _make_unique_dir(staging, ".backup-")
+        _extract(archive, staging, dest_resolved, policy, backup)
+        _move_into_place(staging, dest_resolved, backup)
+    except BaseException as exc:
+        if not isinstance(exc, _RestoreError):  # staging holds the backup it names
+            _remove_or_warn(staging, exc)
+        _remove_made(made)
         raise
     return dest
 
 
-def _remove_tree_or_warn(path: Path) -> None:
-    """Remove a tree unpack made, on the failure path; never raises.
+def _is_link(st: os.stat_result) -> bool:
+    # A Windows junction is a reparse point but not S_ISLNK on Python < 3.12.
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse)
 
-    rmtree does not follow symlinks. On Windows a read-only entry (the
-    attribute blocks deletion) is made writable and retried. Whatever is still
-    left is named in a RuntimeWarning, so the caller's original error is never
-    replaced.
+
+def _is_link_entry(path: Path) -> bool:
+    try:
+        return _is_link(os.lstat(path))
+    except OSError:
+        return False
+
+
+def _same_entry(a: Path, b: Path) -> bool:
+    try:
+        return os.path.lexists(a) and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _make_parents(path: Path) -> list[Path]:
+    """Create ``path`` and its missing parents; return the ones this call made.
+
+    Each level is created on its own, so a directory another process creates
+    meanwhile is not counted as ours and is never removed on failure.
+    """
+    missing = []
+    for candidate in (path, *path.parents):
+        if os.path.lexists(candidate):
+            break
+        missing.append(candidate)
+    made: list[Path] = []
+    try:
+        for directory in reversed(missing):
+            try:
+                directory.mkdir()
+            except FileExistsError:
+                if not directory.is_dir():
+                    raise
+                continue
+            made.append(directory)
+    except BaseException:
+        _remove_made(made)
+        raise
+    return made
+
+
+def _remove_made(made: list[Path]) -> None:
+    # rmdir, not rmtree: anything another process put there stays.
+    for directory in reversed(made):
+        try:
+            os.rmdir(directory)
+        except OSError:
+            pass
+
+
+class _RestoreError(OSError):
+    """An undo did not finish; the message names where the originals are."""
+
+
+class _Replacement:
+    """Put entries in place by rename, so that a failure can be undone.
+
+    An entry about to be replaced is first renamed into ``backup``, a
+    directory on the same filesystem, and every step is logged. ``rollback``
+    reverses the log. If any undo step fails, ``backup`` is kept and the
+    :class:`_RestoreError` raised names it. ``commit`` deletes ``backup``,
+    warning instead of raising if it cannot. Shared by unpack and migrate.
+
+    Known limits: the log is in memory only (no recovery after a kill or a
+    power loss; ``backup`` then still holds the replaced entries), an undo
+    step fails if Windows holds the file open without delete sharing, and
+    every rename must stay on one filesystem.
+    """
+
+    def __init__(self, backup: Path) -> None:
+        self.backup = backup
+        self._undo: list[tuple[Path, Path | None]] = []  # rename back, or rmdir
+
+    def mkdir(self, target: Path) -> None:
+        if not target.is_dir():
+            target.mkdir()
+            self._undo.append((target, None))
+
+    def put(self, src: Path, target: Path) -> None:
+        if os.path.lexists(target):
+            saved = self.backup / str(len(self._undo))
+            os.replace(target, saved)
+            self._undo.append((saved, target))
+        os.replace(src, target)
+        self._undo.append((target, src))
+
+    def rollback(self, exc: BaseException) -> None:
+        failed = []
+        for path, back in reversed(self._undo):
+            try:
+                if back is None:
+                    os.rmdir(path)
+                else:
+                    os.replace(path, back)
+            except OSError as err:
+                failed.append(f"{path}: {err}")
+        self._undo.clear()
+        if failed:
+            raise _RestoreError(
+                f"could not undo after {exc!r}; the original entries are kept in "
+                f"{self.backup} ({'; '.join(failed)})"
+            ) from exc
+        _remove_or_warn(self.backup, exc)
+
+    def commit(self) -> None:
+        _remove_or_warn(self.backup)
+
+
+def _remove_or_warn(path: Path, exc: BaseException | None = None) -> None:
+    """Remove a directory tree this process made; never raises.
+
+    rmtree unlinks links inside the tree instead of following them; where
+    ``shutil.rmtree.avoids_symlink_attacks`` is true it also refuses a
+    directory replaced by a link while it runs. Where it is false (Windows)
+    that race remains, and only symlink and junction reparse points count as
+    links. On Windows a read-only entry (the attribute blocks deletion) is
+    made writable and retried. Whatever is still left is named in a
+    RuntimeWarning and, on Python 3.11+, in a note on ``exc``, so the caller's
+    error is never replaced; under a warnings filter set to "error" on 3.10
+    the leftover goes unreported.
     """
 
     def retry_writable(func: Callable[[str], object], entry: str, _exc: object) -> None:
@@ -293,14 +427,10 @@ def _remove_tree_or_warn(path: Path) -> None:
             return
         try:
             st = os.lstat(entry)
-            reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-            is_link = stat.S_ISLNK(st.st_mode) or bool(
-                getattr(st, "st_file_attributes", 0) & reparse
-            )
             # Never chmod through a link: that would change its target, which
             # may lie outside the tree. Where chmod cannot be told not to
             # follow links, the lstat above is the only guard.
-            if not is_link:
+            if not _is_link(st):
                 if os.chmod in os.supports_follow_symlinks:
                     os.chmod(
                         entry, stat.S_IMODE(st.st_mode) | stat.S_IWRITE, follow_symlinks=False
@@ -316,24 +446,13 @@ def _remove_tree_or_warn(path: Path) -> None:
     else:
         shutil.rmtree(path, onerror=retry_writable)
     if os.path.lexists(path):
+        note = f"could not remove {path}; delete it by hand"
+        if exc is not None and hasattr(exc, "add_note"):
+            exc.add_note(note)
         try:
-            warnings.warn(
-                f"unpack could not remove {path}; delete it by hand",
-                RuntimeWarning,
-                stacklevel=3,
-            )
-        except Exception:  # a warnings filter set to "error" must not mask it
+            warnings.warn(note, RuntimeWarning, stacklevel=3)
+        except Exception:  # a warnings filter set to "error" must not mask exc
             pass
-
-
-def _first_missing_ancestor(path: Path) -> Path | None:
-    """The outermost of ``path`` and its parents that does not exist yet."""
-    missing = None
-    for candidate in (path, *path.parents):
-        if candidate.exists() or candidate.is_symlink():
-            break
-        missing = candidate
-    return missing
 
 
 def _make_staging_dir(dest: Path) -> Path:
@@ -343,40 +462,48 @@ def _make_staging_dir(dest: Path) -> Path:
     # which becomes dest by one rename; Path.mkdir (not tempfile.mkdtemp)
     # keeps the umask-derived mode that dest would have had.
     if dest.is_dir():
-        parent, prefix = dest, ".unpacking-"
-    else:
-        parent, prefix = dest.parent, f".{dest.name}.unpacking-"
+        return _make_unique_dir(dest, ".unpacking-")
+    return _make_unique_dir(dest.parent, f".{dest.name}.unpacking-")
+
+
+def _make_unique_dir(parent: Path, prefix: str) -> Path:
     while True:
-        staging = parent / f"{prefix}{secrets.token_hex(8)}"
+        path = parent / f"{prefix}{secrets.token_hex(8)}"
         try:
-            staging.mkdir()
+            path.mkdir()
         except FileExistsError:  # pragma: no cover - 64-bit random collision
             continue
-        return staging
+        return path
 
 
-def _move_into_place(staging: Path, dest: Path) -> None:
-    """Move a fully extracted staging tree into ``dest``."""
+def _move_into_place(staging: Path, dest: Path, backup: Path | None) -> None:
+    """Move a fully extracted staging tree into ``dest``.
+
+    An existing ``dest`` is merged through a :class:`_Replacement` whose
+    backup directory sits in staging, so an error midway is undone.
+    """
     if not dest.exists():
         os.replace(staging, dest)
         return
-    # Existing destination: merge. Check every target first so a conflict
-    # cannot leave a half-moved tree behind.
+    if backup is None:  # dest appeared after staging was made beside it
+        backup = _make_unique_dir(staging, ".backup-")
 
-    def is_staging(target: Path) -> bool:
-        # Staging may sit inside dest. Compared by identity, not by name: on
-        # Windows a case variant, a trailing dot or space, or the 8.3 short
-        # name also reaches it, and so can a directory link already in dest.
-        try:
-            return os.path.lexists(target) and os.path.samefile(target, staging)
-        except OSError:
-            return False
+    def staged() -> Iterator[tuple[Path, Path, list[str], list[str]]]:
+        # Every staged entry except the backup directory, found by identity.
+        for root, dirnames, filenames in os.walk(staging):
+            rel_root = Path(root).relative_to(staging)
+            if rel_root == Path("."):
+                dirnames[:] = [n for n in dirnames if not _same_entry(staging / n, backup)]
+            yield Path(root), rel_root, dirnames, filenames
 
-    for root, dirnames, filenames in os.walk(staging):
-        rel_root = Path(root).relative_to(staging)
+    # Check every target first so a conflict cannot leave a half-moved tree.
+    for _root, rel_root, dirnames, filenames in staged():
         for name in (*dirnames, *filenames):
             target = dest / rel_root / name
-            if is_staging(target):
+            # Staging sits inside dest. Compared by identity, not by name: on
+            # Windows a case variant or the 8.3 short name also reaches it,
+            # and so can a directory link already in dest.
+            if _same_entry(target, staging):
                 raise FileExistsError(
                     f"cannot unpack over the staging directory: {target}"
                 )
@@ -392,17 +519,27 @@ def _move_into_place(staging: Path, dest: Path) -> None:
                 raise FileExistsError(
                     f"cannot unpack file over existing directory: {target}"
                 )
-    for root, dirnames, filenames in os.walk(staging):
-        rel_root = Path(root).relative_to(staging)
-        for name in dirnames:
-            (dest / rel_root / name).mkdir(exist_ok=True)
-        for name in filenames:
-            os.replace(Path(root) / name, dest / rel_root / name)
-    shutil.rmtree(staging)
+    replacement = _Replacement(backup)
+    try:
+        for root, rel_root, dirnames, filenames in staged():
+            for name in dirnames:
+                replacement.mkdir(dest / rel_root / name)
+            for name in filenames:
+                replacement.put(root / name, dest / rel_root / name)
+    except BaseException as exc:
+        replacement.rollback(exc)
+        raise
+    replacement.commit()
+    # dest is complete: failing to remove what is left of staging only warns.
+    _remove_or_warn(staging)
 
 
 def _extract(
-    archive: Path, staging: Path, dest_resolved: Path, policy: ExtractPolicy
+    archive: Path,
+    staging: Path,
+    dest_resolved: Path,
+    policy: ExtractPolicy,
+    backup: Path | None = None,
 ) -> None:
     total_bytes = 0
     archive_size = archive.stat().st_size
@@ -421,6 +558,12 @@ def _extract(
                     msg=f"resolved path escapes dest: {normalized!r}",
                     path=normalized,
                 )
+            # The backup directory sits in staging; like staging itself it is
+            # recognised by identity, so no alias of its name can reach it.
+            if backup is not None and normalized:
+                first = staging / normalized.split("/", 1)[0]
+                if _same_entry(first, backup):
+                    raise FileExistsError(f"cannot unpack over the backup directory: {first}")
             target = staging / normalized
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
