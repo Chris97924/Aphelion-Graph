@@ -1176,6 +1176,98 @@ def test_undo_stopped_at_any_step_loses_nothing(
                 assert left.get(path) == data or data in kept, (where, path, left, named)
 
 
+# ---------- two members that reach one entry are refused ----------
+
+
+WINDOWS_83 = pytest.mark.skipif(
+    sys.platform != "win32", reason="8.3 short names exist only on Windows"
+)
+
+
+def _short_alias(tmp_path: Path, long_name: str, *, directory: bool) -> str:
+    """The 8.3 short name ``long_name`` gets in an empty directory on this
+    volume, as it would in a fresh staging dir; skips where there is none."""
+    probe = tmp_path / "probe-83" / long_name
+    probe.parent.mkdir()
+    if directory:
+        probe.mkdir()
+    else:
+        probe.write_bytes(b"")
+    short = _short_name(probe)
+    if directory:
+        probe.rmdir()
+    else:
+        probe.unlink()
+    probe.parent.rmdir()
+    if short is None:
+        pytest.skip("this volume does not generate 8.3 short names")
+    return short
+
+
+@WINDOWS_83
+@pytest.mark.parametrize("dest_exists", [False, True], ids=["new-dest", "existing-dest"])
+@pytest.mark.parametrize("layout", ["file", "implicit-parent", "explicit-directory"])
+def test_member_reaching_an_earlier_member_in_staging_is_refused(
+    tmp_path: Path, dest_exists: bool, layout: str
+) -> None:
+    """Windows only (8.3 short names): a member spelled as the short name of
+    an earlier member's file or directory reaches that same entry in staging.
+    It is refused before dest changes, instead of overwriting the earlier
+    file (which a signature was checked against) or merging into its
+    directory."""
+    if layout == "file":
+        short = _short_alias(tmp_path, "longfilename.txt", directory=False)
+        members = [(_reg("longfilename.txt"), b"signed"), (_reg(short), b"other")]
+    else:
+        short = _short_alias(tmp_path, "longdirectoryname", directory=True)
+        if layout == "implicit-parent":
+            members = [(_reg("longdirectoryname/a"), b"a"), (_reg(f"{short}/b"), b"b")]
+        else:
+            members = [(_dir("longdirectoryname"), None), (_dir(short), None)]
+    archive = _write_tar(tmp_path / "a.tar", members)
+    dest = tmp_path / "dest"
+    if dest_exists:
+        dest.mkdir()
+        (dest / "keep.txt").write_bytes(b"keep")
+    before = _tree(dest)
+
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, dest)
+
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+    assert "reaches an entry an earlier member created" in str(exc.value)
+    assert _tree(dest) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar"] + (["dest"] if dest_exists else [])
+
+
+@WINDOWS_83
+@pytest.mark.parametrize("had_file", [False, True], ids=["new-file", "replaced-file"])
+def test_member_reaching_an_earlier_member_in_dest_is_refused(
+    tmp_path: Path, had_file: bool
+) -> None:
+    """Windows only (8.3 short names): a member spelled like a short name,
+    extracted before the long name that will get that short name, is its own
+    file in staging but the same file in dest. The merge refuses it and puts
+    dest back, instead of replacing the long-named file with it."""
+    short = _short_alias(tmp_path, "longfilename.txt", directory=False)
+    archive = _write_tar(
+        tmp_path / "a.tar", [(_reg(short), b"other"), (_reg("longfilename.txt"), b"signed")]
+    )
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "keep.txt").write_bytes(b"keep")
+    if had_file:
+        (dest / "longfilename.txt").write_bytes(b"old")
+    before = _tree(dest)
+
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, dest)
+
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+    assert "already put in place" in str(exc.value)
+    assert _tree(dest) == before
+
+
 # ---------- an error while looking at the tree is never skipped ----------
 
 

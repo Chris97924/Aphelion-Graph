@@ -5,7 +5,8 @@ distinct PX_E_6NNN code (see :mod:`aphelion.error_codes`):
   * path traversal ('..' / absolute / Windows drive / backslash)
   * member names that collide once normalized the way any supported
     filesystem would see them (leading ``./``, repeated or ``.`` separators,
-    Unicode NFC, case folding, Windows trailing dots/spaces)
+    Unicode NFC, case folding, Windows trailing dots/spaces), or that reach
+    one entry on disk under different names (8.3 short names)
   * disallowed member types (symlink, hardlink, device, fifo)
   * zip-bomb (enforced streaming, per-file and per-total budgets)
   * too many files, overly long paths
@@ -415,9 +416,11 @@ class _Replacement:
         # (src, target, saved): target was renamed to saved (if it existed),
         # then src onto target. src None: target is a directory this call made.
         self._log: list[tuple[Path | None, Path, Path | None]] = []
+        self._placed: dict[tuple[int, int], Path] = {}  # (st_dev, st_ino) -> target
 
     def mkdir(self, target: Path) -> None:
         if target.is_dir():
+            self._refuse_placed(os.stat(target), target)
             return
         self._log.append((None, target, None))
         try:
@@ -425,15 +428,42 @@ class _Replacement:
         except FileExistsError:  # made by someone else meanwhile: not ours to remove
             self._log.pop()
             raise
+        self._remember(target)
 
     def put(self, src: Path, target: Path) -> None:
         # _lstat, not os.path.lexists: a target that cannot be looked at
         # must fail the call, not be overwritten without a backup.
-        saved = self.backup / str(len(self._log)) if _lstat(target) is not None else None
+        st = _lstat(target)
+        saved = None
+        if st is not None:
+            self._refuse_placed(st, target)
+            saved = self.backup / str(len(self._log))
         self._log.append((src, target, saved))
         if saved is not None:
             os.replace(target, saved)
         os.replace(src, target)
+        self._remember(target)
+
+    def _refuse_placed(self, st: os.stat_result, target: Path) -> None:
+        # Two entries distinct in staging can still name one entry here: the
+        # 8.3 short name Windows gives the first may be the second's name.
+        # Found by identity, whatever the names look like (an inode number of
+        # 0 means the filesystem has none to compare).
+        other = self._placed.get((st.st_dev, st.st_ino)) if st.st_ino else None
+        if other is not None:
+            raise SecurityError(
+                code=ErrorCode.DUPLICATE_MEMBER_PATH,
+                msg=(
+                    f"{target} reaches {other}, which this call already put in place "
+                    f"(an 8.3 short name or other filesystem alias)"
+                ),
+                path=str(target),
+            )
+
+    def _remember(self, target: Path) -> None:
+        st = os.lstat(target)
+        if st.st_ino:
+            self._placed[(st.st_dev, st.st_ino)] = target
 
     def rollback(self, exc: BaseException) -> None:
         """Undo every logged step; if all is back, return for ``exc`` to propagate.
@@ -695,6 +725,7 @@ def _extract(
 ) -> None:
     total_bytes = 0
     archive_size = archive.stat().st_size
+    made: set[str] = set()  # directories this call created in staging
 
     with tarfile.open(archive, mode="r") as tar:
         # Every header is checked before the first byte is written, so a
@@ -717,8 +748,21 @@ def _extract(
                 if _same_entry(first, backup):
                     raise FileExistsError(f"cannot unpack over the backup directory: {first}")
             target = staging / normalized
+            # Staging starts empty, so every entry is created exclusively, a
+            # directory again only under the exact path this call made it: a
+            # member that reaches an earlier one under another spelling (an
+            # 8.3 short name, case folding, any filesystem alias) then fails
+            # instead of overwriting it or merging into it.
+            parts = normalized.split("/") if normalized else []
+            for depth in range(1, len(parts) + (1 if member.isdir() else 0)):
+                rel = "/".join(parts[:depth])
+                if rel not in made:
+                    try:
+                        (staging / rel).mkdir()
+                    except FileExistsError:
+                        raise _aliased(normalized, rel) from None
+                    made.add(rel)
             if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
                 continue
 
             # Fast-fail on header-declared sizes. A malicious header can lie
@@ -747,13 +791,16 @@ def _extract(
                     msg=f"could not open stream for regular file {normalized!r}",
                     path=normalized,
                 )
-            target.parent.mkdir(parents=True, exist_ok=True)
             written = 0
             chunk_size = 64 * 1024
             # Authoritative budget enforcement happens inside the read loop.
             # A failure here discards the whole staging tree (see unpack).
             try:
-                with open(target, "wb") as out:
+                try:
+                    out = open(target, "xb")  # exclusive, as above
+                except FileExistsError:
+                    raise _aliased(normalized, normalized) from None
+                with out:
                     while True:
                         chunk = src.read(chunk_size)
                         if not chunk:
@@ -794,6 +841,17 @@ def _extract(
                         f"{policy.max_compression_ratio}"
                     ),
                 )
+
+
+def _aliased(member: str, rel: str) -> SecurityError:
+    return SecurityError(
+        code=ErrorCode.DUPLICATE_MEMBER_PATH,
+        msg=(
+            f"member path {member!r}: {rel!r} reaches an entry an earlier member "
+            f"created under another name (an 8.3 short name or other filesystem alias)"
+        ),
+        path=member,
+    )
 
 
 def extract_signatures_jsonl(tar_path: Path | str) -> bytes | None:
