@@ -594,14 +594,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return exit_code_for(err)
     except FileNotFoundError as err:
         emit_error(
-            SchemaError(code=ErrorCode.MISSING_FILE, msg=str(err))
+            _with_notes(SchemaError(code=ErrorCode.MISSING_FILE, msg=str(err)), err)
         )
         return EXIT_VALIDATION
     except Exception as err:  # unexpected — still surface machine-readably
         emit_error(
-            SchemaError(code=ErrorCode.UNKNOWN, msg=f"{type(err).__name__}: {err}")
+            _with_notes(
+                SchemaError(code=ErrorCode.UNKNOWN, msg=f"{type(err).__name__}: {err}"), err
+            )
         )
         return 1
+
+
+def _with_notes(wrapper: SchemaError, err: BaseException) -> SchemaError:
+    # The wrapper is what gets emitted: keep the notes of the error it reports.
+    notes = getattr(err, "__notes__", None)
+    if notes:
+        wrapper.__notes__ = list(notes)
+    return wrapper
 
 
 if __name__ == "__main__":

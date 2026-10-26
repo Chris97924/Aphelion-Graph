@@ -169,6 +169,70 @@ def test_main_generic_exception_emits_unknown(
     assert "RuntimeError" in payload["msg"]
 
 
+# ---------- main(): the error line carries the error's notes ----------
+
+
+@pytest.mark.parametrize(
+    "error, code",
+    [
+        (SchemaError(code=ErrorCode.TYPE_MISMATCH, msg="boom"), ErrorCode.TYPE_MISMATCH),
+        (FileNotFoundError("gone"), ErrorCode.MISSING_FILE),
+        (RuntimeError("unexpected"), ErrorCode.UNKNOWN),
+    ],
+    ids=["aphelion-error", "file-not-found", "unexpected"],
+)
+def test_main_error_line_carries_the_error_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, code: ErrorCode
+) -> None:
+    """All platforms: notes on the error, which name what a failed call left
+    behind, appear in the JSON error line, whichever branch of main() emits
+    it."""
+    src = _minimal_source(tmp_path / "pkg")
+    note = f"could not remove {tmp_path / '.unpacking-0'}; delete it by hand"
+    error.__notes__ = [note]  # what add_note does on Python 3.11+
+
+    def _fail(_manifest: dict, _events: list, **_kwargs) -> None:
+        raise error
+
+    import aphelion.validator as validator_mod
+
+    monkeypatch.setattr(validator_mod, "validate_package", _fail)
+    _, _, err = _run(["validate", str(src)])
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == code.value
+    assert payload["notes"] == [note]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="exception notes exist from Python 3.11")
+def test_unpack_error_line_names_a_staging_dir_it_could_not_remove(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms (Python 3.11+): a failed `aphe unpack` that cannot remove
+    its staging directory names it in the JSON error line, not only in a
+    warning that a warnings filter may turn off or into an error."""
+    import warnings
+
+    from test_unpacker import _fail_to_unlink, _fails_after_first_member
+
+    archive, _ = _fails_after_first_member(tmp_path)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _fail_to_unlink(monkeypatch, "manifest.json")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        code, _, err = _run(["unpack", str(archive), str(dest), "--max-file-bytes", "1024"])
+    monkeypatch.undo()
+
+    assert code == 3, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.FILE_BYTES_EXCEEDED.value
+    (leftover,) = [p for p in dest.resolve().iterdir() if p.name.startswith(".unpacking-")]
+    assert any(str(leftover) in note for note in payload["notes"])
+
+
 # ---------- SchemaError SystemExit handling preserves exit code ----------
 
 

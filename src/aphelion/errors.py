@@ -64,16 +64,25 @@ class VerificationError(AphelionError):
 
 
 def emit_error(err: AphelionError, stream: IO[str] | None = None) -> None:
-    """Write a single JSON line describing the error to ``stream`` (default stderr)."""
+    """Write a single JSON line describing the error to ``stream`` (default stderr).
+
+    ``path`` and ``notes`` (the exception's notes, Python 3.11+) are included
+    only when there are any.
+    """
     if stream is None:
         stream = sys.stderr
-    payload = {
+    payload: dict[str, object] = {
         "code": _code_str(err.code),
         "severity": "error",
         "msg": err.msg,
     }
     if err.path is not None:
         payload["path"] = err.path
+    # Notes name what a failed call left behind (a staging directory it could
+    # not remove, a backup it kept), which the message alone does not.
+    notes = getattr(err, "__notes__", None)
+    if notes:
+        payload["notes"] = [str(note) for note in notes]
     stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
     stream.flush()
 
