@@ -591,10 +591,10 @@ def test_failed_merge_into_existing_dest_leaves_it_unchanged(tmp_path: Path) -> 
 
 
 STAGING_NAME = ".unpacking-" + "00" * 8  # with secrets.token_hex patched to zeros
+# A trailing-dot spelling is refused earlier, by the portable-name rule.
 STAGING_ALIASES = [
     "exact",
     "case",
-    "trailing-dot",
     pytest.param(
         "8.3",
         marks=pytest.mark.skipif(
@@ -625,7 +625,7 @@ def _staging_alias(dest: Path, kind: str, name: str = STAGING_NAME) -> str:
         if kind == "8.3":
             alias = _short_name(probe)
         else:
-            alias = {"exact": name, "case": name.upper(), "trailing-dot": name + "."}[kind]
+            alias = {"exact": name, "case": name.upper()}[kind]
         if alias is None:
             pytest.skip("this volume does not generate 8.3 short names")
         if not (os.path.lexists(dest / alias) and os.path.samefile(dest / alias, probe)):
@@ -1056,6 +1056,53 @@ def test_unpack_refuses_a_link_to_a_directory_as_destination(
 
     assert "symlink or junction" in str(exc.value)
     assert list(target.iterdir()) == []
+
+
+# ---------- member names must be portable ----------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "old.txt:evil",  # NTFS alternate data stream
+        "a<b", "a>b", 'a"b', "a|b", "a?b", "a*b",
+        "a\x01b", "a\x1fb",
+        "CON", "con.txt", "Nul.tar.gz", "AUX", "PRN", "COM1", "com9.md", "LPT1", "lpt9",
+        "COM¹", "CON .txt",
+        "dir./f.md", "dir /f.md", "f.md.", "f.md ",
+        "claims/NUL",
+    ],
+)
+def test_non_portable_member_name_is_refused(tmp_path: Path, name: str) -> None:
+    archive = _write_tar(tmp_path / "a.tar", [(_reg(name), b"x")])
+    dest = tmp_path / "dest"
+
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, dest)
+
+    assert exc.value.code == ErrorCode.PATH_TRAVERSAL
+    assert "not a portable file name" in str(exc.value)
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize("name", ["CONSOLE.md", "con-x.md", "COM10", "LPT0", "a.b.c", "nul_file"])
+def test_portable_names_near_device_names_are_accepted(tmp_path: Path, name: str) -> None:
+    archive = _write_tar(tmp_path / "a.tar", [(_reg(name), b"x")])
+    unpack(archive, tmp_path / "dest")
+    assert (tmp_path / "dest" / name).read_bytes() == b"x"
+
+
+def test_stream_name_does_not_replace_an_existing_file(tmp_path: Path) -> None:
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("old.txt:evil"), b"x")])
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "old.txt").write_bytes(b"old")
+
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, dest)
+
+    assert exc.value.code == ErrorCode.PATH_TRAVERSAL
+    assert _tree(dest) == {"old.txt": b"old"}
 
 
 # ---------- only directories this call created are removed ----------

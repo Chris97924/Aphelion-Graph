@@ -32,6 +32,14 @@ from aphelion.errors import SecurityError
 
 
 WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+# Names Win32 cannot create as a plain file: reserved characters (':' would
+# address an NTFS alternate data stream of another file), device names with or
+# without an extension, and a trailing dot or space, which Win32 drops.
+WINDOWS_RESERVED_CHARS = frozenset('<>:"|?*') | frozenset(map(chr, range(32)))
+WINDOWS_DEVICE_RE = re.compile(
+    r"^(CON|PRN|AUX|NUL|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3]) *(\..*)?$",
+    re.IGNORECASE,
+)
 
 # Hard ceiling on uncompressed archive size (v0.3.0, spec/packaging.md §3).
 # 100 MiB = 104_857_600 bytes. MUST equal ExtractPolicy.max_total_bytes.
@@ -95,6 +103,30 @@ def _check_path(raw_name: str, policy: ExtractPolicy) -> str:
                 path=raw_name,
             )
     return normalized
+
+
+def _check_portable(parts: list[str], raw_name: str) -> None:
+    """Refuse a component Win32 cannot create as the plain file it names.
+
+    On Windows such a component names a device, a stream of another file, or
+    a different file than the archive says. It is refused on every platform,
+    so an archive unpacks to the same files everywhere.
+    """
+    for part in parts:
+        if (
+            not WINDOWS_RESERVED_CHARS.isdisjoint(part)
+            or part[-1] in " ."
+            or WINDOWS_DEVICE_RE.match(part)
+        ):
+            raise SecurityError(
+                code=ErrorCode.PATH_TRAVERSAL,
+                msg=(
+                    f"member path component {part!r} is not a portable file name "
+                    f"(Windows-reserved character or device name, or trailing dot "
+                    f"or space): {raw_name!r}"
+                ),
+                path=raw_name,
+            )
 
 
 def path_parts(normalized: str) -> list[str]:
@@ -217,6 +249,7 @@ def _scan_members(
                 msg=f"member path {rel!r} collides with {other!r} after normalization",
                 path=rel,
             )
+        _check_portable(parts, member.name)
         scanned.append((member, rel))
     return scanned
 
