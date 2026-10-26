@@ -22,6 +22,7 @@ from __future__ import annotations
 import errno
 import io
 import os
+import stat
 import tarfile
 from pathlib import Path
 
@@ -676,3 +677,83 @@ def test_member_reaching_the_staging_dir_is_refused_before_any_move(
 
     assert _tree(dest) == before
     assert "cannot unpack over the staging directory" in str(exc.value)
+
+
+def _fail_to_unlink(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Make every attempt to delete a file called ``name`` fail, as an open
+    handle or an access-denied entry would."""
+    real_unlink = os.unlink
+
+    def unlink(path: str, *args: object, **kwargs: object) -> None:
+        if os.path.basename(os.fspath(path)) == name:
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    monkeypatch.setattr(os, "remove", unlink)
+
+
+def test_failed_unpack_names_a_staging_dir_it_cannot_remove(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, policy = _fails_after_first_member(tmp_path)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "keep.txt").write_bytes(b"keep")
+    _fail_to_unlink(monkeypatch, "manifest.json")
+
+    with pytest.warns(RuntimeWarning) as warned, pytest.raises(SecurityError) as exc:
+        unpack(archive, dest, policy=policy)
+    monkeypatch.undo()
+
+    assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
+    leftover = [p for p in dest.resolve().iterdir() if p.name.startswith(".unpacking-")]
+    assert len(leftover) == 1
+    assert any(str(leftover[0]) in str(w.message) for w in warned)
+
+
+def test_failed_unpack_keeps_its_error_when_warnings_are_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import warnings
+
+    archive, policy = _fails_after_first_member(tmp_path)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _fail_to_unlink(monkeypatch, "manifest.json")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(SecurityError) as exc:
+            unpack(archive, dest, policy=policy)
+    monkeypatch.undo()
+
+    assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
+
+
+def test_failed_unpack_removes_read_only_staged_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only file (the Windows attribute blocks deletion) in the staging
+    tree is made writable and removed, not left inside dest."""
+    import aphelion.unpacker as unpacker
+
+    real_extract = unpacker._extract
+
+    def extract_then_fail(*args: object) -> None:
+        real_extract(*args)
+        for path in args[1].rglob("*"):  # args[1] is the staging dir
+            if path.is_file():
+                path.chmod(stat.S_IREAD)
+        raise RuntimeError("failed after extraction")
+
+    monkeypatch.setattr(unpacker, "_extract", extract_then_fail)
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("claims/a.md"), b"a")])
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "keep.txt").write_bytes(b"keep")
+
+    with pytest.raises(RuntimeError, match="failed after extraction"):
+        unpack(archive, dest)
+
+    assert _tree(dest) == {"keep.txt": b"keep"}

@@ -17,12 +17,15 @@ import os
 import re
 import secrets
 import shutil
+import stat
+import sys
 import tarfile
 import unicodedata
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SecurityError
@@ -241,12 +244,17 @@ def unpack(
     Uses a streaming tarfile.next() loop - NEVER tar.extractall(), because
     extractall won't catch zip-bomb-class expansion until it's already disk-bound.
 
-    All-or-nothing: members are extracted into a staging directory (inside
-    ``dest_dir`` if it exists, next to it otherwise) and moved into place only
-    once every member has passed every check. A failed unpack leaves
-    ``dest_dir`` as it was, including no staging directory, and removes any
-    parent directories it had to create. On success, archive files replace
-    same-named files in an existing ``dest_dir``; other files there are kept.
+    All-or-nothing: members are extracted into a staging directory and moved
+    into place only once every member has passed every check. For an existing
+    ``dest_dir`` the staging directory is a hidden ``.unpacking-*`` directory
+    inside it, visible there while the unpack runs; otherwise it sits next to
+    ``dest_dir`` and is renamed to it. A failed unpack leaves the contents of
+    ``dest_dir`` as they were (its own timestamps may change) and removes any
+    parent directories it had to create. If the staging directory cannot be
+    removed, a RuntimeWarning names it and the original error is still raised;
+    an interrupted process can also leave one behind. On success, archive
+    files replace same-named files in an existing ``dest_dir``; other files
+    there are kept.
     """
     policy = policy or ExtractPolicy.default()
     archive = Path(archive_path)
@@ -261,13 +269,44 @@ def unpack(
         _extract(archive, staging, dest_resolved, policy)
         _move_into_place(staging, dest_resolved)
     except BaseException:
-        # rmtree does not follow symlinks; staging and `created` only hold
-        # directories and files this call made.
-        shutil.rmtree(staging, ignore_errors=True)
+        # staging and `created` only hold directories and files this call made.
+        _remove_tree_or_warn(staging)
         if created is not None:
-            shutil.rmtree(created, ignore_errors=True)
+            _remove_tree_or_warn(created)
         raise
     return dest
+
+
+def _remove_tree_or_warn(path: Path) -> None:
+    """Remove a tree unpack made, on the failure path; never raises.
+
+    rmtree does not follow symlinks. A read-only entry (the Windows attribute)
+    is made writable and retried. Whatever is still left is named in a
+    RuntimeWarning, so the caller's original error is never replaced.
+    """
+
+    def retry_writable(func: Callable[[str], object], entry: str, _exc: object) -> None:
+        if func not in (os.unlink, os.rmdir, os.remove):
+            return
+        try:
+            os.chmod(entry, os.lstat(entry).st_mode | stat.S_IWRITE)
+            func(entry)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry_writable)
+    else:
+        shutil.rmtree(path, onerror=retry_writable)
+    if os.path.lexists(path):
+        try:
+            warnings.warn(
+                f"unpack could not remove {path}; delete it by hand",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        except Exception:  # a warnings filter set to "error" must not mask it
+            pass
 
 
 def _first_missing_ancestor(path: Path) -> Path | None:
