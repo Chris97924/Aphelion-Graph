@@ -116,15 +116,18 @@ All raise sites import the `ErrorCode` enum — no string literals.
 | PX_E_4008  | FLOAT_FORBIDDEN       | Float value in canonical JSON.                       |
 | PX_E_4009  | NAN_FORBIDDEN         | `NaN` / `Infinity` literal in canonical JSON.        |
 | PX_E_4010  | UTF8_INVALID          | Input bytes are not valid UTF-8.                     |
+| PX_E_4011  | DUPLICATE_CLAIM_INSTANCE_ID | Two manifest entries, or two instance-emitting events, share a `claim_instance_id` (ERR-SEM-005, identity I-2). |
+| PX_E_4012  | DUPLICATE_EVENT_ID    | Two provenance events share an `event_id` (ERR-SEM-006, identity I-3). |
 
 ## 5NN — CONSISTENCY
 
 | Code       | Name                 | Condition                                                  |
 |------------|----------------------|------------------------------------------------------------|
 | PX_E_5001  | HASH_MISMATCH        | Manifest hash != actual claim-file bytes.                  |
-| PX_E_5002  | FILESET_DIVERGENCE   | Archive file set != manifest.claims paths.                 |
+| PX_E_5002  | FILESET_DIVERGENCE   | Archive file set != manifest.claims paths, or a claim's path is not `claims/<claim_id>.md` (two claims sharing one file). |
 | PX_E_5003  | CHAIN_BROKEN         | Provenance chain broken/forked/multi-create for a claim.   |
-| PX_E_5004  | DANGLING_REFERENCE   | Event references `claim_id` not in manifest.               |
+| PX_E_5004  | DANGLING_REFERENCE   | Event references `claim_id` not in manifest, or a `claim_instance_id` the claim's provenance never established (a `target_claim_instance_id` that is not the instance in force, or a manifest entry's instance). |
+| PX_E_5005  | MANIFEST_STATE_MISMATCH | Manifest terminal state disagrees with the claim's last provenance event (ERR-SEM-013). |
 
 ## 6NN — SECURITY
 

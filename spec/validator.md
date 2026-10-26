@@ -70,8 +70,11 @@ runtime the implementation emits the `PX_E_<CCNN>` codes defined in
 | `ERR-SEM-001` | `PX_E_5001` | `HASH_MISMATCH` |
 | `ERR-SEM-002` / `003` | `PX_E_5002` | `FILESET_DIVERGENCE` |
 | `ERR-SEM-004` | `PX_E_4004` | `DUPLICATE_CLAIM_ID` |
+| `ERR-SEM-005` | `PX_E_4011` | `DUPLICATE_CLAIM_INSTANCE_ID` |
+| `ERR-SEM-006` | `PX_E_4012` | `DUPLICATE_EVENT_ID` |
 | `ERR-SEM-007` | `PX_E_5004` | `DANGLING_REFERENCE` |
 | `ERR-SEM-009` / `010` / `011` / `012` | `PX_E_5003` | `CHAIN_BROKEN` |
+| `ERR-SEM-013` | `PX_E_5005` | `MANIFEST_STATE_MISMATCH` |
 | `ERR-SEM-014` | `PX_E_2004` | `FORBIDDEN_FIELD` |
 | `ERR-SEM-015` | `PX_E_2001` | `REQUIRED_FIELD_MISSING` |
 | `ERR-SEC-*` (archive safety) | `PX_E_6001..6013` | see `error-codes.md` §6NN |
