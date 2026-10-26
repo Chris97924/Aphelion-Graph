@@ -306,18 +306,24 @@ def _move_into_place(staging: Path, dest: Path) -> None:
         return
     # Existing destination: merge. Check every target first so a conflict
     # cannot leave a half-moved tree behind.
-    if staging.parent == dest:
-        # Staging sits inside dest; a top-level member with its name (or a
-        # spelling a case-insensitive filesystem treats as it) would be moved
-        # into the staging tree itself.
-        staging_key = member_path_key([staging.name])
-        for name in os.listdir(staging):
-            if member_path_key([name]) == staging_key:
-                raise FileExistsError(
-                    f"cannot unpack over the staging directory: {dest / name}"
-                )
+
+    def is_staging(target: Path) -> bool:
+        # Staging may sit inside dest. Compared by identity, not by name: on
+        # Windows a case variant, a trailing dot or space, or the 8.3 short
+        # name also reaches it, and so can a directory link already in dest.
+        try:
+            return os.path.lexists(target) and os.path.samefile(target, staging)
+        except OSError:
+            return False
+
     for root, dirnames, filenames in os.walk(staging):
         rel_root = Path(root).relative_to(staging)
+        for name in (*dirnames, *filenames):
+            target = dest / rel_root / name
+            if is_staging(target):
+                raise FileExistsError(
+                    f"cannot unpack over the staging directory: {target}"
+                )
         for name in dirnames:
             target = dest / rel_root / name
             if target.is_symlink() or (target.exists() and not target.is_dir()):

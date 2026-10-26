@@ -570,7 +570,8 @@ def test_unpack_into_existing_dest_whose_parent_is_not_writable(tmp_path: Path) 
 
 
 def test_failed_merge_into_existing_dest_leaves_it_unchanged(tmp_path: Path) -> None:
-    """A conflict found by the pre-move check leaves no staging dir behind."""
+    """Guards the in-dest staging placement rather than a past regression: a
+    conflict found by the pre-move check leaves no staging dir inside dest."""
     archive = _write_tar(
         tmp_path / "a.tar", [(_reg("a.md"), b"new a"), (_reg("claims"), b"file")]
     )
@@ -587,24 +588,91 @@ def test_failed_merge_into_existing_dest_leaves_it_unchanged(tmp_path: Path) -> 
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
 
 
-@pytest.mark.parametrize(
-    "member", [".unpacking-0000000000000000/x", ".UNPACKING-0000000000000000/x"]
-)
-def test_member_named_like_the_staging_dir_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member: str
+STAGING_NAME = ".unpacking-" + "00" * 8  # with secrets.token_hex patched to zeros
+
+
+def _short_name(path: Path) -> str | None:
+    """The 8.3 short name Windows gave ``path``, or None if it has none."""
+    import sys
+
+    if sys.platform != "win32":
+        return None
+    import ctypes
+
+    buf = ctypes.create_unicode_buffer(32768)
+    if not ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf)):
+        return None
+    short = Path(buf.value).name
+    return None if short == path.name else short
+
+
+def _staging_alias(dest: Path, kind: str) -> str:
+    """A spelling, other than through a link, that names the staging dir
+    unpack will create in ``dest``; skips when this filesystem has none."""
+    probe = dest / STAGING_NAME
+    probe.mkdir()
+    try:
+        alias = {
+            "exact": STAGING_NAME,
+            "case": STAGING_NAME.upper(),
+            "trailing-dot": STAGING_NAME + ".",
+            "8.3": _short_name(probe),
+        }[kind]
+        if alias is None:
+            pytest.skip("this volume does not generate 8.3 short names")
+        if not (os.path.lexists(dest / alias) and os.path.samefile(dest / alias, probe)):
+            pytest.skip(f"on this filesystem {alias!r} is a different name")
+    finally:
+        probe.rmdir()
+    return alias
+
+
+@pytest.mark.parametrize("kind", ["exact", "case", "trailing-dot", "8.3"])
+def test_member_reaching_the_staging_dir_is_not_silently_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    """The staging dir inside dest has a random name; a member that guesses
-    it (in any case) must not be moved into the staging tree."""
+    """A member under a name that reaches the staging dir would be moved into
+    the staging tree and deleted with it. It must be refused instead."""
     import secrets
 
     monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
-    archive = _write_tar(tmp_path / "a.tar", [(_reg(member), b"x")])
     dest = tmp_path / "dest"
     dest.mkdir()
-    (dest / "keep.txt").write_bytes(b"keep")
+    (dest / "old.txt").write_bytes(b"old")
+    alias = _staging_alias(dest, kind)
+    archive = _write_tar(
+        tmp_path / "a.tar", [(_reg(f"{alias}/lost.md"), b"lost"), (_reg("kept.md"), b"kept")]
+    )
 
-    with pytest.raises(FileExistsError) as exc:
+    with pytest.raises(OSError) as exc:
         unpack(archive, dest)
 
+    assert _tree(dest) == {"old.txt": b"old"}
     assert "cannot unpack over the staging directory" in str(exc.value)
-    assert _tree(dest) == {"keep.txt": b"keep"}
+
+
+@pytest.mark.parametrize("kind", ["exact", "case", "trailing-dot", "8.3"])
+def test_member_reaching_the_staging_dir_is_refused_before_any_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Such a member also hides a conflict from the pre-move check (its target
+    looks absent), so the merge would fail halfway. It must be refused before
+    anything in dest changes."""
+    import secrets
+
+    monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
+    dest = tmp_path / "dest"
+    (dest / "zzz" / "f").mkdir(parents=True)
+    (dest / "a.md").write_bytes(b"old a")
+    alias = _staging_alias(dest, kind)
+    archive = _write_tar(
+        tmp_path / "a.tar",
+        [(_reg("a.md"), b"new a"), (_reg(f"{alias}/zzz/f"), b"f"), (_reg("zzz/g"), b"g")],
+    )
+    before = _tree(dest)
+
+    with pytest.raises(OSError) as exc:
+        unpack(archive, dest)
+
+    assert _tree(dest) == before
+    assert "cannot unpack over the staging directory" in str(exc.value)
