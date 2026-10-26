@@ -23,6 +23,7 @@ import errno
 import io
 import os
 import stat
+import sys
 import tarfile
 from pathlib import Path
 
@@ -590,14 +591,21 @@ def test_failed_merge_into_existing_dest_leaves_it_unchanged(tmp_path: Path) -> 
 
 
 STAGING_NAME = ".unpacking-" + "00" * 8  # with secrets.token_hex patched to zeros
+STAGING_ALIASES = [
+    "exact",
+    "case",
+    "trailing-dot",
+    pytest.param(
+        "8.3",
+        marks=pytest.mark.skipif(
+            sys.platform != "win32", reason="8.3 short names exist only on Windows"
+        ),
+    ),
+]
 
 
 def _short_name(path: Path) -> str | None:
     """The 8.3 short name Windows gave ``path``, or None if it has none."""
-    import sys
-
-    if sys.platform != "win32":
-        return None
     import ctypes
 
     buf = ctypes.create_unicode_buffer(32768)
@@ -628,7 +636,7 @@ def _staging_alias(dest: Path, kind: str) -> str:
     return alias
 
 
-@pytest.mark.parametrize("kind", ["exact", "case", "trailing-dot", "8.3"])
+@pytest.mark.parametrize("kind", STAGING_ALIASES)
 def test_member_reaching_the_staging_dir_is_not_silently_dropped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
@@ -652,7 +660,7 @@ def test_member_reaching_the_staging_dir_is_not_silently_dropped(
     assert "cannot unpack over the staging directory" in str(exc.value)
 
 
-@pytest.mark.parametrize("kind", ["exact", "case", "trailing-dot", "8.3"])
+@pytest.mark.parametrize("kind", STAGING_ALIASES)
 def test_member_reaching_the_staging_dir_is_refused_before_any_move(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
