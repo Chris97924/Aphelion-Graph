@@ -365,3 +365,237 @@ def test_cli_migrate_directory_end_to_end(tmp_path: Path) -> None:
     assert "v0.3 -> v0.4" in out
     new_manifest = loads((dst / "manifest.json").read_bytes())
     assert new_manifest["aphelion_spec_version"] == "0.4.0"
+
+
+# ---------- A9: --force checks the destination before removing anything ----------
+
+
+def _snapshot(root: Path) -> dict[str, bytes | None]:
+    return {
+        p.relative_to(root).as_posix(): (None if p.is_dir() else p.read_bytes())
+        for p in sorted(root.rglob("*"))
+    }
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    import os
+
+    try:
+        os.symlink(target, link, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError) as exc:  # Windows without the privilege
+        pytest.skip(f"cannot create symlinks here: {exc}")
+
+
+def _assert_refused(src: Path, dst: Path) -> None:
+    with pytest.raises(SchemaError) as exc:
+        migrate(MigrateOptions(src=src, dst=dst, force=True))
+    assert exc.value.code == ErrorCode.INIT_REFUSES_EXISTING
+
+
+def test_force_refuses_destination_that_is_the_source(tmp_path: Path) -> None:
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    before = _snapshot(src)
+    _assert_refused(src, src)
+    assert _snapshot(src) == before
+
+
+def test_force_refuses_destination_spelled_differently_but_same_dir(tmp_path: Path) -> None:
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    before = _snapshot(src)
+    _assert_refused(src, tmp_path / "v03" / "claims" / "..")
+    assert _snapshot(src) == before
+
+
+def test_force_refuses_destination_that_contains_the_source(tmp_path: Path) -> None:
+    parent = tmp_path / "work"
+    src = parent / "v03"
+    _write_v03_directory(src)
+    (parent / "unrelated.txt").write_bytes(b"keep me")
+    before = _snapshot(parent)
+    _assert_refused(src, parent)
+    assert _snapshot(parent) == before
+
+
+def test_force_refuses_destination_inside_the_source(tmp_path: Path) -> None:
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    (src / "out").mkdir()
+    before = _snapshot(src)
+    _assert_refused(src, src / "out")
+    assert _snapshot(src) == before
+
+
+def test_force_refuses_symlink_resolving_to_the_source(tmp_path: Path) -> None:
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    link = tmp_path / "link"
+    _symlink_or_skip(link, src)
+    before = _snapshot(src)
+    _assert_refused(src, link)
+    assert _snapshot(src) == before
+
+
+def test_force_refuses_symlink_resolving_to_a_parent_of_the_source(tmp_path: Path) -> None:
+    parent = tmp_path / "work"
+    src = parent / "v03"
+    _write_v03_directory(src)
+    link = tmp_path / "link"
+    _symlink_or_skip(link, parent)
+    before = _snapshot(parent)
+    _assert_refused(src, link)
+    assert _snapshot(parent) == before
+
+
+def test_force_refuses_source_reached_through_a_symlink(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    _write_v03_directory(real)
+    src_link = tmp_path / "src-link"
+    _symlink_or_skip(src_link, real)
+    before = _snapshot(real)
+    _assert_refused(src_link, real)
+    assert _snapshot(real) == before
+
+
+def test_force_refuses_destination_differing_only_by_case(tmp_path: Path) -> None:
+    """On NTFS / APFS ``V03`` is the same directory as ``v03``."""
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    if not (tmp_path / "V03").exists():
+        pytest.skip("filesystem is case-sensitive; nothing to collide")
+    before = _snapshot(src)
+    _assert_refused(src, tmp_path / "V03")
+    assert _snapshot(src) == before
+
+
+def test_force_replaces_a_symlinked_destination_without_following_it(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "precious.txt").write_bytes(b"precious")
+    dst = tmp_path / "v04"
+    _symlink_or_skip(dst, elsewhere)
+
+    migrate(MigrateOptions(src=src, dst=dst, force=True))
+
+    assert (elsewhere / "precious.txt").read_bytes() == b"precious"
+    assert not dst.is_symlink()
+    assert (dst / "manifest.json").is_file()
+
+
+def test_force_does_not_follow_symlinks_inside_the_destination(tmp_path: Path) -> None:
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "precious.txt").write_bytes(b"precious")
+    dst = tmp_path / "v04"
+    dst.mkdir()
+    (dst / "stale.txt").write_bytes(b"stale")
+    _symlink_or_skip(dst / "linked", elsewhere)
+
+    migrate(MigrateOptions(src=src, dst=dst, force=True))
+
+    assert (elsewhere / "precious.txt").read_bytes() == b"precious"
+    assert not (dst / "stale.txt").exists()
+    assert not (dst / "linked").exists()
+
+
+def test_force_keeps_destination_when_source_is_not_migratable(tmp_path: Path) -> None:
+    """The manifest check is a safety check too: it runs before the removal."""
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    manifest = loads((src / "manifest.json").read_bytes())
+    manifest["format_version"] = "2.0"  # already v0.4: not migratable
+    (src / "manifest.json").write_bytes(dumps(normalize(manifest)))
+    dst = tmp_path / "v04"
+    dst.mkdir()
+    (dst / "keep.txt").write_bytes(b"keep")
+
+    with pytest.raises(SchemaError) as exc:
+        migrate(MigrateOptions(src=src, dst=dst, force=True))
+
+    assert exc.value.code == ErrorCode.UNSUPPORTED_SCHEMA_VERSION
+    assert _snapshot(dst) == {"keep.txt": b"keep"}
+
+
+def test_force_refuses_archive_destination_that_is_the_source(tmp_path: Path) -> None:
+    archive = tmp_path / "in.aphelion.tar"
+    _write_v03_archive(tmp_path / "pkg_v03", archive)
+    before = archive.read_bytes()
+    _assert_refused(archive, archive)
+    assert archive.read_bytes() == before
+
+
+def test_force_refuses_archive_destination_symlinked_to_the_source(tmp_path: Path) -> None:
+    archive = tmp_path / "in.aphelion.tar"
+    _write_v03_archive(tmp_path / "pkg_v03", archive)
+    link = tmp_path / "out.aphelion.tar"
+    _symlink_or_skip(link, archive)
+    before = archive.read_bytes()
+    _assert_refused(archive, link)
+    assert archive.read_bytes() == before
+
+
+def test_overlap_check_uses_filesystem_identity_not_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs everywhere: simulate a case-insensitive filesystem by making
+    samefile() compare names case-insensitively, as NTFS/APFS lookups do.
+    The check must rely on that identity, not on path string equality."""
+    import os
+
+    src = tmp_path / "work" / "v03"
+    _write_v03_directory(src)
+    real_samefile = os.path.samefile
+
+    def samefile_ci(a: object, b: object) -> bool:
+        if str(a).casefold() == str(b).casefold():
+            return True
+        return real_samefile(a, b)
+
+    monkeypatch.setattr(os.path, "samefile", samefile_ci)
+    before = _snapshot(tmp_path / "work")
+    _assert_refused(src, tmp_path / "work" / "V03")  # is the source
+    _assert_refused(src, tmp_path / "work" / "V03" / "out")  # inside it
+    _assert_refused(src, tmp_path / "WORK")  # contains it
+    assert _snapshot(tmp_path / "work") == before
+
+
+def test_cli_migrate_force_onto_source_is_refused(tmp_path: Path) -> None:
+    from conftest import run_cli
+
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    before = _snapshot(src)
+
+    code, _, err = run_cli(["migrate", str(src), str(src), "--force"])
+
+    assert code == 3, err
+    assert json.loads(err.strip().splitlines()[-1])["code"] == ErrorCode.INIT_REFUSES_EXISTING.value
+    assert _snapshot(src) == before
+
+
+def test_force_onto_current_directory_spelled_dot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Path(".") has no name; staging must use the absolute destination."""
+    import sys
+
+    if sys.platform == "win32":
+        pytest.skip("Windows cannot remove the current working directory")
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    dst = tmp_path / "v04"
+    dst.mkdir()
+    (dst / "stale.txt").write_bytes(b"stale")
+    monkeypatch.chdir(dst)
+
+    migrate(MigrateOptions(src=src, dst=Path("."), force=True))
+
+    assert not (dst / "stale.txt").exists()
+    assert loads((dst / "manifest.json").read_bytes())["format_version"] == "2.0"

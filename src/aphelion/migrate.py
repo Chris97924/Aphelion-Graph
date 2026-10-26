@@ -16,7 +16,9 @@ from __future__ import annotations
 import copy
 import io
 import os
+import secrets
 import shutil
+import stat
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,6 +96,11 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     ``manifest.json`` is rewritten through :func:`migrate_v03_to_v04` +
     canonical JSON. Refuses to overwrite a non-empty ``dst`` unless
     ``force`` is True.
+
+    Every check (source manifest, destination overlap, existing destination)
+    runs before anything is written or removed. The new tree is built next
+    to ``dst`` and only then swapped in; an existing ``dst`` is removed
+    without following symlinks.
     """
     src_path = Path(src)
     dst_path = Path(dst)
@@ -104,21 +111,99 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
             msg=f"source {src_path} does not contain manifest.json",
             path=str(manifest_in),
         )
-    if dst_path.exists():
-        if not force:
+    new_manifest = migrate_v03_to_v04(canonical_loads(manifest_in.read_bytes()))
+    _refuse_overlap(src_path, dst_path)
+    dst_present = os.path.lexists(dst_path)
+    if dst_present and not force:
+        raise SchemaError(
+            code=ErrorCode.INIT_REFUSES_EXISTING,
+            msg=f"destination {dst_path} already exists; pass force=True to overwrite",
+            path=str(dst_path),
+        )
+    # Absolute, so a destination spelled "." still has a name to stage beside.
+    dst_abs = Path(os.path.abspath(dst_path))
+    dst_abs.parent.mkdir(parents=True, exist_ok=True)
+    staging = dst_abs.with_name(f".{dst_abs.name}.migrating-{secrets.token_hex(8)}")
+    try:
+        shutil.copytree(src_path, staging)
+        (staging / "manifest.json").write_bytes(canonical_dumps(normalize(new_manifest)))
+        if dst_present:
+            _remove_no_follow(dst_abs)
+        os.replace(staging, dst_abs)
+    except BaseException:
+        if os.path.lexists(staging):
+            _remove_no_follow(staging)
+        raise
+    return dst_path
+
+
+def _same_entry(a: Path, b: Path) -> bool:
+    """Whether two paths name one directory entry.
+
+    ``samefile`` compares device and inode, so it also catches spellings a
+    string comparison misses: case variants on NTFS / APFS, and names that
+    reach the entry through a symlink or junction.
+    """
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _refuse_overlap(src: Path, dst: Path) -> None:
+    """Refuse a ``dst`` that is ``src``, contains it, or lies inside it.
+
+    Both are resolved first. ``dst`` is also checked as the entry itself
+    (parents resolved, last component not), so a symlink sitting inside the
+    source is refused even when it points elsewhere: replacing it would
+    modify the source.
+    """
+    src_resolved = src.resolve()
+    dst_abs = Path(os.path.abspath(dst))
+    for candidate in (dst_abs.resolve(), dst_abs.parent.resolve() / dst_abs.name):
+        if (
+            _same_entry(candidate, src_resolved)
+            or any(_same_entry(candidate, parent) for parent in src_resolved.parents)
+            or any(_same_entry(src_resolved, parent) for parent in candidate.parents)
+        ):
             raise SchemaError(
                 code=ErrorCode.INIT_REFUSES_EXISTING,
-                msg=f"destination {dst_path} already exists; pass force=True to overwrite",
-                path=str(dst_path),
+                msg=(
+                    f"destination {dst} is, contains, or lies inside the source "
+                    f"{src}; refusing to migrate onto it"
+                ),
+                path=str(dst),
             )
-        if dst_path.is_dir():
-            shutil.rmtree(dst_path)
+
+
+def _is_link(st: os.stat_result) -> bool:
+    # A Windows junction is a reparse point but not S_ISLNK on Python < 3.12.
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse)
+
+
+def _remove_no_follow(path: Path) -> None:
+    """Delete ``path``; a symlink or junction anywhere is unlinked, never followed."""
+    st = os.lstat(path)
+    if _is_link(st):
+        # On Windows a directory symlink or junction is removed with rmdir,
+        # which deletes the link itself, not the directory it points to.
+        windows_dir = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0)
+        if getattr(st, "st_file_attributes", 0) & windows_dir:
+            os.rmdir(path)
         else:
-            dst_path.unlink()
-    shutil.copytree(src_path, dst_path)
-    new_manifest = migrate_v03_to_v04(canonical_loads(manifest_in.read_bytes()))
-    (dst_path / "manifest.json").write_bytes(canonical_dumps(normalize(new_manifest)))
-    return dst_path
+            os.unlink(path)
+        return
+    if stat.S_ISDIR(st.st_mode):
+        with os.scandir(path) as it:
+            children = [Path(entry.path) for entry in it]
+        for child in children:
+            _remove_no_follow(child)
+        os.rmdir(path)
+        return
+    os.unlink(path)
 
 
 def migrate_archive(src: Path, dst: Path, *, force: bool = False) -> Path:
@@ -137,7 +222,8 @@ def migrate_archive(src: Path, dst: Path, *, force: bool = False) -> Path:
             msg=f"source archive {src_path} not found",
             path=str(src_path),
         )
-    if dst_path.exists() and not force:
+    _refuse_overlap(src_path, dst_path)
+    if os.path.lexists(dst_path) and not force:
         raise SchemaError(
             code=ErrorCode.INIT_REFUSES_EXISTING,
             msg=f"destination {dst_path} already exists; pass force=True to overwrite",
