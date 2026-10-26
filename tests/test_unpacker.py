@@ -1392,6 +1392,30 @@ def test_unpack_refuses_a_link_to_a_directory_as_destination(
     assert list(target.iterdir()) == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="only on Windows is a mounted folder a reparse point"
+)
+def test_unpack_accepts_a_mounted_folder_as_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows only: a volume mounted in a folder is a reparse point, as a
+    junction is, but it is the volume itself, so unpack goes into it.
+    Mounting a volume needs administrator rights; a junction reported as a
+    mount point stands in for one."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"a")])
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    dest = tmp_path / "dest"
+    _link_or_skip(dest, volume, "junction")
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(os.path, "ismount", lambda p: Path(p) == dest or real_ismount(p))
+
+    unpack(archive, dest)
+
+    assert (volume / "a.md").read_bytes() == b"a"
+    assert sorted(p.name for p in volume.iterdir()) == ["a.md"]
+
+
 # ---------- member names must be portable ----------
 
 
