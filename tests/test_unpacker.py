@@ -765,3 +765,42 @@ def test_failed_unpack_removes_read_only_staged_files(
         unpack(archive, dest)
 
     assert _tree(dest) == {"keep.txt": b"keep"}
+
+
+def test_failed_unpack_never_changes_a_link_target_in_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link in the staging tree that cannot be removed is reported, never
+    made writable: that would change the read-only file it points to."""
+    import aphelion.unpacker as unpacker
+
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside")
+    outside.chmod(stat.S_IREAD)
+    mode_before = stat.S_IMODE(outside.stat().st_mode)
+    real_extract = unpacker._extract
+
+    def extract_then_fail(*args: object) -> None:
+        real_extract(*args)
+        try:
+            os.symlink(outside, args[1] / "link")  # args[1] is the staging dir
+        except (OSError, NotImplementedError) as exc:  # Windows without the privilege
+            pytest.skip(f"cannot create symlinks here: {exc}")
+        raise RuntimeError("failed after extraction")
+
+    monkeypatch.setattr(unpacker, "_extract", extract_then_fail)
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"a")])
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _fail_to_unlink(monkeypatch, "link")
+
+    try:
+        with pytest.warns(RuntimeWarning), pytest.raises(RuntimeError):
+            unpack(archive, dest)
+    finally:
+        monkeypatch.undo()
+        mode_after = stat.S_IMODE(outside.stat().st_mode)
+        outside.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    assert mode_after == mode_before
+    assert outside.read_bytes() == b"outside"

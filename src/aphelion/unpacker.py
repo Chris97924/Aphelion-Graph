@@ -280,16 +280,33 @@ def unpack(
 def _remove_tree_or_warn(path: Path) -> None:
     """Remove a tree unpack made, on the failure path; never raises.
 
-    rmtree does not follow symlinks. A read-only entry (the Windows attribute)
-    is made writable and retried. Whatever is still left is named in a
-    RuntimeWarning, so the caller's original error is never replaced.
+    rmtree does not follow symlinks. On Windows a read-only entry (the
+    attribute blocks deletion) is made writable and retried. Whatever is still
+    left is named in a RuntimeWarning, so the caller's original error is never
+    replaced.
     """
 
     def retry_writable(func: Callable[[str], object], entry: str, _exc: object) -> None:
-        if func not in (os.unlink, os.rmdir, os.remove):
+        # POSIX has no read-only attribute to clear: a failed removal stays
+        # failed and is reported below.
+        if sys.platform != "win32" or func not in (os.unlink, os.rmdir, os.remove):
             return
         try:
-            os.chmod(entry, os.lstat(entry).st_mode | stat.S_IWRITE)
+            st = os.lstat(entry)
+            reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            is_link = stat.S_ISLNK(st.st_mode) or bool(
+                getattr(st, "st_file_attributes", 0) & reparse
+            )
+            # Never chmod through a link: that would change its target, which
+            # may lie outside the tree. Where chmod cannot be told not to
+            # follow links, the lstat above is the only guard.
+            if not is_link:
+                if os.chmod in os.supports_follow_symlinks:
+                    os.chmod(
+                        entry, stat.S_IMODE(st.st_mode) | stat.S_IWRITE, follow_symlinks=False
+                    )
+                else:
+                    os.chmod(entry, stat.S_IMODE(st.st_mode) | stat.S_IWRITE)
             func(entry)
         except OSError:
             pass
