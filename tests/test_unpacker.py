@@ -621,12 +621,14 @@ def _staging_alias(dest: Path, kind: str) -> str:
     probe = dest / STAGING_NAME
     probe.mkdir()
     try:
-        alias = {
-            "exact": STAGING_NAME,
-            "case": STAGING_NAME.upper(),
-            "trailing-dot": STAGING_NAME + ".",
-            "8.3": _short_name(probe),
-        }[kind]
+        if kind == "8.3":
+            alias = _short_name(probe)
+        else:
+            alias = {
+                "exact": STAGING_NAME,
+                "case": STAGING_NAME.upper(),
+                "trailing-dot": STAGING_NAME + ".",
+            }[kind]
         if alias is None:
             pytest.skip("this volume does not generate 8.3 short names")
         if not (os.path.lexists(dest / alias) and os.path.samefile(dest / alias, probe)):
