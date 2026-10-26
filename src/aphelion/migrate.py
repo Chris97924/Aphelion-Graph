@@ -28,7 +28,7 @@ from aphelion.canonical_json import loads as canonical_loads
 from aphelion.canonical_json import normalize
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
-from aphelion.unpacker import _remove_or_warn, _Replacement
+from aphelion.unpacker import _discard_backup, _remove_or_warn, _Replacement
 
 TARGET_FORMAT_VERSION = "2.0"
 TARGET_SPEC_VERSION = "0.4.0"
@@ -103,8 +103,10 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     that is ``dst``) is first renamed into a backup directory beside it and
     deleted, without following links, only once the new tree is in place;
     if that fails, the backup is named in a RuntimeWarning. After any
-    exception ``dst`` is as it was, or the error names the backup directory
-    that still holds it. The known limits are those of
+    exception, an interrupt such as KeyboardInterrupt included, ``dst`` is
+    as it was, or the error names the backup directory that still holds it;
+    on failure that directory is deleted only once it is empty. The known
+    limits are those of
     :class:`aphelion.unpacker._Replacement`: no recovery after a killed
     process or power loss, Windows files held open, one filesystem only.
     """
@@ -135,9 +137,10 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
         shutil.copytree(src_path, staging)
         (staging / "manifest.json").write_bytes(canonical_dumps(normalize(new_manifest)))
         if dst_present:
-            backup = dst_abs.with_name(f".{dst_abs.name}.replaced-{secrets.token_hex(8)}")
-            backup.mkdir()
-            replacement = _Replacement(backup)
+            replacement = _Replacement(
+                dst_abs.with_name(f".{dst_abs.name}.replaced-{secrets.token_hex(8)}")
+            )
+            replacement.backup.mkdir()
             try:
                 replacement.put(staging, dst_abs)
             except BaseException as exc:
@@ -146,6 +149,10 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
         else:
             os.replace(staging, dst_abs)
     except BaseException as exc:
+        # First, so a backup still holding the old dst is named even if the
+        # staging cleanup below is interrupted; it is deleted only if empty.
+        if replacement is not None:
+            _discard_backup(replacement.backup, exc)
         _remove_or_warn(staging, exc)
         raise
     if replacement is not None:

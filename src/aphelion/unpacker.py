@@ -285,15 +285,18 @@ def unpack(
     has are moved aside into the staging directory before being replaced, so
     an error while moving puts them back (see :class:`_Replacement`).
 
-    After any exception the contents of ``dest_dir`` are as they were (its
-    own timestamps may change), or the error names the directory that still
-    holds the original files. Parent directories this call created are
-    removed again. Staging that cannot be removed is named in a
-    RuntimeWarning and, on Python 3.11+, in a note on the raised error.
-    ``dest_dir`` itself must not be a symlink or junction.
+    After any exception, an interrupt such as KeyboardInterrupt included,
+    the contents of ``dest_dir`` are as they were (its own timestamps may
+    change), or the error names the directory that still holds the original
+    files: on failure that directory is deleted only once it is empty.
+    Parent directories this call created are removed again. Staging that
+    cannot be removed is named in a RuntimeWarning and, on Python 3.11+, in
+    a note on the raised error. ``dest_dir`` itself must not be a symlink or
+    junction.
 
     Known limits: there is no journal, so a killed process or a power loss
-    can leave a ``.unpacking-*`` directory (with replaced files in it) behind;
+    can leave a ``.unpacking-*`` directory (with replaced files in it) behind,
+    and an interrupt in the instant after it is created, an empty one;
     a file Windows holds open without delete sharing can stop both the move
     and the undo; staging is always on ``dest_dir``'s own filesystem, so a
     separate mount inside ``dest_dir`` makes the move fail (and be undone).
@@ -310,15 +313,19 @@ def unpack(
         raise FileExistsError(f"unpack destination is not a directory: {dest}")
     dest_resolved = dest.resolve()
     made = _make_parents(dest_resolved.parent)
-    staging = _make_staging_dir(dest_resolved)
+    staging = backup = None
     try:
-        backup = None
+        staging = _make_staging_dir(dest_resolved)
         if staging.parent == dest_resolved:
             backup = _make_unique_dir(staging, ".backup-")
         _extract(archive, staging, dest_resolved, policy, backup)
+        if backup is None and dest_resolved.exists():  # dest appeared beside staging
+            backup = _make_unique_dir(staging, ".backup-")
         _move_into_place(staging, dest_resolved, backup)
     except BaseException as exc:
-        if not isinstance(exc, _RestoreError):  # staging holds the backup it names
+        # The backup holds what a merge moved aside, and staging holds the
+        # backup: staging goes only once the backup is gone.
+        if staging is not None and (backup is None or _discard_backup(backup, exc)):
             _remove_or_warn(staging, exc)
         _remove_made(made)
         raise
@@ -382,61 +389,164 @@ def _remove_made(made: list[Path]) -> None:
 
 
 class _RestoreError(OSError):
-    """An undo did not finish; the message names where the originals are."""
+    """An undo did not finish; the message names what is left and where."""
 
 
 class _Replacement:
     """Put entries in place by rename, so that a failure can be undone.
 
     An entry about to be replaced is first renamed into ``backup``, a
-    directory on the same filesystem, and every step is logged. ``rollback``
-    reverses the log. If any undo step fails, ``backup`` is kept and the
-    :class:`_RestoreError` raised names it. ``commit`` deletes ``backup``,
-    warning instead of raising if it cannot. Shared by unpack and migrate.
+    directory on the same filesystem. Each step is logged before it runs, so
+    an interrupt that lands right after a rename returns is still on record;
+    ``rollback`` checks which renames happened and reverses them. ``commit``
+    deletes ``backup`` after success, warning instead of raising if it
+    cannot. On a failure path ``backup`` is deleted only once it is empty
+    (see :func:`_discard_backup`). Shared by unpack and migrate.
 
     Known limits: the log is in memory only (no recovery after a kill or a
     power loss; ``backup`` then still holds the replaced entries), an undo
-    step fails if Windows holds the file open without delete sharing, and
-    every rename must stay on one filesystem.
+    step fails if Windows holds the file open without delete sharing, every
+    rename must stay on one filesystem, and an interrupt while ``commit``
+    deletes ``backup`` (every entry is in place by then) leaves part of it.
     """
 
     def __init__(self, backup: Path) -> None:
         self.backup = backup
-        self._undo: list[tuple[Path, Path | None]] = []  # rename back, or rmdir
+        # (src, target, saved): target was renamed to saved (if it existed),
+        # then src onto target. src None: target is a directory this call made.
+        self._log: list[tuple[Path | None, Path, Path | None]] = []
 
     def mkdir(self, target: Path) -> None:
-        if not target.is_dir():
+        if target.is_dir():
+            return
+        self._log.append((None, target, None))
+        try:
             target.mkdir()
-            self._undo.append((target, None))
+        except FileExistsError:  # made by someone else meanwhile: not ours to remove
+            self._log.pop()
+            raise
 
     def put(self, src: Path, target: Path) -> None:
-        if os.path.lexists(target):
-            saved = self.backup / str(len(self._undo))
+        saved = self.backup / str(len(self._log)) if os.path.lexists(target) else None
+        self._log.append((src, target, saved))
+        if saved is not None:
             os.replace(target, saved)
-            self._undo.append((saved, target))
         os.replace(src, target)
-        self._undo.append((target, src))
 
     def rollback(self, exc: BaseException) -> None:
-        failed = []
-        for path, back in reversed(self._undo):
-            try:
-                if back is None:
-                    os.rmdir(path)
-                else:
-                    os.replace(path, back)
-            except OSError as err:
-                failed.append(f"{path}: {err}")
-        self._undo.clear()
-        if failed:
+        """Undo every logged step; if all is back, return for ``exc`` to propagate.
+
+        Every step is tried, even after one fails or is interrupted. What
+        could not be put back is reported: after an interrupt (a
+        BaseException that is not an Exception, from ``exc`` or from an undo
+        step) in a note on it (Python 3.11+), and the interrupt propagates as
+        itself; otherwise by a :class:`_RestoreError` raised from ``exc``.
+        Nothing is deleted here.
+        """
+        errors: list[BaseException] = []
+        for src, target, saved in reversed(self._log):
+            if src is None:
+                _attempt(errors, _rmdir_if_present, target)
+                continue
+            _attempt(errors, _move_back, target, src)
+            if saved is not None:
+                _attempt(errors, _restore, saved, target, src)
+        kept = [
+            f"{target} as {saved.name}"
+            for _src, target, saved in self._log
+            if saved is not None and _maybe_present(saved)
+        ]
+        added = [
+            str(target)
+            for _src, target, saved in self._log
+            if saved is None and _maybe_present(target)
+        ]
+        self._log.clear()
+        interrupt = next((e for e in (exc, *errors) if not isinstance(e, Exception)), None)
+        left = []
+        if kept:
+            left.append(f"the original entries are kept in {self.backup}: {', '.join(kept)}")
+        if added:
+            left.append(f"entries this call added are still in place: {', '.join(added)}")
+        if left and interrupt is None:
             raise _RestoreError(
-                f"could not undo after {exc!r}; the original entries are kept in "
-                f"{self.backup} ({'; '.join(failed)})"
+                f"could not undo after {exc!r}: {'; '.join(left)} "
+                f"({'; '.join(map(str, errors))})"
             ) from exc
-        _remove_or_warn(self.backup, exc)
+        if left and hasattr(interrupt, "add_note"):
+            interrupt.add_note(f"could not undo: {'; '.join(left)}")
+        if interrupt is not None and interrupt is not exc:
+            raise interrupt
 
     def commit(self) -> None:
         _remove_or_warn(self.backup)
+
+
+def _attempt(errors: list[BaseException], step: Callable[..., object], *args: Path) -> None:
+    try:
+        step(*args)
+    except BaseException as err:  # finish the undo first; the caller decides what to raise
+        errors.append(err)
+
+
+def _lstat(path: Path) -> os.stat_result | None:
+    """``os.lstat``, or None if there is no such entry.
+
+    Any other error is raised: an entry that cannot be looked at may still
+    be there, so it must not be taken as absent.
+    """
+    try:
+        return os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _maybe_present(path: Path) -> bool:
+    try:
+        return _lstat(path) is not None
+    except OSError:  # cannot tell: report it rather than lose track of it
+        return True
+
+
+def _move_back(path: Path, back: Path) -> None:
+    # Only a rename that happened is reversed, and nothing is overwritten.
+    if _lstat(path) is not None and _lstat(back) is None:
+        os.replace(path, back)
+
+
+def _restore(saved: Path, target: Path, src: Path) -> None:
+    # target is free, or still holds the new entry (src is gone because it
+    # could not be moved back): the original may replace that, nothing else.
+    if _lstat(saved) is not None and (_lstat(target) is None or _lstat(src) is None):
+        os.replace(saved, target)
+
+
+def _rmdir_if_present(path: Path) -> None:
+    if _lstat(path) is not None:
+        os.rmdir(path)
+
+
+def _discard_backup(backup: Path, exc: BaseException) -> bool:
+    """On a failure path, remove ``backup`` only if it is empty.
+
+    Never rmtree: whatever is still in it was moved aside and not put back.
+    Such a backup is kept and, unless ``exc`` already names it, named in a
+    RuntimeWarning and, on Python 3.11+, in a note on ``exc``. Returns
+    whether ``backup`` is gone.
+    """
+    try:
+        os.rmdir(backup)  # refuses a directory that is not empty
+    except FileNotFoundError:
+        pass
+    except OSError:
+        if not any(str(backup) in text for text in (str(exc), *getattr(exc, "__notes__", ()))):
+            _report(
+                f"kept {backup}: it may hold entries this call moved aside and could "
+                f"not put back",
+                exc,
+            )
+        return False
+    return True
 
 
 def _remove_or_warn(path: Path, exc: BaseException | None = None) -> None:
@@ -479,13 +589,18 @@ def _remove_or_warn(path: Path, exc: BaseException | None = None) -> None:
     else:
         shutil.rmtree(path, onerror=retry_writable)
     if os.path.lexists(path):
-        note = f"could not remove {path}; delete it by hand"
-        if exc is not None and hasattr(exc, "add_note"):
-            exc.add_note(note)
-        try:
-            warnings.warn(note, RuntimeWarning, stacklevel=3)
-        except Exception:  # a warnings filter set to "error" must not mask exc
-            pass
+        _report(f"could not remove {path}; delete it by hand", exc)
+
+
+def _report(note: str, exc: BaseException | None) -> None:
+    """Name a leftover in a RuntimeWarning and, on Python 3.11+, in a note on
+    ``exc``; never replaces ``exc``."""
+    if exc is not None and hasattr(exc, "add_note"):
+        exc.add_note(note)
+    try:
+        warnings.warn(note, RuntimeWarning, stacklevel=4)
+    except Exception:  # a warnings filter set to "error" must not mask exc
+        pass
 
 
 def _make_staging_dir(dest: Path) -> Path:
@@ -512,14 +627,13 @@ def _make_unique_dir(parent: Path, prefix: str) -> Path:
 def _move_into_place(staging: Path, dest: Path, backup: Path | None) -> None:
     """Move a fully extracted staging tree into ``dest``.
 
-    An existing ``dest`` is merged through a :class:`_Replacement` whose
-    backup directory sits in staging, so an error midway is undone.
+    Without ``backup`` there is no ``dest`` yet, and staging is renamed to
+    it. An existing ``dest`` is merged through a :class:`_Replacement` whose
+    ``backup`` directory sits in staging, so an error midway is undone.
     """
-    if not dest.exists():
+    if backup is None:
         os.replace(staging, dest)
         return
-    if backup is None:  # dest appeared after staging was made beside it
-        backup = _make_unique_dir(staging, ".backup-")
 
     def staged() -> Iterator[tuple[Path, Path, list[str], list[str]]]:
         # Every staged entry except the backup directory, found by identity.

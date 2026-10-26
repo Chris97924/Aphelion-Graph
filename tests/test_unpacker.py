@@ -20,12 +20,15 @@ the remaining branches:
 from __future__ import annotations
 
 import errno
+import functools
 import io
 import os
 import stat
 import sys
 import tarfile
+import warnings
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -924,6 +927,32 @@ def test_failed_undo_keeps_the_backup_and_names_it(
     assert kept == [b"old a", b"old z"]
 
 
+def test_new_file_that_cannot_be_moved_back_is_replaced_by_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: if a file that was moved in cannot be moved out again,
+    its original still goes back over it, so nothing is left to report."""
+    archive, dest, before = _merge_archive(tmp_path)
+    _fail_moves(monkeypatch, nth_staged=3)  # after a.md and z.md were replaced
+    real_replace = os.replace
+
+    def replace(src: str, dst: str, **kwargs: object) -> None:
+        back_to_staging = ".unpacking-" in os.fspath(dst) and ".backup-" not in os.fspath(dst)
+        if Path(os.fspath(src)) == dest / "a.md" and back_to_staging:
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(src))
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+    with pytest.raises(OSError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert "simulated I/O error" in str(exc.value)
+    assert "could not undo" not in str(exc.value)
+    assert _tree(dest) == before
+
+
 @pytest.mark.skipif(
     sys.platform != "win32",
     reason="only Windows refuses to rename a file that another handle holds open",
@@ -998,6 +1027,153 @@ def test_member_reaching_the_backup_dir_is_refused(
 
     assert "cannot unpack over the backup directory" in str(exc.value)
     assert _tree(dest) == before
+
+
+# ---------- an error or interrupt at any step loses nothing ----------
+
+
+def _steps(
+    monkeypatch: pytest.MonkeyPatch, plan: dict[int, tuple[BaseException, bool]]
+) -> list[str]:
+    """Number every rename, directory creation and directory removal from now
+    on (1, 2, ...) and return their log, one "kind path" line each.
+
+    ``plan`` maps a step number to ``(error, after)``: the error is raised
+    before the step runs or, with ``after``, once it has returned, where an
+    interrupt such as Ctrl-C can land before the caller records the step.
+    """
+    log: list[str] = []
+    real_replace, real_rmdir, real_mkdir = os.replace, os.rmdir, Path.mkdir
+
+    def step(kind: str, path: os.PathLike[str] | str, run: Callable[[], object]) -> object:
+        log.append(f"{kind} {os.fspath(path)}")
+        error, after = plan.get(len(log), (None, False))
+        if error is not None and not after:
+            raise error
+        result = run()
+        if error is not None:
+            raise error
+        return result
+
+    monkeypatch.setattr(
+        os, "replace", lambda s, d, **kw: step("replace", s, lambda: real_replace(s, d, **kw))
+    )
+    monkeypatch.setattr(
+        os, "rmdir", lambda p, *a, **kw: step("rmdir", p, lambda: real_rmdir(p, *a, **kw))
+    )
+    monkeypatch.setattr(
+        Path, "mkdir", lambda p, *a, **kw: step("mkdir", p, lambda: real_mkdir(p, *a, **kw))
+    )
+    return log
+
+
+def _run_steps(
+    monkeypatch: pytest.MonkeyPatch,
+    call: Callable[[], object],
+    plan: dict[int, tuple[BaseException, bool]],
+) -> tuple[list[str], BaseException | None, list[warnings.WarningMessage]]:
+    """Run ``call`` under :func:`_steps`; return the step log, the exception
+    it raised (None if it returned) and the warnings it gave."""
+    with monkeypatch.context() as patch, warnings.catch_warnings(record=True) as warned:
+        warnings.simplefilter("always")
+        log = _steps(patch, plan)
+        try:
+            call()
+        except BaseException as exc:  # KeyboardInterrupt included
+            return log, exc, warned
+    return log, None, warned
+
+
+def _named(exc: BaseException, warned: list[warnings.WarningMessage]) -> str:
+    """Everything that tells the caller where things are: the message, the
+    notes (Python 3.11+) and the warnings."""
+    notes = getattr(exc, "__notes__", ())
+    return "\n".join([str(exc), *notes, *(str(w.message) for w in warned)])
+
+
+def _error(kind: type[BaseException]) -> BaseException:
+    if kind is KeyboardInterrupt:
+        return KeyboardInterrupt()
+    return OSError(errno.EIO, "simulated I/O error")
+
+
+STOPS = [
+    pytest.param(KeyboardInterrupt, False, id="interrupt-before-step"),
+    pytest.param(KeyboardInterrupt, True, id="interrupt-after-step"),
+    pytest.param(OSError, False, id="oserror-before-step"),
+    pytest.param(OSError, True, id="oserror-after-step"),
+]
+
+
+def _unpack_merge(tmp_path: Path) -> tuple[Callable[[], object], Path, dict[str, bytes | None]]:
+    archive, dest, before = _merge_archive(tmp_path)
+    return functools.partial(unpack, archive, dest), dest, before
+
+
+@pytest.mark.parametrize("kind, after", STOPS)
+def test_merge_stopped_at_any_step_leaves_dest_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: type[BaseException], after: bool
+) -> None:
+    """All platforms: an unpack into an existing dest stopped at any rename or
+    directory creation, also right after it returned (a move-aside included),
+    puts dest back and raises that same error, an interrupt included."""
+    call, _, _ = _unpack_merge(tmp_path / "clean")
+    steps, exc, _ = _run_steps(monkeypatch, call, {})
+    assert exc is None
+    forward = [n for n, line in enumerate(steps, 1) if not line.startswith("rmdir")]
+    # a.md and z.md: move aside, move in; new/f.md: move in.
+    assert sum(steps[n - 1].startswith("replace") for n in forward) == 5
+
+    for n in forward:
+        call, dest, before = _unpack_merge(tmp_path / str(n))
+        error = _error(kind)
+        _, exc, _ = _run_steps(monkeypatch, call, {n: (error, after)})
+        assert exc is error, (steps[n - 1], exc)
+        left = _tree(dest)
+        assert {p: d for p, d in left.items() if not p.startswith(".unpacking-")} == before, (
+            steps[n - 1]
+        )
+        # Only an interrupt right after staging is made, before it is on
+        # record, can leave staging behind, and then it is empty.
+        assert all(d is None for p, d in left.items() if p.startswith(".unpacking-")), steps[n - 1]
+
+
+@pytest.mark.parametrize("kind, after", STOPS)
+def test_undo_stopped_at_any_step_loses_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: type[BaseException], after: bool
+) -> None:
+    """All platforms: once a move into an existing dest has failed, a second
+    error at any step of putting things back or cleaning up never loses an
+    original file: each is back in place, or in a backup directory that the
+    error or a warning names. An interrupt propagates as itself."""
+    call, _, _ = _unpack_merge(tmp_path / "clean")
+    steps, _, _ = _run_steps(monkeypatch, call, {})
+    moves = [n for n, line in enumerate(steps, 1) if line.startswith("replace")]
+    assert len(moves) == 5
+    for fail_at in moves:
+        call, _, _ = _unpack_merge(tmp_path / f"{fail_at}")
+        undo, exc, _ = _run_steps(monkeypatch, call, {fail_at: (_error(OSError), False)})
+        assert isinstance(exc, OSError)
+        for n in range(fail_at + 1, len(undo) + 1):
+            call, dest, before = _unpack_merge(tmp_path / f"{fail_at}-{n}")
+            error = _error(kind)
+            plan = {fail_at: (_error(OSError), False), n: (error, after)}
+            _, exc, warned = _run_steps(monkeypatch, call, plan)
+            where = (steps[fail_at - 1], undo[n - 1])
+            if kind is KeyboardInterrupt:
+                assert exc is error, where
+            else:
+                assert isinstance(exc, OSError), where
+            left = _tree(dest)
+            named = _named(exc, warned)
+            kept = [
+                file.read_bytes()
+                for backup in dest.resolve().glob(".unpacking-*/.backup-*")
+                if str(backup) in named
+                for file in backup.iterdir()
+            ]
+            for path, data in before.items():
+                assert left.get(path) == data or data in kept, (where, path, left, named)
 
 
 # ---------- the destination itself must not be a link ----------
@@ -1130,3 +1306,27 @@ def test_failed_unpack_keeps_a_parent_another_process_created(
 
     assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
     assert _tree(shared) == {"theirs.txt": b"theirs"}
+
+
+def test_failed_staging_dir_removes_the_parents_this_call_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: if the staging directory cannot be created (a full disk,
+    a path too long), the missing parents made for dest are removed again."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"a")])
+    dest = tmp_path / "p1" / "p2" / "dest"
+    real_mkdir = Path.mkdir
+
+    def mkdir(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name.startswith(".dest.unpacking-"):
+            raise OSError(errno.ENOSPC, "No space left on device", str(self))
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+
+    with pytest.raises(OSError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert exc.value.errno == errno.ENOSPC
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar"]

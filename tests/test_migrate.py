@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import io
 import json
 import shutil
 import tarfile
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -25,6 +27,7 @@ from aphelion.migrate import (
     migrate_v03_to_v04,
 )
 from aphelion.validator import validate_manifest
+from test_unpacker import STOPS, _error, _named, _run_steps
 
 
 UUID_PKG = "0191aaaa-0000-7000-8000-000000000001"
@@ -750,3 +753,69 @@ def test_force_only_warns_when_the_old_destination_cannot_be_deleted(
     assert loads((dst / "manifest.json").read_bytes())["format_version"] == "2.0"
     (backup,) = [p for p in tmp_path.iterdir() if p.name.startswith(".v04.replaced-")]
     assert any(str(backup) in str(w.message) for w in warned)
+
+
+# ---------- --force stopped at any step loses nothing ----------
+
+
+def _force_call(tmp_path: Path) -> tuple[Callable[[], object], Path, dict[str, bytes | None]]:
+    src, dst, before = _force_setup(tmp_path)
+    return functools.partial(migrate, MigrateOptions(src=src, dst=dst, force=True)), dst, before
+
+
+@pytest.mark.parametrize("kind, after", STOPS)
+def test_force_stopped_at_any_step_leaves_destination_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: type[BaseException], after: bool
+) -> None:
+    """All platforms: migrate --force stopped at any rename or directory
+    creation, also right after it returned (the move-aside of the old
+    destination included), puts the destination back and raises that same
+    error, an interrupt included."""
+    call, _, _ = _force_call(tmp_path / "clean")
+    steps, exc, _ = _run_steps(monkeypatch, call, {})
+    assert exc is None
+    forward = [n for n, line in enumerate(steps, 1) if not line.startswith("rmdir")]
+    assert sum(steps[n - 1].startswith("replace") for n in forward) == 2  # aside, in
+
+    for n in forward:
+        work = tmp_path / str(n)
+        call, dst, before = _force_call(work)
+        error = _error(kind)
+        _, exc, _ = _run_steps(monkeypatch, call, {n: (error, after)})
+        assert exc is error, (steps[n - 1], exc)
+        assert _snapshot(dst) == before, steps[n - 1]
+        assert sorted(p.name for p in work.iterdir()) == ["v03", "v04"], steps[n - 1]
+
+
+@pytest.mark.parametrize("kind, after", STOPS)
+def test_force_undo_stopped_at_any_step_loses_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: type[BaseException], after: bool
+) -> None:
+    """All platforms: once moving the new tree in has failed, a second error
+    at any step of putting the old destination back or cleaning up never
+    loses it: it is back in place, or in a backup directory that the error
+    or a warning names. An interrupt propagates as itself."""
+    call, _, _ = _force_call(tmp_path / "clean")
+    steps, _, _ = _run_steps(monkeypatch, call, {})
+    moves = [n for n, line in enumerate(steps, 1) if line.startswith("replace")]
+    assert len(moves) == 2
+    for fail_at in moves:
+        call, _, _ = _force_call(tmp_path / str(fail_at))
+        undo, exc, _ = _run_steps(monkeypatch, call, {fail_at: (_error(OSError), False)})
+        assert isinstance(exc, OSError)
+        for n in range(fail_at + 1, len(undo) + 1):
+            work = tmp_path / f"{fail_at}-{n}"
+            call, dst, before = _force_call(work)
+            error = _error(kind)
+            plan = {fail_at: (_error(OSError), False), n: (error, after)}
+            _, exc, warned = _run_steps(monkeypatch, call, plan)
+            where = (steps[fail_at - 1], undo[n - 1])
+            if kind is KeyboardInterrupt:
+                assert exc is error, where
+            else:
+                assert isinstance(exc, OSError), where
+            if dst.exists() and _snapshot(dst) == before:
+                continue
+            named = _named(exc, warned)
+            backups = [b for b in work.glob(".v04.replaced-*") if str(b) in named]
+            assert any(_snapshot(b / "0") == before for b in backups), (where, named)
