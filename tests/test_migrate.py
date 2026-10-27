@@ -877,3 +877,48 @@ def test_force_undo_stopped_at_any_step_loses_nothing(
             named = _named(exc, warned)
             backups = [b for b in work.glob(".v04.replaced-*") if str(b) in named]
             assert any(_snapshot(b / "0") == before for b in backups), (where, named)
+
+
+@pytest.mark.parametrize(
+    "layout, after",
+    [("existing-dst", False), ("existing-dst", True), ("new-dst", True)],
+    ids=["force-interrupt-before-step", "force-interrupt-after-step", "new-dst-after-rename"],
+)
+def test_interrupt_once_the_new_tree_is_in_place_says_migrate_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str, after: bool
+) -> None:
+    """All platforms: once the new tree is in place the migration has
+    succeeded. An interrupt after that (while the old destination is
+    deleted, or right after a new one is renamed into place) propagates with
+    a note (Python 3.11+) and a warning saying migrate completed and naming
+    the backup directory left over, and the destination holds the new tree."""
+
+    def setup(work: Path) -> tuple[Callable[[], object], Path]:
+        if layout == "existing-dst":
+            call, dst, _ = _force_call(work)
+            return call, dst
+        src = work / "v03"
+        _write_v03_directory(src)
+        return functools.partial(migrate, MigrateOptions(src=src, dst=work / "v04")), work / "v04"
+
+    call, _ = setup(tmp_path / "clean")
+    steps, exc, _ = _run_steps(monkeypatch, call, {})
+    assert exc is None
+    last_move = max(n for n, line in enumerate(steps, 1) if line.startswith("replace"))
+    # The rename of a new dst completes it; swapping in the new tree over an
+    # old one is still undone if interrupted (see the test above).
+    finishing = range(last_move + (0 if layout == "new-dst" else 1), len(steps) + 1)
+    assert finishing
+
+    for n in finishing:
+        work = tmp_path / str(n)
+        call, dst = setup(work)
+        error = KeyboardInterrupt()
+        _, exc, warned = _run_steps(monkeypatch, call, {n: (error, after)})
+        assert exc is error, steps[n - 1]
+        named = _named(exc, warned)
+        assert "migrate completed" in named, (steps[n - 1], named)
+        assert loads((dst / "manifest.json").read_bytes())["format_version"] == "2.0"
+        assert not (dst / "keep.txt").exists()
+        for leftover in work.glob(".v04.replaced-*"):
+            assert str(leftover) in named, (steps[n - 1], named)

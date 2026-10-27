@@ -308,15 +308,20 @@ def unpack(
     check cannot run, so an entry the archive would replace or merge into
     is refused.
 
-    After any exception, an interrupt such as KeyboardInterrupt included,
-    the contents of ``dest_dir`` are as they were (its own timestamps may
-    change), or the error names the directory that still holds the original
-    files: on failure that directory is deleted only once it is empty.
-    Parent directories this call created are removed again. Staging that
-    cannot be removed is named in a RuntimeWarning and, on Python 3.11+, in
-    a note on the raised error. ``dest_dir`` itself must not be a symlink or
-    junction. Nor can it be a Windows mounted folder, which is the same kind
-    of reparse point as a junction: unpack into a directory inside it instead.
+    Until every entry is in place, any exception, an interrupt such as
+    KeyboardInterrupt included, leaves the contents of ``dest_dir`` as they
+    were (its own timestamps may change), or the error names the directory
+    that still holds the original files: on failure that directory is
+    deleted only once it is empty. Parent directories this call created are
+    removed again. Once every entry is in place the unpack has succeeded,
+    and an interrupt while the replaced files are deleted propagates with a
+    note saying so and naming what is left over. Leftovers are named in a
+    RuntimeWarning and, on Python 3.11+, in a note on the raised error; when
+    neither can carry the name (Python 3.10, or a call that succeeded, with
+    warnings turned into errors) it is written to stderr. ``dest_dir``
+    itself must not be a symlink or junction. Nor can it be a Windows
+    mounted folder, which is the same kind of reparse point as a junction:
+    unpack into a directory inside it instead.
 
     Known limits: there is no journal, so a killed process or a power loss
     can leave a ``.unpacking-*`` directory (with replaced files in it) behind,
@@ -324,6 +329,9 @@ def unpack(
     a file Windows holds open without delete sharing can stop both the move
     and the undo; staging is always on ``dest_dir``'s own filesystem, so a
     separate mount inside ``dest_dir`` makes the move fail (and be undone).
+    Every check goes by path: a process that can replace ``dest_dir``, one
+    of its parents or an entry in it while unpack runs can still redirect
+    the writes, a window that path-based checks cannot close.
     On success, archive files replace same-named files in an existing
     ``dest_dir``; other files there are kept.
     """
@@ -338,7 +346,8 @@ def unpack(
         raise FileExistsError(f"unpack destination is not a directory: {dest}")
     dest_resolved = dest.resolve()
     made: list[Path] = []  # parents this call created, each on record before its mkdir
-    staging = backup = None
+    staging = backup = replacement = None
+    renaming = False
     try:
         _make_parents(dest_resolved.parent, made)
         staging = _make_staging_dir(dest_resolved)
@@ -347,8 +356,25 @@ def unpack(
         _extract(archive, staging, dest_resolved, policy, backup)
         if backup is None and _lstat(dest_resolved) is not None:  # dest appeared beside staging
             backup = _make_unique_dir(staging, ".backup-")
-        _move_into_place(staging, dest_resolved, backup)
+        if backup is None:
+            renaming = True  # on record before the rename, as _Replacement logs its steps
+            os.replace(staging, dest_resolved)
+        else:
+            replacement = _Replacement(backup)
+            _merge(staging, dest_resolved, replacement)
+            # Every entry is in place; what follows only deletes what was replaced.
+            replacement.commit()
+            _remove_or_warn(staging)
     except BaseException as exc:
+        if (replacement is not None and replacement.complete) or (
+            renaming and not _maybe_present(staging)
+        ):
+            # The unpack succeeded; only the cleanup after it was cut short.
+            left = ""
+            if staging is not None and _maybe_present(staging):
+                left = f"; {staging} is left over and holds only replaced files, so it can go"
+            _report(f"the unpack completed and {dest} is updated{left}", exc)
+            raise
         # The backup holds what a merge moved aside, and staging holds the
         # backup: staging goes only once the backup is gone.
         if staging is not None and (backup is None or _discard_backup(backup, exc)):
@@ -432,6 +458,9 @@ class _Replacement:
 
     def __init__(self, backup: Path) -> None:
         self.backup = backup
+        # Set by the caller once every step is done; from then on the call
+        # has succeeded, and only deleting the replaced entries is left.
+        self.complete = False
         # (src, target, saved): target was renamed to saved (if it existed),
         # then src onto target. src None: target is a directory this call made.
         self._log: list[tuple[Path | None, Path, Path | None]] = []
@@ -516,6 +545,7 @@ class _Replacement:
         itself; otherwise by a :class:`_RestoreError` raised from ``exc``.
         Nothing is deleted here.
         """
+        self.complete = False
         errors: list[BaseException] = []
         for src, target, saved in reversed(self._log):
             if src is None:
@@ -638,10 +668,8 @@ def _remove_or_warn(path: Path, exc: BaseException | None = None) -> None:
     directory replaced by a link while it runs. Where it is false (Windows)
     that race remains, and only symlink and junction reparse points count as
     links. On Windows a read-only entry (the attribute blocks deletion) is
-    made writable and retried. Whatever is still left is named in a
-    RuntimeWarning and, on Python 3.11+, in a note on ``exc``, so the caller's
-    error is never replaced; under a warnings filter set to "error" on 3.10
-    the leftover goes unreported.
+    made writable and retried. Whatever is still left is named as
+    :func:`_report` does, so the caller's error is never replaced.
     """
 
     def retry_writable(func: Callable[[str], object], entry: str, _exc: object) -> None:
@@ -675,13 +703,21 @@ def _remove_or_warn(path: Path, exc: BaseException | None = None) -> None:
 
 def _report(note: str, exc: BaseException | None) -> None:
     """Name a leftover in a RuntimeWarning and, on Python 3.11+, in a note on
-    ``exc``; never replaces ``exc``."""
+    ``exc``; never replaces ``exc``. When neither can carry it (no note to
+    add, on Python 3.10 or without ``exc``, and warnings turned into
+    errors), it is written to stderr, so it is named somewhere."""
+    noted = False
     if exc is not None and hasattr(exc, "add_note"):
         exc.add_note(note)
+        noted = True
     try:
         warnings.warn(note, RuntimeWarning, stacklevel=4)
     except Exception:  # a warnings filter set to "error" must not mask exc
-        pass
+        if not noted and sys.stderr is not None:
+            try:
+                sys.stderr.write(f"RuntimeWarning: {note}\n")
+            except (OSError, ValueError):  # stderr closed: nowhere left to say it
+                pass
 
 
 def _make_staging_dir(dest: Path) -> Path:
@@ -705,17 +741,14 @@ def _make_unique_dir(parent: Path, prefix: str) -> Path:
         return path
 
 
-def _move_into_place(staging: Path, dest: Path, backup: Path | None) -> None:
-    """Move a fully extracted staging tree into ``dest``.
+def _merge(staging: Path, dest: Path, replacement: _Replacement) -> None:
+    """Merge a fully extracted staging tree into the existing ``dest``.
 
-    Without ``backup`` there is no ``dest`` yet, and staging is renamed to
-    it. An existing ``dest`` is merged through a :class:`_Replacement` whose
-    ``backup`` directory sits in staging, so an error midway is undone.
+    Every move goes through ``replacement``, whose backup directory sits in
+    staging, so an error midway is undone. ``replacement.complete`` is set
+    once every entry is in place.
     """
-    if backup is None:
-        os.replace(staging, dest)
-        return
-    entries = _staged(staging, backup)
+    entries = _staged(staging, replacement.backup)
     # Check every target first so a conflict cannot leave a half-moved tree.
     existing: dict[tuple[int, int], Path] = {}
     for rel, is_dir in entries:
@@ -740,19 +773,16 @@ def _move_into_place(staging: Path, dest: Path, backup: Path | None) -> None:
                     ),
                     path=str(target),
                 )
-    replacement = _Replacement(backup)
     try:
         for rel, is_dir in entries:
             if is_dir:
                 replacement.mkdir(dest / rel)
             else:
                 replacement.put_file(staging / rel, dest / rel)
+        replacement.complete = True  # last: anything raised before it is undone
     except BaseException as exc:
         replacement.rollback(exc)
         raise
-    replacement.commit()
-    # dest is complete: failing to remove what is left of staging only warns.
-    _remove_or_warn(staging)
 
 
 def _staged(staging: Path, backup: Path) -> list[tuple[Path, bool]]:

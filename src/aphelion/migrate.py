@@ -29,7 +29,14 @@ from aphelion.canonical_json import loads as canonical_loads
 from aphelion.canonical_json import normalize
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
-from aphelion.unpacker import _discard_backup, _lstat, _remove_or_warn, _Replacement
+from aphelion.unpacker import (
+    _discard_backup,
+    _lstat,
+    _maybe_present,
+    _remove_or_warn,
+    _Replacement,
+    _report,
+)
 
 TARGET_FORMAT_VERSION = "2.0"
 TARGET_SPEC_VERSION = "0.4.0"
@@ -103,10 +110,15 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     to ``dst`` and only then swapped in. An existing ``dst`` (or the link
     that is ``dst``) is first renamed into a backup directory beside it and
     deleted, without following links, only once the new tree is in place;
-    if that fails, the backup is named in a RuntimeWarning. After any
-    exception, an interrupt such as KeyboardInterrupt included, ``dst`` is
-    as it was, or the error names the backup directory that still holds it;
-    on failure that directory is deleted only once it is empty. The known
+    if that fails, the backup is named in a RuntimeWarning. Until the new
+    tree is in place, any exception, an interrupt such as KeyboardInterrupt
+    included, leaves ``dst`` as it was, or the error names the backup
+    directory that still holds it; on failure that directory is deleted only
+    once it is empty. Once the new tree is in place the migration has
+    succeeded, and an interrupt while the old ``dst`` is deleted propagates
+    with a note saying so and naming the backup directory left over. Where
+    neither a note nor a warning can name a leftover (Python 3.10 with
+    warnings turned into errors), it is written to stderr. The known
     limits are those of
     :class:`aphelion.unpacker._Replacement`: no recovery after a killed
     process or power loss, Windows files held open, one filesystem only.
@@ -134,6 +146,7 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     dst_abs.parent.mkdir(parents=True, exist_ok=True)
     staging = dst_abs.with_name(f".{dst_abs.name}.migrating-{secrets.token_hex(8)}")
     replacement = None
+    renaming = False
     try:
         shutil.copytree(src_path, staging)
         (staging / "manifest.json").write_bytes(canonical_dumps(normalize(new_manifest)))
@@ -144,20 +157,31 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
             replacement.backup.mkdir()
             try:
                 replacement.replace_entry(staging, dst_abs)
+                replacement.complete = True  # last: anything raised before it is undone
             except BaseException as exc:
                 replacement.rollback(exc)
                 raise
+            # The new tree is in place; what follows only deletes the old one.
+            replacement.commit()
         else:
+            renaming = True  # on record before the rename, as _Replacement logs its steps
             os.replace(staging, dst_abs)
     except BaseException as exc:
+        if (replacement is not None and replacement.complete) or (
+            renaming and not _maybe_present(staging)
+        ):
+            # The migration succeeded; only deleting the old dst was cut short.
+            left = ""
+            if replacement is not None and _maybe_present(replacement.backup):
+                left = f"; the old one is left over in {replacement.backup}, which can go"
+            _report(f"migrate completed: {dst_path} holds the new tree{left}", exc)
+            raise
         # First, so a backup still holding the old dst is named even if the
         # staging cleanup below is interrupted; it is deleted only if empty.
         if replacement is not None:
             _discard_backup(replacement.backup, exc)
         _remove_or_warn(staging, exc)
         raise
-    if replacement is not None:
-        replacement.commit()
     return dst_path
 
 

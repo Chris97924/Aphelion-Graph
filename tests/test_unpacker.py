@@ -1217,6 +1217,107 @@ def test_undo_stopped_at_any_step_loses_nothing(
                 assert left.get(path) == data or data in kept, (where, path, left, named)
 
 
+MERGED = {
+    "a.md": b"new a",
+    "keep.txt": b"keep",
+    "new": None,
+    "new/f.md": b"new f",
+    "z.md": b"new z",
+}
+
+
+@pytest.mark.parametrize(
+    "layout, after",
+    [("merge", False), ("merge", True), ("new-dest", True)],
+    ids=["merge-interrupt-before-step", "merge-interrupt-after-step", "new-dest-after-rename"],
+)
+def test_interrupt_once_every_entry_is_in_place_says_the_unpack_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str, after: bool
+) -> None:
+    """All platforms: once every entry is in place the unpack has succeeded.
+    An interrupt after that (while the replaced files are deleted, or right
+    after a new dest is renamed into place) propagates with a note (Python
+    3.11+) and a warning saying the unpack completed and naming what is
+    left over, and dest keeps the archive's files."""
+
+    def setup(work: Path) -> tuple[Callable[[], object], Path, dict[str, bytes | None]]:
+        if layout == "merge":
+            return _unpack_merge(work)
+        archive = _write_tar(work / "a.tar", [(_reg("a.md"), b"a")])
+        return functools.partial(unpack, archive, work / "dest"), work / "dest", {"a.md": b"a"}
+
+    call, _, _ = setup(tmp_path / "clean")
+    steps, exc, _ = _run_steps(monkeypatch, call, {})
+    assert exc is None
+    last_move = max(n for n, line in enumerate(steps, 1) if line.startswith("replace"))
+    # The rename of a new dest completes it; the merge's last move is still
+    # undone if interrupted (see test_merge_stopped_at_any_step_leaves_dest_unchanged).
+    finishing = range(last_move + (0 if layout == "new-dest" else 1), len(steps) + 1)
+    assert finishing
+
+    for n in finishing:
+        call, dest, done = setup(tmp_path / str(n))
+        error = KeyboardInterrupt()
+        _, exc, warned = _run_steps(monkeypatch, call, {n: (error, after)})
+        assert exc is error, steps[n - 1]
+        named = _named(exc, warned)
+        assert "the unpack completed" in named, (steps[n - 1], named)
+        left = _tree(dest)
+        assert {p: d for p, d in left.items() if not p.startswith(".unpacking-")} == (
+            MERGED if layout == "merge" else done
+        )
+        for leftover in [p for p in left if p.startswith(".unpacking-") and "/" not in p]:
+            assert str(dest.resolve() / leftover) in named, (steps[n - 1], named)
+
+
+def test_leftover_after_success_is_named_on_stderr_when_warnings_are_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """All platforms: a staging dir left over after a complete merge has no
+    error to carry a note, and with warnings turned into errors its warning
+    cannot be shown either, so it is named on stderr."""
+    archive, dest, _ = _merge_archive(tmp_path)
+    real_rmdir = os.rmdir
+
+    def rmdir(path: str, *args: object, **kwargs: object) -> None:
+        if os.path.basename(os.fspath(path)).startswith(".unpacking-"):
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rmdir", rmdir)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert unpack(archive, dest) == dest
+    monkeypatch.undo()
+
+    (leftover,) = [p for p in dest.resolve().iterdir() if p.name.startswith(".unpacking-")]
+    assert str(leftover) in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 11), reason="from Python 3.11 a note on the error names it")
+def test_kept_backup_is_named_on_stderr_without_notes_when_warnings_are_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Python 3.10 only (no exception notes): a merge fails at a move, and an
+    interrupt lands on putting a file back. The backup still holding it
+    cannot be named in a note, nor, with warnings turned into errors, in a
+    warning, so it is named on stderr."""
+    call, _, _ = _unpack_merge(tmp_path / "clean")
+    steps, _, _ = _run_steps(monkeypatch, call, {})
+    fail_at = [n for n, line in enumerate(steps, 1) if line.startswith("replace")][3]
+
+    call, dest, _ = _unpack_merge(tmp_path / "run")
+    with monkeypatch.context() as patch, warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _steps(patch, {fail_at: (_error(OSError), False), fail_at + 1: (KeyboardInterrupt(), False)})
+        with pytest.raises(KeyboardInterrupt):
+            call()
+
+    (backup,) = dest.resolve().glob(".unpacking-*/.backup-*")
+    assert list(backup.iterdir())
+    assert str(backup) in capsys.readouterr().err
+
+
 # ---------- two members that reach one entry are refused ----------
 
 
