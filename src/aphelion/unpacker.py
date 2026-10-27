@@ -299,7 +299,11 @@ def unpack(
     regular files are ever moved aside: where the archive has a file and
     ``dest_dir`` a directory, a link or anything else, or the archive a
     directory and ``dest_dir`` anything but a real directory, the unpack is
-    refused before anything moves, and again if that changes meanwhile.
+    refused before anything moves, and again if that changes meanwhile. An
+    entry found absent is put in place by a step that fails if anything is
+    there by then (an exclusive create, or a rename that replaces nothing),
+    so a wrong "not found" fails the unpack instead of replacing a file
+    nothing backed up.
     Two members that reach one entry already in ``dest_dir`` (by its 8.3
     short name, say) are refused before anything moves; an alias the merge
     itself creates (Windows gives a new file or directory a short name
@@ -358,7 +362,8 @@ def unpack(
             backup = _make_unique_dir(staging, ".backup-")
         if backup is None:
             renaming = True  # on record before the rename, as _Replacement logs its steps
-            os.replace(staging, dest_resolved)
+            # Not os.replace, which on Windows replaces a file there by now.
+            os.rename(staging, dest_resolved)
         else:
             replacement = _Replacement(backup)
             _merge(staging, dest_resolved, replacement)
@@ -447,7 +452,11 @@ class _Replacement:
     cannot. On a failure path ``backup`` is deleted only once it is empty
     (see :func:`_discard_backup`). Shared by unpack, whose merge uses
     ``mkdir`` and ``put_file`` and so moves aside regular files only, and
-    migrate, whose ``replace_entry`` replaces the whole destination.
+    migrate, whose ``replace_entry`` replaces the whole destination. An
+    entry found absent is placed by a step that fails if anything is there
+    by then: a file over an empty placeholder made by an exclusive create
+    (removed again by ``rollback``), a directory by a rename that replaces
+    nothing on Windows and only an empty directory elsewhere.
 
     Known limits: the log is in memory only (no recovery after a kill or a
     power loss; ``backup`` then still holds the replaced entries), an undo
@@ -465,6 +474,7 @@ class _Replacement:
         # then src onto target. src None: target is a directory this call made.
         self._log: list[tuple[Path | None, Path, Path | None]] = []
         self._placed: dict[tuple[int, int], Path] = {}  # (st_dev, st_ino) -> target
+        self._claims: dict[Path, tuple[int, int]] = {}  # placeholder -> (st_dev, st_ino)
 
     def mkdir(self, target: Path) -> None:
         """Unpack's merge: make ``target`` for a staged directory, or merge
@@ -504,16 +514,50 @@ class _Replacement:
         self._remember(target)
 
     def replace_entry(self, src: Path, target: Path) -> None:
-        """migrate --force: put ``src`` at ``target``, moving aside whatever
-        is there, by design: the whole old destination, or the link it is."""
-        self._swap(src, target, present=_lstat(target) is not None)
+        """migrate --force: put the directory ``src`` at ``target``, moving
+        aside whatever is there, by design: the whole old destination, or the
+        link it is."""
+        self._swap(src, target, present=_lstat(target) is not None, directory=True)
 
-    def _swap(self, src: Path, target: Path, *, present: bool) -> None:
+    def _swap(self, src: Path, target: Path, *, present: bool, directory: bool = False) -> None:
         saved = self.backup / str(len(self._log)) if present else None
         self._log.append((src, target, saved))
         if saved is not None:
             os.replace(target, saved)
+            os.replace(src, target)
+            return
+        # Found absent, and nothing backed up what a rename would replace,
+        # while the strict lstat can still be wrong (on Windows a network
+        # error is reported as "not found"): placed by a step that fails if
+        # anything is there by now. A directory by a rename, which replaces
+        # nothing on Windows and elsewhere only an empty directory; a file
+        # over an empty placeholder made by an exclusive create.
+        try:
+            if directory:
+                os.rename(src, target)
+                return
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError:  # nothing was made; what is there, if anything, is not this call's
+            self._log.pop()
+            raise
+        try:
+            st = os.fstat(fd)
+            self._claims[target] = (st.st_dev, st.st_ino)  # how rollback knows it
+        finally:
+            os.close(fd)
         os.replace(src, target)
+
+    def _unclaim(self, target: Path) -> None:
+        # The placeholder of a move that did not happen goes; anything else
+        # at target (the moved file, if it could not be moved back) stays.
+        st = _lstat(target)
+        if (
+            st is not None
+            and st.st_ino
+            and stat.S_ISREG(st.st_mode)
+            and (st.st_dev, st.st_ino) == self._claims[target]
+        ):
+            os.unlink(target)
 
     def _refuse_placed(self, st: os.stat_result, target: Path) -> None:
         # Two entries distinct in staging can still name one entry here: the
@@ -554,6 +598,8 @@ class _Replacement:
             _attempt(errors, _move_back, target, src)
             if saved is not None:
                 _attempt(errors, _restore, saved, target, src)
+            elif target in self._claims:
+                _attempt(errors, self._unclaim, target)
         kept = [
             f"{target} as {saved.name}"
             for _src, target, saved in self._log
@@ -565,6 +611,7 @@ class _Replacement:
             if saved is None and _maybe_present(target)
         ]
         self._log.clear()
+        self._claims.clear()
         interrupt = next((e for e in (exc, *errors) if not isinstance(e, Exception)), None)
         left = []
         if kept:

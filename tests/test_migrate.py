@@ -27,7 +27,7 @@ from aphelion.migrate import (
     migrate_v03_to_v04,
 )
 from aphelion.validator import validate_manifest
-from test_unpacker import STOPS, _error, _named, _run_steps
+from test_unpacker import MOVES, STOPS, _error, _named, _run_steps
 
 
 UUID_PKG = "0191aaaa-0000-7000-8000-000000000001"
@@ -833,7 +833,7 @@ def test_force_stopped_at_any_step_leaves_destination_unchanged(
     steps, exc, _ = _run_steps(monkeypatch, call, {})
     assert exc is None
     forward = [n for n, line in enumerate(steps, 1) if not line.startswith("rmdir")]
-    assert sum(steps[n - 1].startswith("replace") for n in forward) == 2  # aside, in
+    assert sum(steps[n - 1].startswith(MOVES) for n in forward) == 2  # aside, in
 
     for n in forward:
         work = tmp_path / str(n)
@@ -855,7 +855,7 @@ def test_force_undo_stopped_at_any_step_loses_nothing(
     or a warning names. An interrupt propagates as itself."""
     call, _, _ = _force_call(tmp_path / "clean")
     steps, _, _ = _run_steps(monkeypatch, call, {})
-    moves = [n for n, line in enumerate(steps, 1) if line.startswith("replace")]
+    moves = [n for n, line in enumerate(steps, 1) if line.startswith(MOVES)]
     assert len(moves) == 2
     for fail_at in moves:
         call, _, _ = _force_call(tmp_path / str(fail_at))
@@ -904,7 +904,7 @@ def test_interrupt_once_the_new_tree_is_in_place_says_migrate_completed(
     call, _ = setup(tmp_path / "clean")
     steps, exc, _ = _run_steps(monkeypatch, call, {})
     assert exc is None
-    last_move = max(n for n, line in enumerate(steps, 1) if line.startswith("replace"))
+    last_move = max(n for n, line in enumerate(steps, 1) if line.startswith(MOVES))
     # The rename of a new dst completes it; swapping in the new tree over an
     # old one is still undone if interrupted (see the test above).
     finishing = range(last_move + (0 if layout == "new-dst" else 1), len(steps) + 1)

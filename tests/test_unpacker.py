@@ -24,6 +24,7 @@ import errno
 import functools
 import io
 import os
+import shutil
 import stat
 import sys
 import tarfile
@@ -1073,6 +1074,10 @@ def test_member_reaching_the_backup_dir_is_refused(
 # ---------- an error or interrupt at any step loses nothing ----------
 
 
+# The kinds of step that move an entry (os.rename places what was found absent).
+MOVES = ("replace", "rename")
+
+
 def _steps(
     monkeypatch: pytest.MonkeyPatch, plan: dict[int, tuple[BaseException, bool]]
 ) -> list[str]:
@@ -1084,7 +1089,8 @@ def _steps(
     interrupt such as Ctrl-C can land before the caller records the step.
     """
     log: list[str] = []
-    real_replace, real_rmdir, real_mkdir = os.replace, os.rmdir, Path.mkdir
+    real_replace, real_rename = os.replace, os.rename
+    real_rmdir, real_mkdir = os.rmdir, Path.mkdir
 
     def step(kind: str, path: os.PathLike[str] | str, run: Callable[[], object]) -> object:
         log.append(f"{kind} {os.fspath(path)}")
@@ -1098,6 +1104,9 @@ def _steps(
 
     monkeypatch.setattr(
         os, "replace", lambda s, d, **kw: step("replace", s, lambda: real_replace(s, d, **kw))
+    )
+    monkeypatch.setattr(
+        os, "rename", lambda s, d, **kw: step("rename", s, lambda: real_rename(s, d, **kw))
     )
     monkeypatch.setattr(
         os, "rmdir", lambda p, *a, **kw: step("rmdir", p, lambda: real_rmdir(p, *a, **kw))
@@ -1163,7 +1172,7 @@ def test_merge_stopped_at_any_step_leaves_dest_unchanged(
     assert exc is None
     forward = [n for n, line in enumerate(steps, 1) if not line.startswith("rmdir")]
     # a.md and z.md: move aside, move in; new/f.md: move in.
-    assert sum(steps[n - 1].startswith("replace") for n in forward) == 5
+    assert sum(steps[n - 1].startswith(MOVES) for n in forward) == 5
 
     for n in forward:
         call, dest, before = _unpack_merge(tmp_path / str(n))
@@ -1189,7 +1198,7 @@ def test_undo_stopped_at_any_step_loses_nothing(
     error or a warning names. An interrupt propagates as itself."""
     call, _, _ = _unpack_merge(tmp_path / "clean")
     steps, _, _ = _run_steps(monkeypatch, call, {})
-    moves = [n for n, line in enumerate(steps, 1) if line.startswith("replace")]
+    moves = [n for n, line in enumerate(steps, 1) if line.startswith(MOVES)]
     assert len(moves) == 5
     for fail_at in moves:
         call, _, _ = _unpack_merge(tmp_path / f"{fail_at}")
@@ -1249,7 +1258,7 @@ def test_interrupt_once_every_entry_is_in_place_says_the_unpack_completed(
     call, _, _ = setup(tmp_path / "clean")
     steps, exc, _ = _run_steps(monkeypatch, call, {})
     assert exc is None
-    last_move = max(n for n, line in enumerate(steps, 1) if line.startswith("replace"))
+    last_move = max(n for n, line in enumerate(steps, 1) if line.startswith(MOVES))
     # The rename of a new dest completes it; the merge's last move is still
     # undone if interrupted (see test_merge_stopped_at_any_step_leaves_dest_unchanged).
     finishing = range(last_move + (0 if layout == "new-dest" else 1), len(steps) + 1)
@@ -1304,7 +1313,7 @@ def test_kept_backup_is_named_on_stderr_without_notes_when_warnings_are_errors(
     warning, so it is named on stderr."""
     call, _, _ = _unpack_merge(tmp_path / "clean")
     steps, _, _ = _run_steps(monkeypatch, call, {})
-    fail_at = [n for n, line in enumerate(steps, 1) if line.startswith("replace")][3]
+    fail_at = [n for n, line in enumerate(steps, 1) if line.startswith(MOVES)][3]
 
     call, dest, _ = _unpack_merge(tmp_path / "run")
     with monkeypatch.context() as patch, warnings.catch_warnings():
@@ -1848,6 +1857,46 @@ def test_merge_moves_only_what_is_a_regular_file_right_before_the_move(
     else:
         assert "not a regular file" in str(exc.value)
         assert _tree(dest) == before
+
+
+@pytest.mark.parametrize("found_absent", ["file", "directory", "new-dest-over-a-file"])
+def test_entry_wrongly_found_absent_is_never_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, found_absent: str
+) -> None:
+    """All platforms: the lstat that finds an entry absent can be wrong (on
+    Windows a network error is reported as "not found"). What it found
+    absent is put in place by a step that fails if anything is there (an
+    exclusive create, an exclusive mkdir, a rename that replaces no file),
+    so the unpack fails and dest keeps what it had, instead of a rename
+    replacing a file nothing backed up."""
+    archive, dest, _ = _merge_archive(tmp_path)
+    if found_absent == "file":
+        victim = dest / "z.md"  # after a.md was replaced, so that is undone too
+    elif found_absent == "directory":
+        victim = dest / "new"
+        victim.mkdir()
+        (victim / "old.md").write_bytes(b"old")
+    else:
+        shutil.rmtree(dest)
+        dest.write_bytes(b"a file of the user's")
+        victim = dest
+    before = dest.read_bytes() if dest.is_file() else _tree(dest)
+    want = os.path.normcase(os.path.abspath(victim.resolve()))
+    real_lstat = os.lstat
+
+    def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
+        name = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if not kwargs.get("dir_fd") and name == want and _from_aphelion():
+            raise FileNotFoundError(errno.ENOENT, "simulated: network path not found", path)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    with pytest.raises(OSError):
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert (dest.read_bytes() if dest.is_file() else _tree(dest)) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
 
 
 # ---------- the destination itself must not be a link ----------

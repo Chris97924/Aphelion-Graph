@@ -165,7 +165,8 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
             replacement.commit()
         else:
             renaming = True  # on record before the rename, as _Replacement logs its steps
-            os.replace(staging, dst_abs)
+            # Not os.replace, which on Windows replaces a file there by now.
+            os.rename(staging, dst_abs)
     except BaseException as exc:
         if (replacement is not None and replacement.complete) or (
             renaming and not _maybe_present(staging)
