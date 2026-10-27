@@ -76,6 +76,9 @@ def pack(members: list[TarMember]) -> bytes:
     ``..``, and on Windows a name Win32 cannot create; see
     :func:`aphelion.unpacker.non_portable_component`), and on two paths that
     collide once normalized (see :class:`aphelion.unpacker.MemberNames`).
+    pack does not see filesystem aliases such as Windows 8.3 short names;
+    unpack refuses an archive whose members reach one entry on the target
+    filesystem.
     """
     names = MemberNames()
     for member in members:

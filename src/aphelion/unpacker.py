@@ -337,7 +337,13 @@ def unpack(
     separate mount inside ``dest_dir`` makes the move fail (and be undone).
     Every check goes by path: a process that can replace ``dest_dir``, one
     of its parents or an entry in it while unpack runs can still redirect
-    the writes, a window that path-based checks cannot close.
+    the writes, a window that path-based checks cannot close. Resolving
+    ``dest_dir`` and each member's path (``Path.resolve``) keeps its
+    standard-library behaviour, which can take a component it cannot look
+    at for one that is not a link; the merge's strict check of every entry
+    in ``dest_dir`` is what refuses a link there. On a filesystem other
+    than Windows', a new ``dest_dir`` renamed into place can replace an
+    empty directory that appeared there meanwhile.
     On success, archive files replace same-named files in an existing
     ``dest_dir``; other files there are kept.
     """
@@ -465,6 +471,9 @@ class _Replacement:
     step fails if Windows holds the file open without delete sharing, every
     rename must stay on one filesystem, and an interrupt while ``commit``
     deletes ``backup`` (every entry is in place by then) leaves part of it.
+    Every check goes by path: a process that can replace a target or one of
+    its parents between the check and the rename can still redirect it, a
+    window that path-based checks cannot close.
     """
 
     def __init__(self, backup: Path) -> None:
@@ -646,9 +655,14 @@ def _lstat(path: Path, *, follow_symlinks: bool = False) -> os.stat_result | Non
     is no such entry.
 
     Any other error is raised: an entry that cannot be looked at may still
-    be there, so it must not be taken as absent. Every type and existence
-    check on the write paths of unpack and migrate goes through here, never
-    through pathlib or os.path predicates, which return False on errors.
+    be there, so it must not be taken as absent. The type and existence
+    checks unpack and migrate make themselves go through here, never through
+    pathlib or os.path predicates, which return False on errors. Path
+    resolution (``Path.resolve``) and ``Path.mkdir(exist_ok=True)`` keep their
+    standard-library behaviour; the strict checks of the entries that are
+    moved are their backstop. A "not found" can still be wrong (on Windows
+    a network error is reported as one), so what is found absent is placed
+    by a step that fails if anything is there.
     """
     try:
         return os.stat(path) if follow_symlinks else os.lstat(path)

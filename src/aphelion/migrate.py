@@ -117,11 +117,20 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     once it is empty. Once the new tree is in place the migration has
     succeeded, and an interrupt while the old ``dst`` is deleted propagates
     with a note saying so and naming the backup directory left over. Where
-    neither a note nor a warning can name a leftover (Python 3.10 with
-    warnings turned into errors), it is written to stderr. The known
-    limits are those of
+    no note can name a leftover (Python 3.10, or a call that succeeded),
+    its RuntimeWarning is shown even where warnings are ignored or turned
+    into errors. A new ``dst`` is put in place by a rename that replaces
+    nothing on Windows and elsewhere only an empty directory.
+
+    The known limits are those of
     :class:`aphelion.unpacker._Replacement`: no recovery after a killed
     process or power loss, Windows files held open, one filesystem only.
+    Every check goes by path: a process that can replace ``dst``, one of its
+    parents or ``src`` while migrate runs can still redirect the copy or the
+    swap, a window that path-based checks cannot close. Resolving ``src``
+    and ``dst`` for the overlap check (``Path.resolve``; strict for ``src``,
+    which must exist) and creating ``dst``'s parents
+    (``Path.mkdir(exist_ok=True)``) keep their standard-library behaviour.
     """
     src_path = Path(src)
     dst_path = Path(dst)
@@ -215,7 +224,7 @@ def _refuse_overlap(src: Path, dst: Path) -> None:
     source is refused even when it points elsewhere: replacing it would
     modify the source.
     """
-    src_resolved = src.resolve()
+    src_resolved = src.resolve(strict=True)  # src exists: both callers checked it
     dst_abs = Path(os.path.abspath(dst))
     for candidate in (dst_abs.resolve(), dst_abs.parent.resolve() / dst_abs.name):
         if (
