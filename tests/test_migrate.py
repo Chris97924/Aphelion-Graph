@@ -34,6 +34,7 @@ from test_unpacker import (
     WINDOWS_ONLY,
     _error,
     _named,
+    _no_final_path,
     _not_found,
     _run_steps,
     run_python,
@@ -651,6 +652,33 @@ def test_migrate_stops_when_the_destination_cannot_be_looked_at(
     assert exc.value is err
     assert _snapshot(dst) == before
     assert sorted(p.name for p in tmp_path.iterdir()) == ["v03", "v04"]
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("winerror, works", [(1, True), (50, True), (53, False)])
+def test_migrate_works_where_the_source_volume_reports_no_final_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int, works: bool
+) -> None:
+    """Windows only (simulated): on a volume whose driver cannot answer the
+    final-path query (some RAM disks and mapped drives: winerror 1 or 50),
+    migrate works; a strict look has already shown that the source exists.
+    Any other error from that query (a network path that cannot be
+    reached, 53) still fails it before anything is written."""
+    src = tmp_path / "v03"
+    _write_v03_directory(src)
+    dst = tmp_path / "v04"
+    _no_final_path(monkeypatch, src.resolve(), winerror)
+
+    if works:
+        migrate(MigrateOptions(src=src, dst=dst))
+        monkeypatch.undo()
+        assert loads((dst / "manifest.json").read_bytes())["format_version"] == "2.0"
+    else:
+        with pytest.raises(OSError) as exc:
+            migrate(MigrateOptions(src=src, dst=dst))
+        monkeypatch.undo()
+        assert getattr(exc.value, "winerror", None) == winerror
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["v03"]
 
 
 def test_force_refuses_archive_destination_that_is_the_source(tmp_path: Path) -> None:

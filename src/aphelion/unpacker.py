@@ -984,13 +984,30 @@ def _entry_name(st: os.stat_result, target: Path, *, is_dir: bool) -> str | None
 
     None where the entry is the only one (a directory, or a file with one
     link), so every name that reaches it is an alias. A file with hard links
-    has several entries: the name the filesystem stores (``realpath`` spells
+    has several entries: the name the filesystem stores (resolving spells
     an 8.3 short name or a case variant out) tells them apart, so two hard
     links are two entries, each replaced on its own.
     """
     if is_dir or st.st_nlink <= 1:
         return None
-    return os.path.normcase(os.path.realpath(target, strict=True))
+    return os.path.normcase(str(_resolve_existing(target)))
+
+
+def _resolve_existing(path: Path) -> Path:
+    """``path.resolve(strict=True)``, for a path a strict lstat has found.
+
+    Where the volume's driver cannot answer the final-path query that
+    Windows resolves with (ERROR_INVALID_FUNCTION 1 or ERROR_NOT_SUPPORTED
+    50: some RAM disks and mapped drives), the non-strict resolve, which
+    then falls back as the standard library does; the caller's lstat has
+    shown that the path exists. Any other error is raised.
+    """
+    try:
+        return path.resolve(strict=True)
+    except OSError as err:
+        if getattr(err, "winerror", None) not in (1, 50):
+            raise
+        return path.resolve()
 
 
 def _check_replaceable(st: os.stat_result, target: Path, *, is_dir: bool) -> None:

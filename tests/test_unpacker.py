@@ -1374,6 +1374,7 @@ def test_leftover_reaches_stderr_once_whatever_the_warnings_filters(
 WINDOWS_83 = pytest.mark.skipif(
     sys.platform != "win32", reason="8.3 short names exist only on Windows"
 )
+WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="winerror exists only on Windows")
 
 
 def _short_alias(tmp_path: Path, long_name: str, *, directory: bool) -> str:
@@ -1511,6 +1512,45 @@ def test_hard_links_in_dest_are_each_replaced(tmp_path: Path) -> None:
     archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a"), (_reg("b.md"), b"new b")])
 
     assert unpack(archive, dest) == dest
+
+    assert _tree(dest) == {"a.md": b"new a", "b.md": b"new b"}
+
+
+def _no_final_path(monkeypatch: pytest.MonkeyPatch, volume: Path, winerror: int) -> None:
+    """Make Windows' final-path query fail with ``winerror`` for every path in
+    ``volume``, as on a RAM disk or mapped drive whose driver cannot answer
+    it (1: ERROR_INVALID_FUNCTION, 50: ERROR_NOT_SUPPORTED)."""
+    import ntpath
+
+    real = ntpath._getfinalpathname  # type: ignore[attr-defined]
+    prefix = os.path.normcase(str(volume))
+
+    def final_path(path: str) -> str:
+        if os.path.normcase(os.fspath(path)).startswith(prefix):
+            raise OSError(0, "simulated: no final path here", os.fspath(path), winerror)
+        return real(path)
+
+    monkeypatch.setattr(ntpath, "_getfinalpathname", final_path)
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("winerror", [1, 50])
+def test_hard_links_in_dest_are_each_replaced_where_no_final_path_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    """Windows only (simulated): on a volume whose driver cannot answer the
+    final-path query, two hard links in dest are still two entries, each
+    replaced; the name each is stored under comes from the fallback the
+    standard library uses there."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "a.md").write_bytes(b"old")
+    _hard_link(dest / "a.md", dest / "b.md")
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a"), (_reg("b.md"), b"new b")])
+    _no_final_path(monkeypatch, dest.resolve(), winerror)
+
+    assert unpack(archive, dest) == dest
+    monkeypatch.undo()
 
     assert _tree(dest) == {"a.md": b"new a", "b.md": b"new b"}
 
@@ -2015,9 +2055,6 @@ def test_merge_moves_only_what_is_a_regular_file_right_before_the_move(
     else:
         assert "not a regular file" in str(exc.value)
         assert _tree(dest) == before
-
-
-WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="winerror exists only on Windows")
 
 
 def _not_found(path: object, winerror: int | None = 2) -> OSError:

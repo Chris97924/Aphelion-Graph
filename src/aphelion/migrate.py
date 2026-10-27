@@ -37,6 +37,7 @@ from aphelion.unpacker import (
     _remove_or_warn,
     _Replacement,
     _report,
+    _resolve_existing,
 )
 
 TARGET_FORMAT_VERSION = "2.0"
@@ -130,7 +131,8 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     parents or ``src`` while migrate runs can still redirect the copy or the
     swap, a window that path-based checks cannot close. Resolving ``src``
     and ``dst`` for the overlap check (``Path.resolve``; strict for ``src``,
-    which must exist) and creating ``dst``'s parents
+    which must exist, except on a volume that cannot report a final path)
+    and creating ``dst``'s parents
     (``Path.mkdir(exist_ok=True)``) keep their standard-library behaviour.
     """
     src_path = Path(src)
@@ -227,7 +229,7 @@ def _refuse_overlap(src: Path, dst: Path) -> None:
     source is refused even when it points elsewhere: replacing it would
     modify the source.
     """
-    src_resolved = src.resolve(strict=True)  # src exists: both callers checked it
+    src_resolved = _resolve_existing(src)  # src exists: both callers checked it
     dst_abs = Path(os.path.abspath(dst))
     for candidate in (dst_abs.resolve(), dst_abs.parent.resolve() / dst_abs.name):
         if (
