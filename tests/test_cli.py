@@ -204,6 +204,29 @@ def test_main_error_line_carries_the_error_notes(
     assert payload["notes"] == [note]
 
 
+def test_canonicalize_error_line_carries_the_error_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: `aphe canonicalize` wraps an I/O error in a JSON error
+    line of its own, and keeps the error's notes there as main() does."""
+    note = f"could not remove {tmp_path / 'x.md.tmp'}; delete it by hand"
+    error = OSError("simulated I/O error")
+    error.__notes__ = [note]  # what add_note does on Python 3.11+
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    import aphelion.canonicalize as canonicalize_mod
+
+    monkeypatch.setattr(canonicalize_mod, "canonicalize_path", _fail)
+    code, _, err = _run(["canonicalize", str(tmp_path / "x.md")])
+    payload = _error_payload(err)
+    assert code == 1
+    assert payload is not None
+    assert payload["code"] == ErrorCode.MISSING_FILE.value
+    assert payload["notes"] == [note]
+
+
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="exception notes exist from Python 3.11")
 def test_unpack_error_line_names_a_staging_dir_it_could_not_remove(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
