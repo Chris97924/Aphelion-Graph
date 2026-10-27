@@ -1498,7 +1498,7 @@ def test_portable_names_near_device_names_are_accepted(tmp_path: Path, name: str
 @pytest.mark.parametrize("name", [*NON_PORTABLE_NAMES, *NEAR_DEVICE_NAMES, "a:b.md"])
 def test_pack_refuses_exactly_the_names_unpack_refuses(tmp_path: Path, name: str) -> None:
     """All platforms: whatever this platform's unpack refuses, pack refuses
-    too, with the same code, and the other way round."""
+    too, with the same code, and unpack refuses whatever pack refuses."""
     from aphelion.canonical_tar import TarMember, pack
     from aphelion.errors import SchemaError
 
