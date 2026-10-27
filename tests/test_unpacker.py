@@ -1368,6 +1368,25 @@ def test_leftover_reaches_stderr_once_whatever_the_warnings_filters(
     assert run.stderr.count(left[0]) == 1, run.stderr
 
 
+@pytest.mark.parametrize("case", ["staging-after-success", "backup-after-failure"])
+def test_leftover_reaches_stderr_once_where_warnings_go_to_logging(
+    tmp_path: Path, case: str
+) -> None:
+    """All platforms, run in a new interpreter: where an application sends
+    warnings to logging (logging.captureWarnings) and has no handler, which
+    shows nothing, a leftover that no note on an error can name (Python
+    3.10, or no error at all) is still named on stderr, exactly once."""
+    archive, dest, _ = _merge_archive(tmp_path)
+    script = "import logging\nlogging.captureWarnings(True)\n" + LEFTOVER_AFTER_UNPACK
+
+    run = run_python(script, [str(archive), str(dest), case], None)
+
+    assert run.returncode == 0, run.stderr
+    left = run.stdout.splitlines()
+    assert len(left) == 1, (run.stdout, run.stderr)
+    assert run.stderr.count(left[0]) == 1, run.stderr
+
+
 # ---------- two members that reach one entry are refused ----------
 
 

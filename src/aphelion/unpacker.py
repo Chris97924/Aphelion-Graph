@@ -837,7 +837,9 @@ def _report(note: str, exc: BaseException | None) -> None:
     (Python 3.10, or a call that succeeded) the RuntimeWarning is all there
     is, so it goes straight to :func:`warnings.showwarning`, past the
     filters: shown once, like any warning, even where RuntimeWarnings are
-    ignored or turned into errors.
+    ignored or turned into errors. Where ``showwarning`` has been replaced
+    (``logging.captureWarnings``, say, which with no handler shows nothing)
+    the line is also written to stderr.
     """
     if exc is not None and hasattr(exc, "add_note"):
         exc.add_note(note)
@@ -851,14 +853,17 @@ def _report(note: str, exc: BaseException | None) -> None:
         filename, lineno = frame.f_code.co_filename, frame.f_lineno
     except ValueError:
         filename, lineno = __file__, 0
+    # Not the standard library's: it may show nothing, so stderr too.
+    replaced = warnings.showwarning is not getattr(warnings, "_showwarning_orig", None)
     try:
         warnings.showwarning(RuntimeWarning(note), RuntimeWarning, filename, lineno)
     except Exception:  # a replaced showwarning that fails: stderr is what is left
-        if sys.stderr is not None:
-            try:
-                sys.stderr.write(f"RuntimeWarning: {note}\n")
-            except (OSError, ValueError):  # stderr closed: nowhere left to say it
-                pass
+        replaced = True
+    if replaced and sys.stderr is not None:
+        try:
+            sys.stderr.write(f"RuntimeWarning: {note}\n")
+        except (OSError, ValueError):  # stderr closed: nowhere left to say it
+            pass
 
 
 def _make_staging_dir(dest: Path) -> Path:
