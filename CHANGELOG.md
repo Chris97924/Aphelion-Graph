@@ -122,19 +122,30 @@ the record of what a bump would carry.
   (`PX_E_6013`). `unpack`, `check_member_names`,
   `extract_signatures_jsonl`, `extract_signer_manifests`, signature
   validation (`validate_signatures`) and `verify_package` read an archive
-  in `tarfile`'s stream mode, which never goes back. Before reading on
-  from a member, `tarfile` may be handed up to 4,096 bytes past the end of
-  that member's data, for the next member's headers (pax or GNU long-name
-  headers and its own); before the first member, 5,120 bytes, as its
-  headers may take 1,024 bytes more for a global pax header in front of
-  it. Asking for more, or reading on after reaching the end of the
-  archive 8 times, fails before another byte is handed out. So one pass hands `tarfile` at most
-  `max_total_bytes` plus 4,607 bytes per `max_files` member plus 5,120
-  bytes: 150,932,720 bytes at the default policy. A decompressing reader
-  (gzip, bzip2, zstd) may decompress up to `io.DEFAULT_BUFFER_SIZE` (8 KiB,
-  or 128 KiB from Python 3.14) ahead of that. Header bytes are bounded by
-  this per-member allowance; the compression-ratio limit (`PX_E_6012`)
-  counts the members' declared sizes only, as before.
+  in `tarfile`'s stream mode, which never goes back, and keeps no list of
+  the members it has read. Before reading on from a member, `tarfile` may
+  be handed up to H bytes past the end of that member's data, for the next
+  member's headers (pax or GNU long-name headers and its own). H is room
+  for a pax header holding a path of `max_path_length` four-byte UTF-8
+  characters and about 1 KiB of other records, plus the member's own
+  header: the larger of 4,096 bytes and 1,024 bytes plus 4 ×
+  `max_path_length` + 1,024 bytes rounded up to a multiple of 512 (4,096
+  bytes at the default `max_path_length` of 512; 6,144 at 1,000). Before
+  the first member, H + 1,024 bytes, as its headers may take 1,024 bytes
+  more for global pax headers in front of it. A member whose header blocks
+  take more is refused (`PX_E_6013`), so at the default policy so is a
+  member whose pax header holds larger records, such as an extended
+  attribute of about 3 KB or more (`tar --xattrs`). Asking for more, or
+  reading on after reaching the end of the archive 8 times, fails before
+  another byte is handed out. So one pass hands `tarfile` at most
+  `max_total_bytes` plus H + 511 bytes per `max_files` member plus H +
+  1,024 bytes: 150,932,720 bytes at the default policy. A decompressing
+  reader (gzip, bzip2, zstd) may decompress up to `io.DEFAULT_BUFFER_SIZE`
+  (8 KiB, or 128 KiB from Python 3.14) ahead of that. Header bytes are
+  bounded by this per-member allowance; the compression-ratio limit
+  (`PX_E_6012`) counts the members' declared sizes only, as before. The
+  archive must be a seekable file (not a pipe): its first bytes are read
+  to tell its compression, and then it is read from the start.
 - **Each call reads an archive a fixed number of times**, whatever it
   holds: `check_member_names`, `extract_signatures_jsonl`,
   `extract_signer_manifests` and `validate_signatures` once (signature
@@ -147,26 +158,47 @@ the record of what a bump would carry.
   The accessors, signature validation and `verify_package` use the
   default policy. The accessors run `unpack`'s header checks other than
   the name checks, so they too now refuse a link, device or other member
-  type `unpack` refuses (`PX_E_6008`), and an archive whose declared sizes
-  `unpack` refuses.
+  type `unpack` refuses (`PX_E_6008`), more members than `max_files`
+  (`PX_E_6009`), and an archive whose declared sizes `unpack` refuses.
 - **A member that would take a reader further than its size says is
-  refused before its data is read**: a sparse member or any
-  `GNU.sparse.*` key (`PX_E_6008`); a negative size, a size given in a
-  local or global pax header, or a directory with a size (`PX_E_6010`); a
-  member that does not start where the one before it ends, other than
-  after a global pax header (`PX_E_6013`). Where Python's `tarfile` itself
-  stops at a header with a negative size (recent releases), the reader
-  fails with `tarfile.ReadError`. A package never has any of these.
-- **Bytes after the end of the archive**: everything up to 4,096 bytes
-  past the end of the last member must be zeros, else every reader fails
-  with `tarfile.ReadError` ("data after the end of the archive"). Anything
-  further on is not read, as `tar` reads only the first of two archives
-  written one after the other.
+  refused before its data is read**: a sparse member, or one with a
+  `GNU.sparse.*` pax key `tarfile` can parse (`PX_E_6008`); a negative
+  size, in the member's header, in a pax or GNU long-name header before it
+  or in a pax record, and a size given in a local or global pax header
+  (`PX_E_6010`); header blocks that do not lead, size by size, from where
+  the member before ends to the member's own header (`PX_E_6013`). These
+  header blocks are read again from the bytes handed to `tarfile`, so the
+  outcome is the same on every Python release, whether its `tarfile`
+  reports a member with a negative size, skips it, stops there or reads
+  on. A package never has any of these. A directory's size field is
+  ignored, as `tar` and `tarfile` ignore it: no data follows a directory.
+- **What `tarfile` or the decompressor raises for a damaged archive is
+  `tarfile.ReadError`**: anything `tarfile` raises while it parses a member
+  header other than an operating-system error (for example `ValueError`
+  for a `GNU.sparse.*` value it cannot read), and what the decompressor
+  raises for a compressed archive that is damaged or cut short
+  (`EOFError`, `lzma.LZMAError`, `OSError`, `zlib.error`, zstd's
+  `ZstdError`). The refusals above keep their codes. The command line
+  reports `tarfile.ReadError`, like any error without a code of its own,
+  as `PX_E_9001`.
+- **Bytes after the end of the archive**: the H bytes (4,096 at the
+  default policy) after the end of the last member, or after the start of
+  an archive with no members, must be zeros, else every reader fails with
+  `tarfile.ReadError` ("data after the end of the archive") on every
+  Python release. Anything further on is not checked, and once a member
+  has been read it is not read either. So of two archives written one
+  after the other, the second is ignored if it starts more than H bytes
+  after the end of the first one's last member, and the whole is refused
+  if it starts within them.
 - **xz and LZMA-alone archives are decompressed with at most 100,762,596
   bytes of decoder memory**, 1.5 times what the largest xz preset (`-9`,
-  `-9e`) needs; one that needs more fails with `PX_E_6013` before the
-  memory is taken. Concatenated xz streams are read one after another, as
-  `lzma.LZMAFile` reads them.
+  `-9e`) needs (about 67.2 MB; the exact figure depends on the liblzma
+  build); one that needs more fails with `PX_E_6013` before the memory is
+  taken. Concatenated xz streams are read one after another, as
+  `lzma.LZMAFile` reads them. zstd archives (Python 3.14 and later) are
+  decompressed with the library's default limit on the window size, 128
+  MiB, so decoding one may take that much memory; one whose frame needs a
+  larger window fails with `tarfile.ReadError`.
 - **`unpack`, `check_member_names` and the accessors tell a compressed
   archive by its first bytes**, as `tarfile`'s stream mode does: gzip,
   bzip2, xz, zstd (Python 3.14 and later) and LZMA-alone whose header

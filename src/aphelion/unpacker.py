@@ -208,17 +208,32 @@ class MemberNames:
 
 
 # What one pass over an archive may hand to tarfile (see :func:`_members`).
-# Every member may take this many bytes of header blocks (its ustar header
-# and any pax or GNU long-name headers before it) ...
+# Every member may take at least this many bytes of header blocks (its ustar
+# header and any pax or GNU long-name headers before it; see _header_bytes) ...
 _HEADER_BYTES = 4096
 # ... and the first one this many more, for a global pax header before it.
 _GLOBAL_HEADER_BYTES = 1024
+# Header types tarfile reads as extensions of the member header after them.
+_EXTENSION_TYPES = (b"x", b"g", b"X", b"L", b"K")
+# A pax record's length prefix, and the keys tarfile takes as a member's size.
+_PAX_LENGTH = re.compile(rb"([0-9]{1,20}) ")
+_PAX_SIZE_KEYS = (b"size", b"GNU.sparse.size", b"GNU.sparse.realsize")
 # How many reads may find the end of the archive; the next one fails.
 _MAX_EOF_READS = 8
 _READ_CHUNK = 64 * 1024
-# The most memory the xz and LZMA decoder may use: 1.5 times the 67,175,064
-# bytes the largest xz preset (-9 and -9e, a 64 MiB dictionary) needs.
+# The most memory the xz and LZMA decoder may use: 1.5 times what the largest
+# xz preset (-9 and -9e, a 64 MiB dictionary) needs, about 67.2 MB (the exact
+# figure depends on the liblzma build).
 _XZ_MEMLIMIT = 100_762_596
+
+
+def _header_bytes(policy: ExtractPolicy) -> int:
+    """How many bytes of header blocks a member may take: room for a pax
+    header with a path of ``max_path_length`` four-byte UTF-8 characters and
+    about 1 KiB of other records, and the member's own header; at least
+    ``_HEADER_BYTES`` (exactly that at the default ``max_path_length``, 512)."""
+    records = 4 * policy.max_path_length + 1024
+    return max(_HEADER_BYTES, 1024 + -(-records // 512) * 512)
 
 
 def _archive_bomb(msg: str) -> SecurityError:
@@ -233,16 +248,38 @@ class _ForwardReader:
     (``r|``) never seeks the file it reads. ``limit`` is how far tarfile may
     read; a read at ``limit`` fails with ARCHIVE_BOMB without handing out
     anything, and so does a read after ``_MAX_EOF_READS`` have found the end
-    of the archive. ``handed`` counts the bytes handed out and
-    ``last_nonzero`` is where the last non-zero one ends.
+    of the archive. ``handed`` counts the bytes handed out. ``kept`` holds
+    those from ``mark`` on, at most ``window`` of them: the header blocks
+    after the member before, which the checks read again themselves. An
+    error of the decompressor (one of ``errors``) fails with
+    ``tarfile.ReadError``.
     """
 
-    def __init__(self, source: BinaryIO, limit: int) -> None:
+    def __init__(
+        self,
+        source: BinaryIO,
+        window: int,
+        errors: tuple[type[Exception], ...] = (),
+        kind: str = "tar",
+    ) -> None:
         self._source = source
-        self.limit = limit
+        self.limit = window
+        self.window = window
         self.handed = 0
-        self.last_nonzero = 0
+        self.mark = 0
+        self.kept = bytearray()
         self._eof_reads = 0
+        self._errors = errors
+        self._kind = kind
+
+    def advance(self, end: int, limit: int) -> None:
+        """Keep the bytes from ``end`` on, and let tarfile read up to ``limit``."""
+        if end <= self.handed:
+            del self.kept[: end - self.mark]
+        else:
+            self.kept.clear()
+        self.mark = end
+        self.limit = limit
 
     def read(self, size: int | None = -1) -> bytes:
         if size == 0:
@@ -250,13 +287,20 @@ class _ForwardReader:
         if self.handed >= self.limit:
             raise _archive_bomb(
                 f"reading the archive goes past byte {self.limit}: a member's headers "
-                f"take more than {_HEADER_BYTES} bytes, or the archive goes on where "
-                f"its headers say it ends"
+                f"take more than they may, or the archive goes on where its headers "
+                f"say it ends"
             )
         want = self.limit - self.handed
         if size is not None and size > 0:
             want = min(want, size)
-        data = self._source.read(min(want, _READ_CHUNK))
+        try:
+            data = self._source.read(min(want, _READ_CHUNK))
+        except self._errors as exc:
+            if not self.handed:
+                raise tarfile.ReadError(f"not a {self._kind} file") from exc
+            raise tarfile.ReadError(
+                f"the {self._kind} data is damaged or cut short: {exc}"
+            ) from exc
         if not data:
             self._eof_reads += 1
             if self._eof_reads > _MAX_EOF_READS:
@@ -264,10 +308,12 @@ class _ForwardReader:
                     "the archive ends before the data its headers declare"
                 )
             return b""
+        start = self.handed
         self.handed += len(data)
-        kept = len(data.rstrip(b"\0"))
-        if kept:
-            self.last_nonzero = self.handed - len(data) + kept
+        low = max(start, self.mark)
+        high = min(self.handed, self.mark + self.window)
+        if low < high:
+            self.kept += data[low - start : high - start]
         return data
 
 
@@ -338,18 +384,24 @@ def _compression(
     head: bytes,
 ) -> tuple[str, Callable[[BinaryIO], BinaryIO], tuple[type[Exception], ...]]:
     """The compression an archive's leading bytes name (the test tarfile's
-    stream mode uses), how to read such a file, and the errors that, while the
-    first header is read, mean it is not one (as in tarfile's ``gzopen``,
-    ``bz2open``, ``xzopen`` and ``zstopen``). LZMA-alone is recognised only
-    by a header starting ``5d 00 00 80`` (the default properties, and a
-    dictionary of 8 MiB or 8 MiB plus a multiple of 16 MiB), and zstd only
-    from a data frame (not a skippable one) on Python 3.14 and later;
-    anything else is read as an uncompressed tar."""
+    stream mode uses), how to read such a file, and the errors its
+    decompressor raises for data that is not of that kind, damaged or cut
+    short (as in tarfile's ``gzopen``, ``bz2open``, ``xzopen`` and
+    ``zstopen``). LZMA-alone is recognised only by a header starting
+    ``5d 00 00 80`` (the default properties, and a dictionary of 8 MiB or
+    8 MiB plus a multiple of 16 MiB), and zstd only from a data frame (not a
+    skippable one) on Python 3.14 and later; anything else is read as an
+    uncompressed tar."""
     try:
         if head.startswith(b"\x1f\x8b\x08"):
             import gzip
+            import zlib
 
-            return "gzip", lambda raw: gzip.GzipFile(fileobj=raw, mode="rb"), (OSError,)
+            return (
+                "gzip",
+                lambda raw: gzip.GzipFile(fileobj=raw, mode="rb"),
+                (OSError, EOFError, zlib.error),
+            )
         if head[:3] == b"BZh" and head[4:10] == b"1AY&SY":
             import bz2
 
@@ -391,61 +443,187 @@ def _members(
     tarfile reads the archive in stream mode through a
     :class:`_ForwardReader`, so it moves forwards only and never reads a
     byte twice. Before it reads on from member k, it may read up to
-    ``E_k + _HEADER_BYTES``, where ``E_k`` is where member k's data ends
-    (``offset_data`` plus its size padded to a multiple of 512 bytes; a
-    directory has none); before the first member, ``_HEADER_BYTES + _GLOBAL_HEADER_BYTES``.
-    So one pass hands tarfile at most ``max_total_bytes + max_files *
-    (_HEADER_BYTES + 511) + _HEADER_BYTES + _GLOBAL_HEADER_BYTES`` bytes
-    (150,932,720 at the default policy); a decompressing file object may
-    decompress up to ``io.DEFAULT_BUFFER_SIZE`` more ahead of what it hands
-    out.
+    ``E_k + H``, where ``E_k`` is where member k's data ends (``offset_data``
+    plus its size padded to a multiple of 512 bytes; any other member type
+    has no data) and ``H`` is :func:`_header_bytes` (4,096 at the default
+    policy); before the first member, ``H + _GLOBAL_HEADER_BYTES``. So one
+    pass hands tarfile at most ``max_total_bytes + max_files * (H + 511) +
+    H + _GLOBAL_HEADER_BYTES`` bytes (150,932,720 at the default policy); a
+    decompressing file object may decompress up to
+    ``io.DEFAULT_BUFFER_SIZE`` more ahead of what it hands out. tarfile
+    keeps no list of the members it has read.
 
     Refused, before the scan moves past the member: a member type other
-    than a regular file or a directory, a sparse member or any
-    ``GNU.sparse.*`` key, a negative size, a size in a pax header (local or
-    global), a directory with a size, a member that does not start where
-    the one before it ends (only a global pax header may come between), and
-    header blocks longer than ``_HEADER_BYTES`` (the first member's may
-    take up to ``_GLOBAL_HEADER_BYTES`` more for a global pax header before
-    it); with ``check_names``, the names :func:`unpack` refuses; a declared
-    size over ``max_file_bytes``, a total over ``max_total_bytes``, and a
-    declared total over ``max_compression_ratio`` times the archive size
-    (for an archive that is a regular file; another kind of file reports no
-    size, and there only the other limits apply). The ratio counts declared
+    than a regular file or a directory, a sparse member or a
+    ``GNU.sparse.*`` key tarfile can parse, a negative size (in the
+    member's header, a header before it or a pax record), a size in a pax
+    header (local or global), header blocks that do not lead, size by size,
+    from where the member before ends to the member's own header, and
+    header blocks longer than ``H`` (the first member's may take up to
+    ``_GLOBAL_HEADER_BYTES`` more for global pax headers before it); with
+    ``check_names``, the names :func:`unpack` refuses; a declared size over
+    ``max_file_bytes``, a total over ``max_total_bytes``, and a declared
+    total over ``max_compression_ratio`` times the archive size (for an
+    archive that is a regular file; for another kind of file the size is
+    not known and the ratio is not checked). The ratio counts declared
     member data only; header bytes are bounded by the per-member allowance
-    above. After the last member, everything up to ``_HEADER_BYTES`` past
-    its end must be zeros, else ``tarfile.ReadError`` is raised.
+    above. A directory's size is ignored, as tarfile ignores it. After the
+    last member (or from the start, if there is none), the ``H`` bytes
+    past its end must be zeros, else ``tarfile.ReadError`` is raised;
+    nothing further on is looked at. Anything else tarfile raises while it
+    parses a header (other than an operating-system error), and any error
+    of the decompressor, is ``tarfile.ReadError`` too; a refusal of these
+    checks raised while tarfile reads keeps its code.
+
+    The archive must be a seekable file: its first bytes are read to tell
+    its compression, and then it is read from the start.
     """
+    header_bytes = _header_bytes(policy)
     with open(archive, "rb") as raw:
         st = os.fstat(raw.fileno())
         compressed = st.st_size if stat.S_ISREG(st.st_mode) else 0
-        kind, open_source, not_this_kind = _compression(raw.read(10))
+        kind, open_source, errors = _compression(raw.read(10))
         raw.seek(0)
         with closing(open_source(raw)) as source:
-            reader = _ForwardReader(source, _HEADER_BYTES + _GLOBAL_HEADER_BYTES)
-            try:
-                # tarfile asks for up to _READ_CHUNK bytes at a time; the
-                # reader still hands out nothing past its limit.
-                tar = tarfile.open(fileobj=reader, mode="r|", bufsize=_READ_CHUNK)
-            except not_this_kind as exc:
-                raise tarfile.ReadError(f"not a {kind} file") from exc
+            reader = _ForwardReader(source, header_bytes + _GLOBAL_HEADER_BYTES, errors, kind)
+            # tarfile asks for up to _READ_CHUNK bytes at a time; the reader
+            # still hands out nothing past its limit. Stream mode keeps no
+            # list of the members it has read (from Python 3.13 by asking it
+            # not to; before, the list is emptied after each member).
+            options = {"stream": True} if sys.version_info >= (3, 13) else {}
+            tar = _parsing(
+                reader,
+                lambda: tarfile.open(fileobj=reader, mode="r|", bufsize=_READ_CHUNK, **options),
+            )
             found: list[_Member] = []
             with tar:
                 try:
                     end = yield from _checked_members(
-                        tar, reader, policy, compressed, check_names, found
+                        tar, reader, policy, header_bytes, compressed, check_names, found
                     )
                 except tarfile.StreamError:
                     # Python 3.10 reads past an archive of zero blocks only
-                    # by seeking back before its start: an empty archive.
-                    if found or reader.last_nonzero or not reader.handed:
+                    # by seeking back before its start: no members, and what
+                    # follows them is checked below as on later releases.
+                    if found or not reader.handed:
                         raise
                     end = 0
-            stop = end + _HEADER_BYTES
+            stop = end + header_bytes
             while reader.handed < stop and reader.read(stop - reader.handed):
                 pass
-            if reader.last_nonzero > end:
+            if reader.kept[:header_bytes].rstrip(b"\0"):
+                _refuse_negative_size(reader)
                 raise tarfile.ReadError("data after the end of the archive")
+
+
+def _parsing(reader: _ForwardReader, call: Callable[[], Any]) -> Any:
+    """Run a tarfile call that reads member headers. A refusal of ours
+    passes through, and anything else tarfile raises while it parses a
+    header (other than an operating-system error) is ``tarfile.ReadError``.
+    If the header blocks after the last member declare a negative size,
+    which tarfile, depending on the release, stops at, reads wrongly or
+    reports, the refusal is FILE_BYTES_EXCEEDED on every release."""
+    try:
+        return call()
+    except SecurityError as exc:
+        if exc.code == ErrorCode.ARCHIVE_BOMB:
+            _refuse_negative_size(reader)
+        raise
+    except tarfile.TarError:
+        _refuse_negative_size(reader)
+        raise
+    except (OSError, MemoryError):
+        raise
+    except Exception as exc:
+        _refuse_negative_size(reader)
+        raise tarfile.ReadError(
+            f"cannot read a member header: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _number(field: bytes) -> int | None:
+    """A numeric header field as tarfile reads it (octal, or base-256 after
+    a 0x80 or 0xff byte); None if it is not a number."""
+    if field[0] in (0x80, 0xFF):
+        value = int.from_bytes(field[1:], "big")
+        return value - (1 << (8 * len(field) - 8)) if field[0] == 0xFF else value
+    try:
+        return int(field.split(b"\0", 1)[0].decode("ascii").strip() or "0", 8)
+    except ValueError:
+        return None
+
+
+def _size_field(block: bytes) -> int | None:
+    """A header block's size, if its checksum is right, as tarfile reads them."""
+    stored = _number(block[148:156])
+    rest = block[:148] + b" " * 8 + block[156:512]
+    if stored not in (sum(rest), sum(b - 256 if b > 127 else b for b in rest)):
+        return None
+    return _number(block[124:136])
+
+
+def _pax_sizes(data: bytes) -> Iterator[int]:
+    """The sizes a pax header's records give (``size``, ``GNU.sparse.size``
+    and ``GNU.sparse.realsize``, which tarfile takes as the member's size),
+    read as tarfile reads its records; up to the first it cannot read."""
+    if b"size=" not in data:
+        return
+    pos = 0
+    while pos < len(data) and data[pos]:
+        match = _PAX_LENGTH.match(data, pos)
+        if match is None:
+            return
+        length = int(match.group(1))
+        record = data[pos : pos + length]
+        if length < len(match.group(0)) or len(record) < length or record[-1:] != b"\n":
+            return
+        key, _, value = record[len(match.group(0)) : -1].partition(b"=")
+        if key in _PAX_SIZE_KEYS:
+            try:
+                yield int(value)
+            except ValueError:
+                pass
+        pos += length
+
+
+def _header_chain(blocks: bytes, start: int, *, records: bool = False) -> tuple[int, int]:
+    """Walk the pax and GNU long-name headers at the start of ``blocks``
+    (bytes read from archive offset ``start``), each followed by its data as
+    its size says, up to the first block that is not such a header. Returns
+    where that block starts and how many bytes the global pax headers on the
+    way take. A negative size on the way, in a header (the last block
+    included) or, with ``records``, in a pax record, is refused
+    (FILE_BYTES_EXCEEDED): tarfile, depending on the release, stops at it,
+    skips the member, reads past it wrongly, or reports it. (Where tarfile
+    reports the member after them, a pax record's size is its size.)"""
+    pos = 0
+    global_bytes = 0
+    while pos + 512 <= len(blocks):
+        block = blocks[pos : pos + 512]
+        size = _size_field(block)
+        if size is None:
+            break
+        declared = size
+        if records and size >= 0 and block[156:157] in (b"x", b"X", b"g"):
+            declared = min([size, *_pax_sizes(blocks[pos + 512 : pos + 512 + size])])
+        if declared < 0:
+            raise SecurityError(
+                code=ErrorCode.FILE_BYTES_EXCEEDED,
+                msg=f"a header at byte {start + pos} declares a negative size {declared}",
+            )
+        if block[156:157] not in _EXTENSION_TYPES:
+            break
+        step = 512 + -(-size // 512) * 512
+        if block[156:157] == b"g":
+            global_bytes += step
+        pos += step
+    return pos, global_bytes
+
+
+def _refuse_negative_size(reader: _ForwardReader) -> None:
+    """Refuse (FILE_BYTES_EXCEEDED) if the header blocks tarfile reads from
+    where the last member ends declare a negative size."""
+    _header_chain(bytes(reader.kept), reader.mark, records=True)
 
 
 def _scan(
@@ -470,6 +648,7 @@ def _checked_members(
     tar: tarfile.TarFile,
     reader: _ForwardReader,
     policy: ExtractPolicy,
+    header_bytes: int,
     compressed: int,
     check_names: bool,
     members: list[_Member],
@@ -479,7 +658,9 @@ def _checked_members(
     declared = 0
     end = 0
     while True:
-        member = tar.next()
+        if isinstance(getattr(tar, "members", None), list):
+            tar.members.clear()  # stream mode never looks a member up again
+        member = _parsing(reader, tar.next)
         if member is None:
             return end
         if len(members) >= policy.max_files:
@@ -487,7 +668,7 @@ def _checked_members(
                 code=ErrorCode.FILE_COUNT_EXCEEDED,
                 msg=f"archive exceeds {policy.max_files} files",
             )
-        _check_extent(member, end, first=not members)
+        _check_extent(member, end, reader.kept, header_bytes, first=not members)
         rel = _check_name(member, policy, names) if check_names else ""
         if member.isreg():
             label = rel if check_names else member.name
@@ -517,16 +698,41 @@ def _checked_members(
                 )
         stored = -(-member.size // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE if member.isreg() else 0
         end = member.offset_data + stored
-        reader.limit = end + _HEADER_BYTES
+        reader.advance(end, end + header_bytes)
         record = _Member(member.name, member.type, member.size, member.offset, rel)
         members.append(record)
         yield tar, member, record
 
 
-def _check_extent(member: tarfile.TarInfo, end: int, *, first: bool) -> None:
+def _check_extent(
+    member: tarfile.TarInfo,
+    end: int,
+    kept: bytearray,
+    header_bytes: int,
+    *,
+    first: bool,
+) -> None:
     """Refuse a member whose extent in the archive tarfile might see
-    differently from its header, or that does not start where the member
-    before it ends (``end``)."""
+    differently from its header, or whose header blocks do not follow on
+    from where the member before it ends (``end``). ``kept`` holds the bytes
+    from ``end`` on, so the header blocks are read again here, whatever the
+    tarfile release made of them."""
+    if member.size < 0:
+        raise SecurityError(
+            code=ErrorCode.FILE_BYTES_EXCEEDED,
+            msg=f"member {member.name!r} declares a negative size {member.size}",
+            path=member.name,
+        )
+    headers = member.offset_data - end
+    chain = bytes(kept[: max(headers, 0)])
+    own, global_bytes = _header_chain(chain, end)
+    # The header blocks from ``end`` must lead, size by size, to the member's
+    # own header, so every release reads them as they are. If they do not,
+    # tarfile may have skipped a member whose pax records give it a
+    # negative size.
+    leads = member.offset >= end and headers <= len(kept) and own == headers - 512
+    if not leads:
+        _header_chain(chain, end, records=True)
     # Reject disallowed member types BEFORE path checks to catch hardlinks
     # whose link target points outside dest (member.isfile() would NOT catch these).
     if not (member.isreg() or member.isdir()):
@@ -538,17 +744,12 @@ def _check_extent(member: tarfile.TarInfo, end: int, *, first: bool) -> None:
             ),
             path=member.name,
         )
-    # pax_headers holds the global pax keys as well as the member's own.
+    # Sparse data (and the sparse map blocks after the header) is not part of
+    # the format. pax_headers holds the global pax keys as well as the member's own.
     if member.issparse() or any(k.startswith("GNU.sparse.") for k in member.pax_headers):
         raise SecurityError(
             code=ErrorCode.DISALLOWED_MEMBER_TYPE,
             msg=f"sparse member {member.name!r} (sparse files are not part of the format)",
-            path=member.name,
-        )
-    if member.size < 0:
-        raise SecurityError(
-            code=ErrorCode.FILE_BYTES_EXCEEDED,
-            msg=f"member {member.name!r} declares a negative size {member.size}",
             path=member.name,
         )
     if "size" in member.pax_headers:
@@ -557,23 +758,16 @@ def _check_extent(member: tarfile.TarInfo, end: int, *, first: bool) -> None:
             msg=f"member {member.name!r} has its size in a pax header",
             path=member.name,
         )
-    if member.isdir() and member.size:
-        raise SecurityError(
-            code=ErrorCode.FILE_BYTES_EXCEEDED,
-            msg=f"directory member {member.name!r} declares size {member.size}",
-            path=member.name,
-        )
-    gap = member.offset - end
-    if gap < 0 or (gap and not member.pax_headers):
+    if not leads:
         raise _archive_bomb(
-            f"member {member.name!r} starts at byte {member.offset}, not where the "
-            f"member before it ends (byte {end})"
+            f"the header blocks from byte {end} do not lead to the header of "
+            f"member {member.name!r}"
         )
-    allowance = _HEADER_BYTES + (min(gap, _GLOBAL_HEADER_BYTES) if first else 0)
-    if member.offset_data - end > allowance:
+    allowance = header_bytes + (min(global_bytes, _GLOBAL_HEADER_BYTES) if first else 0)
+    if headers > allowance:
         raise _archive_bomb(
-            f"the headers of member {member.name!r} take {member.offset_data - end} "
-            f"bytes, more than {allowance}"
+            f"the headers of member {member.name!r} take {headers} bytes, more than "
+            f"{allowance}"
         )
 
 

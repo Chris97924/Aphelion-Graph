@@ -45,6 +45,7 @@ from aphelion.errors import SecurityError
 from aphelion.unpacker import ExtractPolicy, unpack
 from aphelion.unpacker import _GLOBAL_HEADER_BYTES as GLOBAL_HEADER_BYTES
 from aphelion.unpacker import _HEADER_BYTES as HEADER_BYTES
+from aphelion.unpacker import _header_bytes
 
 
 def _write_tar(
@@ -463,16 +464,6 @@ def _negative_size_chain(jumps: int, filler: int) -> bytes:
     return _raw_header(b"a.bin", data_len) + bytes(body) + chain + bytes(1024)
 
 
-def _tarfile_reports_negative_sizes() -> bool:
-    """Whether this Python's tarfile hands out a member with a negative size
-    rather than stopping at its header."""
-    raw = _raw_header(b"a", 0) + _raw_header(b"n", -1024) + bytes(1024)
-    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tar:
-        tar.next()
-        member = tar.next()
-    return member is not None and member.size < 0
-
-
 @pytest.mark.parametrize("via", ["unpack", "check_member_names"])
 @pytest.mark.parametrize(
     "pax",
@@ -637,10 +628,11 @@ def passes(monkeypatch: pytest.MonkeyPatch) -> list:
 
 def _pass_limit(policy: ExtractPolicy) -> int:
     """The most one pass may hand tarfile under ``policy``."""
+    header_bytes = _header_bytes(policy)
     return (
         policy.max_total_bytes
-        + policy.max_files * (HEADER_BYTES + 511)
-        + HEADER_BYTES
+        + policy.max_files * (header_bytes + 511)
+        + header_bytes
         + GLOBAL_HEADER_BYTES
     )
 
@@ -715,7 +707,6 @@ def _entries(archive: Path, dest: Path, policy: ExtractPolicy) -> dict[str, Call
 
 
 MIB = 1024 * 1024
-NEGATIVE = "negative"  # PX_E_6010 where tarfile reports the size, else ReadError
 
 
 def _bounded_cases() -> list:
@@ -746,11 +737,12 @@ def _bounded_cases() -> list:
         ),
         pytest.param(
             lambda: _file(b"a.md", b"a" * 5) + _raw_header(b"n.md", -512) + bytes(10240),
-            "gz", None, NEGATIVE, 1024 + HEADER_BYTES, every,
+            "gz", None, ErrorCode.FILE_BYTES_EXCEEDED, 1024 + HEADER_BYTES, every,
             id="T5-negative-size-back-to-its-own-header",
         ),
         pytest.param(
-            lambda: _negative_size_chain(50, 256 * 1024), "gz", None, NEGATIVE,
+            lambda: _negative_size_chain(50, 256 * 1024), "gz", None,
+            ErrorCode.FILE_BYTES_EXCEEDED,
             512 * 51 + 256 * 1024 + HEADER_BYTES, every,
             id="T6-negative-size-hides-members",
         ),
@@ -776,10 +768,6 @@ def _bounded_cases() -> list:
             lambda: _file(b"a.md", b"a") + b"\x01" * 512 + _file(b"b.md", b"b") + END,
             "tar", None, "ReadError", 1024 + HEADER_BYTES, every,
             id="T13-damaged-header-between-members",
-        ),
-        pytest.param(
-            lambda: _raw_header(b"d", 1024, b"5") + bytes(1024) + END, "tar", None,
-            ErrorCode.FILE_BYTES_EXCEEDED, 2560, every, id="T14-directory-with-a-size",
         ),
         *[
             pytest.param(
@@ -830,19 +818,12 @@ def test_a_pass_over_an_archive_hands_tarfile_a_bounded_number_of_bytes(
 ) -> None:
     """All platforms and Python versions: each archive is refused the same
     way, with tarfile handed at most ``limit`` bytes in every pass, whatever
-    the headers declare. A negative size is refused with PX_E_6010 where
-    tarfile reports it, and where tarfile stops at that header the data
-    after the end of the archive fails with tarfile.ReadError. Nothing is
-    left in the destination."""
+    the headers declare. A negative size is refused with PX_E_6010 whether
+    tarfile reports it or stops at its header. Nothing is left in the
+    destination."""
     archive = tmp_path / f"a.tar.{fmt}"
     archive.write_bytes(_compress(build(), fmt))
     policy = policy or ExtractPolicy.default()
-    if expected == NEGATIVE:
-        expected = (
-            str(ErrorCode.FILE_BYTES_EXCEEDED)
-            if _tarfile_reports_negative_sizes()
-            else "ReadError"
-        )
     calls = _entries(archive, tmp_path / "dest", policy)
     for entry in entries:
         passes.clear()
@@ -1052,11 +1033,9 @@ def test_negative_member_size_is_refused_before_tarfile_moves_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, via: str
 ) -> None:
     """All platforms and Python versions: a negative size would make tarfile
-    move backwards, which its stream mode cannot. Where tarfile reports such
-    a member it is refused (PX_E_6010) before tarfile moves; where tarfile
-    stops at its header, the members it would have hidden are data after
-    the end of the archive (tarfile.ReadError). Either way what is
-    decompressed stays under 1 MiB for a 0.3 MB archive."""
+    move backwards, which its stream mode cannot. It is refused (PX_E_6010)
+    whether tarfile reports such a member or stops at its header, and what
+    is decompressed stays under 1 MiB for a 0.3 MB archive."""
     from aphelion.unpacker import check_member_names
 
     archive = tmp_path / "a.tar.gz"
@@ -1072,10 +1051,7 @@ def test_negative_member_size_is_refused_before_tarfile_moves_back(
     monkeypatch.undo()
 
     assert decompressed < 1024 * 1024, decompressed
-    if _tarfile_reports_negative_sizes():
-        assert outcome == str(ErrorCode.FILE_BYTES_EXCEEDED)
-    else:
-        assert outcome == "ReadError"
+    assert outcome == str(ErrorCode.FILE_BYTES_EXCEEDED)
 
 
 @pytest.mark.parametrize("fmt", ["gz", "bz2", "xz"])
@@ -1101,12 +1077,253 @@ def test_accessors_refuse_a_member_whose_size_leads_back_to_its_own_header(
     finally:
         tracemalloc.stop()
     assert peak < 16 * MIB, peak
-    if _tarfile_reports_negative_sizes():
-        assert outcome == str(ErrorCode.FILE_BYTES_EXCEEDED)
-    else:
-        assert outcome == "ReadError"
+    assert outcome == str(ErrorCode.FILE_BYTES_EXCEEDED)
     assert len(passes) == 1
     assert passes[0].handed <= len(raw)
+
+
+def _negative_size_before(kind: bytes) -> bytes:
+    """a.md, then a pax (``x``) or GNU long-name (``L``) header declaring a
+    negative size, its data, the header of hidden.md, and z's header, which
+    starts 512 or 2,560 bytes before byte 5,120: up to there tarfile may
+    read before a.md's headers are checked. A tarfile that reads a negative
+    size as "all but that many of the bytes it holds" takes z for the next
+    header and never reports hidden.md."""
+    if kind == b"x":
+        middle = (
+            _raw_header(b"././@PaxHeader", -512, b"x")
+            + _padded(_pax_record("path", "b.md"))
+            + _file(b"hidden.md", b"h" * 2048)
+        )
+    else:
+        middle = (
+            _raw_header(b"././@LongLink", -2560, b"L")
+            + _padded(b"b.md")
+            + _raw_header(b"hidden.md", 0)
+        )
+    return _file(b"a.md", b"a") + middle + _raw_header(b"z", 0) + bytes(10240)
+
+
+@pytest.mark.parametrize("fmt", ["tar", "gz"])
+@pytest.mark.parametrize("kind", [b"x", b"L"], ids=["pax-header", "long-name"])
+def test_a_negative_size_in_the_headers_before_a_member_is_refused_on_every_release(
+    tmp_path: Path, passes: list, kind: bytes, fmt: str
+) -> None:
+    """All platforms and Python versions: a pax or GNU long-name header
+    declaring a negative size is refused (PX_E_6010) by every entry point,
+    whether this release's tarfile stops at it or reads on to a later
+    header. The header blocks before a member are read again from the
+    bytes handed to tarfile, so the outcome does not depend on what tarfile
+    made of them."""
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compress(_negative_size_before(kind), fmt))
+    for entry, call in _entries(archive, tmp_path / "dest", ExtractPolicy.default()).items():
+        passes.clear()
+        assert _outcome(call) == str(ErrorCode.FILE_BYTES_EXCEEDED), entry
+        assert all(reader.handed <= FIRST_LIMIT for reader in passes), entry
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
+@pytest.mark.parametrize(
+    "records",
+    [{"size": "-512"}, {"size": "x", "GNU.sparse.size": "-512"}, {"GNU.sparse.realsize": "-1"}],
+    ids=["size", "sparse-size-after-an-unreadable-size", "sparse-realsize"],
+)
+def test_a_negative_size_in_a_pax_record_is_refused_on_every_release(
+    tmp_path: Path, records: dict[str, str]
+) -> None:
+    """All platforms and Python versions: a pax record giving a member a
+    negative size is refused (PX_E_6010) by every entry point, whether this
+    release's tarfile reports the member, skips it or stops there."""
+    raw = (
+        _pax(records) + _file(b"a.md", b"a" * 600) + _raw_header(b"d", 0, b"5")
+        + _file(b"b.md", b"b") + END
+    )
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(raw)
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
+        calls, str(ErrorCode.FILE_BYTES_EXCEEDED)
+    )
+
+
+@pytest.mark.parametrize(
+    "max_path_length, path",
+    [(4000, "a" * 3500), (1000, "\U0001d11e" * 1000)],
+    ids=["4000-ascii-3500", "1000-four-byte-1000"],
+)
+def test_header_allowance_grows_with_the_longest_path_the_policy_allows(
+    tmp_path: Path, passes: list, max_path_length: int, path: str
+) -> None:
+    """All platforms: under a policy allowing paths longer than 512
+    characters, a member whose pax header holds such a path and about 1 KiB
+    of other records passes the header checks; a member whose header blocks
+    take one block more than the allowance is refused (PX_E_6013)."""
+    from aphelion.unpacker import check_member_names
+
+    policy = ExtractPolicy(max_path_length=max_path_length)
+    allowance = _header_bytes(policy)
+    assert allowance > HEADER_BYTES
+    member = _pax({"path": path, "comment": "c" * 990}) + _file(b"x", b"x")
+    assert len(member) - 512 <= allowance
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(gzip.compress(_file(b"a.md", b"a") + member + END, mtime=0))
+    check_member_names(archive, policy)
+
+    over = _pax_blocks((allowance - 1024) // 512 + 1) + _file(b"b.md", b"b")
+    archive.write_bytes(gzip.compress(_file(b"a.md", b"a") + over + END, mtime=0))
+    passes.clear()
+    with pytest.raises(SecurityError) as exc:
+        check_member_names(archive, policy)
+    assert exc.value.code == ErrorCode.ARCHIVE_BOMB
+    assert [reader.handed <= 1024 + allowance for reader in passes] == [True]
+
+
+@pytest.mark.parametrize(
+    "pax",
+    [
+        {"GNU.sparse.map": "x"},
+        {"GNU.sparse.size": "x"},
+        {"GNU.sparse.realsize": "x"},
+        {"GNU.sparse.major": "1", "GNU.sparse.minor": "0"},
+    ],
+    ids=["map", "size", "realsize", "1.0-map"],
+)
+def test_sparse_keys_tarfile_cannot_parse_are_a_read_error(
+    tmp_path: Path, pax: dict[str, str]
+) -> None:
+    """All platforms and Python versions: GNU sparse keys whose values
+    tarfile cannot parse make it fail inside its header parsing (with
+    ValueError); every entry point reports that as tarfile.ReadError. Keys
+    it can parse are refused as sparse (PX_E_6008), and a refusal of the
+    header checks raised while tarfile reads keeps its code."""
+    raw = _pax(pax) + _file(b"a.md", b"zz") + END
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(raw)
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
+        calls, "ReadError"
+    )
+    archive.write_bytes(_pax({"GNU.sparse.size": "2"}) + _file(b"a.md", b"zz") + END)
+    assert {_outcome(call) for call in calls.values()} == {str(ErrorCode.DISALLOWED_MEMBER_TYPE)}
+    archive.write_bytes(_pax({"GNU.sparse.map": "x", "comment": "x" * 8000}) + raw)
+    assert {_outcome(call) for call in calls.values()} == {str(ErrorCode.ARCHIVE_BOMB)}
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
+@pytest.mark.parametrize(
+    "body, ok",
+    [
+        (bytes(1024) + b"\x01" * 512, False),
+        (bytes(4095) + b"\x01" + bytes(512), False),
+        (bytes(4096) + b"\x01" * 512, True),
+        (_file(b"a.md", b"a") + bytes(4095) + b"\x01", False),
+        (_file(b"a.md", b"a") + bytes(4096) + b"\x01" * 512, True),
+    ],
+    ids=["zero-blocks-then-data", "no-member-byte-4095", "no-member-byte-4096",
+         "after-a-member-byte-4095", "after-a-member-byte-4096"],
+)
+def test_only_the_allowance_after_the_last_member_is_checked_for_data(
+    tmp_path: Path, body: bytes, ok: bool
+) -> None:
+    """All platforms and Python versions: a non-zero byte within 4,096
+    bytes after the end of the last member (or of the archive's start, if
+    it has none) is data after the end of the archive (tarfile.ReadError,
+    also on Python 3.10, whose tarfile reads past leading zero blocks by
+    seeking back); one further on is not looked at."""
+    from aphelion.unpacker import check_member_names, extract_signer_manifests
+
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(body)
+    for call in (lambda: check_member_names(archive), lambda: extract_signer_manifests(archive)):
+        if ok:
+            call()
+        else:
+            with pytest.raises(tarfile.ReadError, match="after the end"):
+                call()
+
+
+def test_directory_with_a_size_is_read_as_a_directory(tmp_path: Path, passes: list) -> None:
+    """All platforms and Python versions: a directory member's size is not
+    the size of any data after it (tarfile reads the next header right
+    after it, as tar does), so a directory declaring 4,096 bytes, followed
+    by a file, unpacks to that directory and file."""
+    raw = _raw_header(b"d", 4096, b"5") + _file(b"d/a.md", b"a") + END
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(raw)
+    dest = unpack(archive, tmp_path / "dest")
+    assert sorted(str(p.relative_to(dest).as_posix()) for p in dest.rglob("*")) == ["d", "d/a.md"]
+    assert (dest / "d" / "a.md").read_bytes() == b"a"
+    assert all(reader.handed <= len(raw) for reader in passes)
+
+
+@pytest.mark.parametrize(
+    "before",
+    [
+        _raw_header(b"././@PaxHeader", 0, b"g"),
+        _raw_header(b"././@PaxHeader", 0, b"g") + _pax_blocks(6),
+    ],
+    ids=["empty-global-header", "empty-global-header-and-4096"],
+)
+def test_empty_global_pax_header_before_the_first_member(tmp_path: Path, before: bytes) -> None:
+    """All platforms and Python versions: a global pax header with no
+    records before the first member is read as there, and its 512 bytes
+    count towards the first member's extra allowance."""
+    from aphelion.unpacker import check_member_names
+
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(before + _file(b"a.md", b"a") + END)
+    check_member_names(archive)
+    assert unpack(archive, tmp_path / "dest").joinpath("a.md").read_bytes() == b"a"
+
+
+def test_a_pass_keeps_no_member_it_has_moved_past(tmp_path: Path) -> None:
+    """All platforms and Python versions: a pass keeps no list of the
+    members tarfile has read, so 1,000 members whose pax headers each hold
+    300 records (tens of kilobytes each once parsed) are checked in a few
+    MiB of memory."""
+    import tracemalloc
+
+    from aphelion.unpacker import check_member_names
+
+    pax = _pax({f"k{j:03d}": "1" for j in range(300)})
+    assert len(pax) + 512 == HEADER_BYTES
+    raw = b"".join(pax + _raw_header(b"m%04d" % i, 0) for i in range(1000)) + END
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(gzip.compress(raw, mtime=0))
+    tracemalloc.start()
+    try:
+        check_member_names(archive)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * MIB, peak
+
+
+def _damaged(fmt: str, how: str) -> bytes:
+    raw = _tar_bytes([("a.md", random.Random(9).randbytes(20_000)), ("b.md", b"b")])
+    data = bytearray(_compressed(raw, fmt))
+    if how == "cut":
+        return bytes(data[: len(data) // 2])
+    data[len(data) // 2] ^= 0x55
+    return bytes(data)
+
+
+@pytest.mark.parametrize(
+    "fmt, how",
+    [("gz", "cut"), ("xz", "flip"), ("xz", "cut"), ("bz2", "cut"), ("zst", "cut")],
+)
+def test_damaged_compressed_archive_is_a_read_error(tmp_path: Path, fmt: str, how: str) -> None:
+    """All platforms: whatever the decompressor raises for a compressed
+    archive that is damaged or cut short (EOFError, LZMAError, OSError,
+    ZstdError) every entry point reports as tarfile.ReadError."""
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_damaged(fmt, how))
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
+        calls, "ReadError"
+    )
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
 
 
 @pytest.mark.parametrize("kind", ["one-byte-files", "empty-files", "directories"])
