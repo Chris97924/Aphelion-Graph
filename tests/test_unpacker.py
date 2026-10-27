@@ -1288,8 +1288,10 @@ def test_member_reaching_an_earlier_member_in_dest_is_refused(
 ) -> None:
     """Windows only (8.3 short names): a member spelled like a short name,
     extracted before the long name that will get that short name, is its own
-    file in staging but the same file in dest. The merge refuses it and puts
-    dest back, instead of replacing the long-named file with it."""
+    file in staging but the same file in dest. It is refused, instead of
+    replacing the long-named file: before anything moves when that file is
+    already in dest, and otherwise during the merge (which gives the long
+    name the short name), which is then undone."""
     short = _short_alias(tmp_path, "longfilename.txt", directory=False)
     archive = _write_tar(
         tmp_path / "a.tar", [(_reg(short), b"other"), (_reg("longfilename.txt"), b"signed")]
@@ -1305,7 +1307,82 @@ def test_member_reaching_an_earlier_member_in_dest_is_refused(
         unpack(archive, dest)
 
     assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
-    assert "already put in place" in str(exc.value)
+    assert "filesystem alias" in str(exc.value)
+    assert _tree(dest) == before
+
+
+@WINDOWS_83
+@pytest.mark.parametrize("layout", ["files", "explicit-directories"])
+def test_members_reaching_one_directory_in_dest_are_refused_before_anything_moves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    """Windows only (8.3 short names): two members, one spelled as the short
+    name of a directory already in dest and one as its long name, are two
+    directories in staging but one in dest. They are refused before
+    anything in dest changes, instead of being merged into one directory."""
+    dest = tmp_path / "dest"
+    (dest / "longdirectoryname").mkdir(parents=True)
+    (dest / "longdirectoryname" / "old.md").write_bytes(b"old")
+    short = _short_name(dest / "longdirectoryname")
+    if short is None:
+        pytest.skip("this volume does not generate 8.3 short names")
+    if layout == "files":
+        members = [(_reg(f"{short}/a.md"), b"a"), (_reg("longdirectoryname/b.md"), b"b")]
+    else:
+        members = [(_dir(short), None), (_dir("longdirectoryname"), None)]
+    archive = _write_tar(tmp_path / "a.tar", members)
+    before = _tree(dest)
+
+    steps, exc, _ = _run_steps(monkeypatch, functools.partial(unpack, archive, dest), {})
+
+    assert isinstance(exc, SecurityError)
+    assert exc.code == ErrorCode.DUPLICATE_MEMBER_PATH
+    assert "filesystem alias" in str(exc)
+    assert [s for s in steps if ".unpacking-" not in s] == []  # nothing outside staging
+    assert _tree(dest) == before
+
+
+def test_existing_entries_are_refused_where_the_filesystem_reports_no_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms (simulated): where the filesystem reports inode number 0,
+    whether two members reach one entry in dest cannot be checked, so an
+    unpack that would replace or merge into an existing entry fails closed;
+    one that only adds new entries still works."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "keep.md").write_bytes(b"keep")
+    inside = os.path.normcase(str(dest.resolve()))
+    real_lstat = os.lstat
+
+    class NoIdentity:
+        st_ino = 0
+
+        def __init__(self, st: os.stat_result) -> None:
+            self._st = st
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._st, name)
+
+    def lstat(path: str, *args: object, **kwargs: object) -> object:
+        st = real_lstat(path, *args, **kwargs)
+        name = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if not kwargs.get("dir_fd") and name.startswith(inside) and ".unpacking-" not in name:
+            return NoIdentity(st)
+        return st
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+    unpack(_write_tar(tmp_path / "new.tar", [(_reg("new.md"), b"new")]), dest)
+    assert _tree(dest) == {"keep.md": b"keep", "new.md": b"new"}
+
+    before = _tree(dest)
+    with pytest.raises(SecurityError) as exc:
+        unpack(_write_tar(tmp_path / "old.tar", [(_reg("keep.md"), b"other")]), dest)
+    monkeypatch.undo()
+
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+    assert "no file identity" in str(exc.value)
     assert _tree(dest) == before
 
 

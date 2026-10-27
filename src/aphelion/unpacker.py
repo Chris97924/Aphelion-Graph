@@ -300,6 +300,13 @@ def unpack(
     ``dest_dir`` a directory, a link or anything else, or the archive a
     directory and ``dest_dir`` anything but a real directory, the unpack is
     refused before anything moves, and again if that changes meanwhile.
+    Two members that reach one entry already in ``dest_dir`` (by its 8.3
+    short name, say) are refused before anything moves; an alias the merge
+    itself creates (Windows gives a new file or directory a short name
+    another member spells) is found during the merge, which is then undone.
+    Where the filesystem reports no file identity (inode number 0) that
+    check cannot run, so an entry the archive would replace or merge into
+    is refused.
 
     After any exception, an interrupt such as KeyboardInterrupt included,
     the contents of ``dest_dir`` are as they were (its own timestamps may
@@ -440,6 +447,8 @@ class _Replacement:
         if st is not None:
             _check_replaceable(st, target, is_dir=True)
             self._refuse_placed(st, target)
+            # Merged into, so a later member must not reach it by another name.
+            self._placed[_identity(st, target)] = target
             return
         self._log.append((None, target, None))
         try:
@@ -483,9 +492,8 @@ class _Replacement:
     def _refuse_placed(self, st: os.stat_result, target: Path) -> None:
         # Two entries distinct in staging can still name one entry here: the
         # 8.3 short name Windows gives the first may be the second's name.
-        # Found by identity, whatever the names look like (an inode number of
-        # 0 means the filesystem has none to compare).
-        other = self._placed.get((st.st_dev, st.st_ino)) if st.st_ino else None
+        # Found by identity, whatever the names look like.
+        other = self._placed.get(_identity(st, target))
         if other is not None:
             raise SecurityError(
                 code=ErrorCode.DUPLICATE_MEMBER_PATH,
@@ -712,6 +720,7 @@ def _move_into_place(staging: Path, dest: Path, backup: Path | None) -> None:
         return
     entries = _staged(staging, backup)
     # Check every target first so a conflict cannot leave a half-moved tree.
+    existing: dict[tuple[int, int], Path] = {}
     for rel, is_dir in entries:
         target = dest / rel
         # Staging sits inside dest. Compared by identity, not by name: on
@@ -722,6 +731,18 @@ def _move_into_place(staging: Path, dest: Path, backup: Path | None) -> None:
         st = _lstat(target)
         if st is not None:
             _check_replaceable(st, target, is_dir=is_dir)
+            # Two members distinct in staging can name one entry already in
+            # dest (the 8.3 short name of a file or directory there).
+            other = existing.setdefault(_identity(st, target), target)
+            if other != target:
+                raise SecurityError(
+                    code=ErrorCode.DUPLICATE_MEMBER_PATH,
+                    msg=(
+                        f"{target} and {other} are one entry in dest "
+                        f"(an 8.3 short name or other filesystem alias)"
+                    ),
+                    path=str(target),
+                )
     replacement = _Replacement(backup)
     try:
         for rel, is_dir in entries:
@@ -768,6 +789,25 @@ def _staged(staging: Path, backup: Path) -> list[tuple[Path, bool]]:
         entries += [(rel, True) for rel in dirs] + [(rel, False) for rel in files]
         pending += dirs
     return entries
+
+
+def _identity(st: os.stat_result, target: Path) -> tuple[int, int]:
+    """``(st_dev, st_ino)`` of an existing entry the merge would use.
+
+    An inode number of 0 means the filesystem reports no identity, so
+    whether another member reaches the same entry cannot be checked: the
+    merge fails closed instead of skipping the check.
+    """
+    if not st.st_ino:
+        raise SecurityError(
+            code=ErrorCode.DUPLICATE_MEMBER_PATH,
+            msg=(
+                f"cannot tell whether another member also reaches {target}: "
+                f"the filesystem reports no file identity there"
+            ),
+            path=str(target),
+        )
+    return st.st_dev, st.st_ino
 
 
 def _check_replaceable(st: os.stat_result, target: Path, *, is_dir: bool) -> None:
