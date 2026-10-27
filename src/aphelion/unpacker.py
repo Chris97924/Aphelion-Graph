@@ -776,7 +776,9 @@ def _discard_backup(backup: Path, exc: BaseException) -> bool:
     try:
         os.rmdir(backup)  # refuses a directory that is not empty
     except OSError as err:
-        if _absent(err):
+        # From rmdir, ENOTDIR can mean that something other than a
+        # directory is there: only "not found" means it is gone.
+        if isinstance(err, FileNotFoundError) and _absent(err):
             return True
         if not any(str(backup) in text for text in (str(exc), *getattr(exc, "__notes__", ()))):
             _report(

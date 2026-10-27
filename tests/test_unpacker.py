@@ -2216,9 +2216,12 @@ def test_on_windows_only_no_such_file_or_path_means_absent(
 def test_elsewhere_enoent_and_enotdir_still_mean_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, code: int
 ) -> None:
-    """POSIX: ENOENT and ENOTDIR still mean that there is no such entry."""
+    """POSIX: ENOENT and ENOTDIR still mean that there is no such entry;
+    except from rmdir, where ENOTDIR can mean that something other than a
+    directory is there, so the backup is kept, as before."""
     err = OSError(code, os.strerror(code), str(tmp_path / "entry"))
-    assert _taken_as_absent(site, tmp_path, monkeypatch, err) is True
+    absent = not (site == "rmdir-backup" and code == errno.ENOTDIR)
+    assert _taken_as_absent(site, tmp_path, monkeypatch, err) is absent
 
 
 @pytest.mark.parametrize("winerror", [2, pytest.param(53, marks=WINDOWS_ONLY)])
