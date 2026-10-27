@@ -26,7 +26,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Iterator, Mapping
+from typing import Callable, Mapping
 
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SecurityError
@@ -295,7 +295,11 @@ def unpack(
     inside it, visible there while the unpack runs; otherwise it sits next to
     ``dest_dir`` and is renamed to it. Files an existing ``dest_dir`` already
     has are moved aside into the staging directory before being replaced, so
-    an error while moving puts them back (see :class:`_Replacement`).
+    an error while moving puts them back (see :class:`_Replacement`). Only
+    regular files are ever moved aside: where the archive has a file and
+    ``dest_dir`` a directory, a link or anything else, or the archive a
+    directory and ``dest_dir`` anything but a real directory, the unpack is
+    refused before anything moves, and again if that changes meanwhile.
 
     After any exception, an interrupt such as KeyboardInterrupt included,
     the contents of ``dest_dir`` are as they were (its own timestamps may
@@ -319,10 +323,11 @@ def unpack(
     policy = policy or ExtractPolicy.default()
     archive = Path(archive_path)
     dest = Path(dest_dir)
-    if _is_link_entry(dest):
+    st = _lstat(dest)
+    if st is not None and _is_link(st):
         # resolve() would follow it, also when dangling, and unpack elsewhere.
         raise FileExistsError(f"unpack destination is a symlink or junction: {dest}")
-    if dest.exists() and not dest.is_dir():
+    if st is not None and not stat.S_ISDIR(st.st_mode):
         raise FileExistsError(f"unpack destination is not a directory: {dest}")
     dest_resolved = dest.resolve()
     made = _make_parents(dest_resolved.parent)
@@ -332,7 +337,7 @@ def unpack(
         if staging.parent == dest_resolved:
             backup = _make_unique_dir(staging, ".backup-")
         _extract(archive, staging, dest_resolved, policy, backup)
-        if backup is None and dest_resolved.exists():  # dest appeared beside staging
+        if backup is None and _lstat(dest_resolved) is not None:  # dest appeared beside staging
             backup = _make_unique_dir(staging, ".backup-")
         _move_into_place(staging, dest_resolved, backup)
     except BaseException as exc:
@@ -349,11 +354,6 @@ def _is_link(st: os.stat_result) -> bool:
     # A Windows junction is a reparse point but not S_ISLNK on Python < 3.12.
     reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse)
-
-
-def _is_link_entry(path: Path) -> bool:
-    st = _lstat(path)
-    return st is not None and _is_link(st)
 
 
 def _same_entry(a: Path, b: Path) -> bool:
@@ -373,7 +373,7 @@ def _make_parents(path: Path) -> list[Path]:
     """
     missing = []
     for candidate in (path, *path.parents):
-        if os.path.lexists(candidate):
+        if _lstat(candidate) is not None:
             break
         missing.append(candidate)
     made: list[Path] = []
@@ -382,7 +382,8 @@ def _make_parents(path: Path) -> list[Path]:
             try:
                 directory.mkdir()
             except FileExistsError:
-                if not directory.is_dir():
+                st = _lstat(directory, follow_symlinks=True)
+                if st is None or not stat.S_ISDIR(st.st_mode):
                     raise
                 continue
             made.append(directory)
@@ -414,7 +415,9 @@ class _Replacement:
     ``rollback`` checks which renames happened and reverses them. ``commit``
     deletes ``backup`` after success, warning instead of raising if it
     cannot. On a failure path ``backup`` is deleted only once it is empty
-    (see :func:`_discard_backup`). Shared by unpack and migrate.
+    (see :func:`_discard_backup`). Shared by unpack, whose merge uses
+    ``mkdir`` and ``put_file`` and so moves aside regular files only, and
+    migrate, whose ``replace_entry`` replaces the whole destination.
 
     Known limits: the log is in memory only (no recovery after a kill or a
     power loss; ``backup`` then still holds the replaced entries), an undo
@@ -431,8 +434,12 @@ class _Replacement:
         self._placed: dict[tuple[int, int], Path] = {}  # (st_dev, st_ino) -> target
 
     def mkdir(self, target: Path) -> None:
-        if target.is_dir():
-            self._refuse_placed(os.stat(target), target)
+        """Unpack's merge: make ``target`` for a staged directory, or merge
+        into the real directory already there; anything else fails."""
+        st = _lstat(target)
+        if st is not None:
+            _check_replaceable(st, target, is_dir=True)
+            self._refuse_placed(st, target)
             return
         self._log.append((None, target, None))
         try:
@@ -442,19 +449,36 @@ class _Replacement:
             raise
         self._remember(target)
 
-    def put(self, src: Path, target: Path) -> None:
-        # _lstat, not os.path.lexists: a target that cannot be looked at
-        # must fail the call, not be overwritten without a backup.
+    def put_file(self, src: Path, target: Path) -> None:
+        """Unpack's merge: move the staged regular file ``src`` to ``target``.
+
+        Whether something is there, and that it is a regular file that may
+        be moved aside, is read by a strict lstat right before the rename: a
+        directory, a link or an entry that cannot be looked at fails the
+        call instead, so the merge never moves aside or replaces anything
+        else in dest.
+        """
+        src_st = _lstat(src)
+        if src_st is None or not stat.S_ISREG(src_st.st_mode):
+            raise OSError(f"staged entry is not a regular file any more: {src}")
         st = _lstat(target)
-        saved = None
         if st is not None:
+            _check_replaceable(st, target, is_dir=False)
             self._refuse_placed(st, target)
-            saved = self.backup / str(len(self._log))
+        self._swap(src, target, present=st is not None)
+        self._remember(target)
+
+    def replace_entry(self, src: Path, target: Path) -> None:
+        """migrate --force: put ``src`` at ``target``, moving aside whatever
+        is there, by design: the whole old destination, or the link it is."""
+        self._swap(src, target, present=_lstat(target) is not None)
+
+    def _swap(self, src: Path, target: Path, *, present: bool) -> None:
+        saved = self.backup / str(len(self._log)) if present else None
         self._log.append((src, target, saved))
         if saved is not None:
             os.replace(target, saved)
         os.replace(src, target)
-        self._remember(target)
 
     def _refuse_placed(self, st: os.stat_result, target: Path) -> None:
         # Two entries distinct in staging can still name one entry here: the
@@ -533,16 +557,24 @@ def _attempt(errors: list[BaseException], step: Callable[..., object], *args: Pa
         errors.append(err)
 
 
-def _lstat(path: Path) -> os.stat_result | None:
-    """``os.lstat``, or None if there is no such entry.
+def _lstat(path: Path, *, follow_symlinks: bool = False) -> os.stat_result | None:
+    """``os.lstat`` (``os.stat`` with ``follow_symlinks``), or None if there
+    is no such entry.
 
     Any other error is raised: an entry that cannot be looked at may still
-    be there, so it must not be taken as absent.
+    be there, so it must not be taken as absent. Every type and existence
+    check on the write paths of unpack and migrate goes through here, never
+    through pathlib or os.path predicates, which return False on errors.
     """
     try:
-        return os.lstat(path)
+        return os.stat(path) if follow_symlinks else os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
         return None
+
+
+def _is_dir(st: os.stat_result) -> bool:
+    # A real directory: a junction is S_ISDIR too, but leads elsewhere.
+    return stat.S_ISDIR(st.st_mode) and not _is_link(st)
 
 
 def _maybe_present(path: Path) -> bool:
@@ -632,7 +664,7 @@ def _remove_or_warn(path: Path, exc: BaseException | None = None) -> None:
         shutil.rmtree(path, onexc=retry_writable)
     else:
         shutil.rmtree(path, onerror=retry_writable)
-    if os.path.lexists(path):
+    if _maybe_present(path):
         _report(f"could not remove {path}; delete it by hand", exc)
 
 
@@ -653,7 +685,7 @@ def _make_staging_dir(dest: Path) -> Path:
     # in a directory the caller cannot write to. A new dest gets a sibling,
     # which becomes dest by one rename; Path.mkdir (not tempfile.mkdtemp)
     # keeps the umask-derived mode that dest would have had.
-    if dest.is_dir():
+    if _lstat(dest) is not None:
         return _make_unique_dir(dest, ".unpacking-")
     return _make_unique_dir(dest.parent, f".{dest.name}.unpacking-")
 
@@ -678,54 +710,81 @@ def _move_into_place(staging: Path, dest: Path, backup: Path | None) -> None:
     if backup is None:
         os.replace(staging, dest)
         return
-
-    def fail(err: OSError) -> None:
-        raise err  # os.walk would skip a directory it cannot list
-
-    def staged() -> Iterator[tuple[Path, Path, list[str], list[str]]]:
-        # Every staged entry except the backup directory, found by identity.
-        for root, dirnames, filenames in os.walk(staging, onerror=fail):
-            rel_root = Path(root).relative_to(staging)
-            if rel_root == Path("."):
-                dirnames[:] = [n for n in dirnames if not _same_entry(staging / n, backup)]
-            yield Path(root), rel_root, dirnames, filenames
-
+    entries = _staged(staging, backup)
     # Check every target first so a conflict cannot leave a half-moved tree.
-    for _root, rel_root, dirnames, filenames in staged():
-        for name in (*dirnames, *filenames):
-            target = dest / rel_root / name
-            # Staging sits inside dest. Compared by identity, not by name: on
-            # Windows a case variant or the 8.3 short name also reaches it,
-            # and so can a directory link already in dest.
-            if _same_entry(target, staging):
-                raise FileExistsError(
-                    f"cannot unpack over the staging directory: {target}"
-                )
-        for name in dirnames:
-            target = dest / rel_root / name
-            if target.is_symlink() or (target.exists() and not target.is_dir()):
-                raise FileExistsError(
-                    f"cannot unpack directory over existing non-directory: {target}"
-                )
-        for name in filenames:
-            target = dest / rel_root / name
-            if target.is_dir() and not target.is_symlink():
-                raise FileExistsError(
-                    f"cannot unpack file over existing directory: {target}"
-                )
+    for rel, is_dir in entries:
+        target = dest / rel
+        # Staging sits inside dest. Compared by identity, not by name: on
+        # Windows a case variant or the 8.3 short name also reaches it,
+        # and so can a directory link already in dest.
+        if _same_entry(target, staging):
+            raise FileExistsError(f"cannot unpack over the staging directory: {target}")
+        st = _lstat(target)
+        if st is not None:
+            _check_replaceable(st, target, is_dir=is_dir)
     replacement = _Replacement(backup)
     try:
-        for root, rel_root, dirnames, filenames in staged():
-            for name in dirnames:
-                replacement.mkdir(dest / rel_root / name)
-            for name in filenames:
-                replacement.put(root / name, dest / rel_root / name)
+        for rel, is_dir in entries:
+            if is_dir:
+                replacement.mkdir(dest / rel)
+            else:
+                replacement.put_file(staging / rel, dest / rel)
     except BaseException as exc:
         replacement.rollback(exc)
         raise
     replacement.commit()
     # dest is complete: failing to remove what is left of staging only warns.
     _remove_or_warn(staging)
+
+
+def _staged(staging: Path, backup: Path) -> list[tuple[Path, bool]]:
+    """Every staged entry except ``backup``, as ``(path relative to staging,
+    is a directory)``, each directory before the entries in it.
+
+    The type of each entry comes from a strict lstat of it, never from the
+    directory listing: os.walk takes an entry whose type it cannot read for
+    a file. Staging holds only what this call extracted, so an entry that
+    is neither a regular file nor a directory fails the call.
+    """
+    entries: list[tuple[Path, bool]] = []
+    pending = [Path()]
+    while pending:
+        rel_dir = pending.pop(0)
+        with os.scandir(staging / rel_dir) as listing:
+            names = [entry.name for entry in listing]
+        dirs: list[Path] = []
+        files: list[Path] = []
+        for name in names:
+            if not rel_dir.parts and name == backup.name:
+                continue  # listed under its own name; members cannot reach it (see _extract)
+            rel = rel_dir / name
+            st = _lstat(staging / rel)
+            if st is not None and _is_dir(st):
+                dirs.append(rel)
+            elif st is not None and stat.S_ISREG(st.st_mode):
+                files.append(rel)
+            else:
+                raise OSError(f"staged entry is gone or not a file or directory: {staging / rel}")
+        entries += [(rel, True) for rel in dirs] + [(rel, False) for rel in files]
+        pending += dirs
+    return entries
+
+
+def _check_replaceable(st: os.stat_result, target: Path, *, is_dir: bool) -> None:
+    """Refuse an entry in dest the merge may not touch.
+
+    A staged directory merges only into a real directory; a staged file
+    replaces only a regular file. Anything else there (a directory where
+    the archive has a file, a link, a junction, a device) is refused, so it
+    is never moved aside, replaced or deleted.
+    """
+    if is_dir:
+        if not _is_dir(st):
+            raise FileExistsError(f"cannot unpack directory over existing non-directory: {target}")
+    elif stat.S_ISDIR(st.st_mode):
+        raise FileExistsError(f"cannot unpack file over existing directory: {target}")
+    elif not stat.S_ISREG(st.st_mode):
+        raise FileExistsError(f"cannot unpack file over existing non-file: {target}")
 
 
 def _extract(

@@ -19,6 +19,7 @@ the remaining branches:
 
 from __future__ import annotations
 
+import ast
 import errno
 import functools
 import io
@@ -28,7 +29,7 @@ import sys
 import tarfile
 import warnings
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 import pytest
 
@@ -1311,14 +1312,14 @@ def test_member_reaching_an_earlier_member_in_dest_is_refused(
 # ---------- an error while looking at the tree is never skipped ----------
 
 
-@pytest.mark.parametrize("listing", [1, 2], ids=["pre-move-check", "merge"])
 def test_unpack_fails_when_a_staged_directory_cannot_be_listed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """All platforms: a staged directory that cannot be listed (too many open
-    files, a filter driver refusing access) fails the unpack, in the check
-    before any move or in the merge, and dest is left as it was. It used to
-    be skipped, and the unpack reported success with files missing."""
+    files, a filter driver refusing access) fails the unpack before anything
+    moves, and dest is left as it was. It used to be skipped, and the unpack
+    reported success with files missing. (Staging is listed once, before any
+    move; the merge then works from that listing.)"""
     archive, dest, before = _merge_archive(tmp_path)
     real_scandir = os.scandir
     listed: list[str] = []
@@ -1326,10 +1327,9 @@ def test_unpack_fails_when_a_staged_directory_cannot_be_listed(
     def scandir(*args: object) -> object:
         if args and isinstance(args[0], (str, os.PathLike)):
             path = os.fspath(args[0])
-            if ".unpacking-" in path and os.path.basename(path) == "new":
-                listed.append(path)
-                if len(listed) == listing:
-                    raise PermissionError(errno.EACCES, "Permission denied", path)
+            if ".unpacking-" in path and os.path.basename(path) == "new" and not listed:
+                listed.append(path)  # once: cleaning up afterwards lists it again
+                raise PermissionError(errno.EACCES, "Permission denied", path)
         return real_scandir(*args)
 
     monkeypatch.setattr(os, "scandir", scandir)
@@ -1338,7 +1338,7 @@ def test_unpack_fails_when_a_staged_directory_cannot_be_listed(
         unpack(archive, dest)
     monkeypatch.undo()
 
-    assert exc.value.filename == listed[listing - 1]
+    assert exc.value.filename == listed[0]
     assert _tree(dest) == before
 
 
@@ -1373,6 +1373,303 @@ def test_unpack_fails_when_an_entry_cannot_be_looked_at(
 
     assert exc.value.errno == errno.EIO
     assert _tree(dest) == before
+
+
+# ---------- types and existence come only from a look that cannot fail silently ----------
+
+# Checks that answer False when the entry cannot be looked at (pathlib's and
+# os.path's on Python 3.14 do so on any OSError, DirEntry's on some), and
+# os.walk / Path.walk, which take an entry whose type cannot be read for a file.
+SWALLOWING_ANYWHERE = {
+    "exists", "lexists", "is_dir", "is_file", "is_symlink", "is_junction", "is_mount", "walk",
+}
+# Also the names of TarInfo methods, so these count only in their os.path form.
+SWALLOWING_IN_OS_PATH = {"isdir", "isfile", "islink", "isjunction", "ismount"}
+OS_PATH_MODULES = {"path", "ntpath", "posixpath", "genericpath"}
+
+
+def _swallowing_checks(source: str) -> list[str]:
+    """``line: code`` for every swallowing type or existence check in ``source``."""
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.module in {"os", "os.path", *OS_PATH_MODULES}:
+            names = SWALLOWING_ANYWHERE | SWALLOWING_IN_OS_PATH | OS_PATH_MODULES
+            found += [f"{node.lineno}: import {a.name}" for a in node.names if a.name in names]
+        elif isinstance(node, ast.Attribute):
+            on_os_path = (isinstance(node.value, ast.Attribute) and node.value.attr == "path") or (
+                isinstance(node.value, ast.Name) and node.value.id in OS_PATH_MODULES
+            )
+            if node.attr in SWALLOWING_ANYWHERE or (node.attr in SWALLOWING_IN_OS_PATH and on_os_path):
+                found.append(f"{node.lineno}: {ast.unparse(node)}")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in SWALLOWING_ANYWHERE | SWALLOWING_IN_OS_PATH
+        ):
+            found.append(f"{node.lineno}: {node.func.id}()")
+    return found
+
+
+def test_unpack_and_migrate_never_use_a_check_that_swallows_errors() -> None:
+    """All platforms: every function in aphelion/unpacker.py and
+    aphelion/migrate.py decides whether an entry exists, and what it is,
+    only through the strict lstat helper, never through a pathlib, os.path
+    or DirEntry predicate or os.walk, which turn an error into "absent" or
+    "not a directory". Such a check let unpack move a whole directory in
+    dest aside and delete it; this keeps one from coming back unnoticed."""
+    import aphelion.migrate as migrate_module
+    import aphelion.unpacker as unpacker_module
+
+    sample = "os.path.isdir(p)\nPath(p).is_dir()\nos.walk(p)\nmember.isdir()\nentry.is_file()\n"
+    assert len(_swallowing_checks(sample)) == 4  # the scan finds what it must, TarInfo aside
+    for module in (unpacker_module, migrate_module):
+        source = Path(str(module.__file__)).read_text(encoding="utf-8")
+        assert _swallowing_checks(source) == [], module.__name__
+    # Only migrate puts something in place whatever is there; unpack's merge
+    # moves aside regular files only.
+    unpacker_tree = ast.parse(Path(str(unpacker_module.__file__)).read_text(encoding="utf-8"))
+    assert not [
+        node.lineno
+        for node in ast.walk(unpacker_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "replace_entry"
+    ]
+
+
+def _from_aphelion() -> bool:
+    """Whether the call being made comes from aphelion code, and not by way of
+    shutil, whose rmtree cleans up only after the call has decided."""
+    frame = sys._getframe(2)
+    while frame is not None:
+        module = frame.f_globals.get("__name__", "")
+        if module == "shutil":
+            return False
+        if module.startswith("aphelion."):
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _looks_at(
+    monkeypatch: pytest.MonkeyPatch, path: Path, fail_at: int | None = None
+) -> list[str]:
+    """Record every look aphelion takes at ``path`` and make the ``fail_at``-th
+    one fail: lstat, stat, scandir and samefile raise EIO, and the os.path
+    predicates return False, as Python 3.14's do on any error."""
+    looks: list[str] = []
+    want = os.path.normcase(os.path.abspath(path))
+
+    def wrap(module: object, name: str, swallows: bool) -> None:
+        real = getattr(module, name)
+
+        def look(*args: object, **kwargs: object) -> object:
+            paths = [a for a in args[: 2 if name == "samefile" else 1] if isinstance(a, (str, os.PathLike))]
+            if (
+                not kwargs.get("dir_fd")
+                and any(os.path.normcase(os.path.abspath(os.fspath(p))) == want for p in paths)
+                and _from_aphelion()
+            ):
+                looks.append(name)
+                if len(looks) == fail_at:
+                    if swallows:
+                        return False
+                    raise OSError(errno.EIO, "simulated I/O error", os.fspath(path))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, look)
+
+    for name in ("lstat", "stat", "scandir"):
+        wrap(os, name, swallows=False)
+    wrap(os.path, "samefile", swallows=False)
+    for name in ("exists", "lexists", "isdir", "isfile", "islink"):
+        wrap(os.path, name, swallows=True)
+    return looks
+
+
+def _dir_in_dest(work: Path, archive_has: str) -> tuple[Path, Path, dict[str, bytes | None]]:
+    """dest holds keep.md and sub/precious.md, which the archive does not
+    name; the archive has top.md and a directory ``sub`` with new.md in it
+    (``archive_has="dir"``) or a file ``sub`` (``"file"``)."""
+    sub = (_reg("sub/new.md"), b"new") if archive_has == "dir" else (_reg("sub"), b"new")
+    archive = _write_tar(work / "a.tar", [sub, (_reg("top.md"), b"top")])
+    dest = work / "dest"
+    (dest / "sub").mkdir(parents=True)
+    (dest / "sub" / "precious.md").write_bytes(b"precious")
+    (dest / "keep.md").write_bytes(b"keep")
+    return archive, dest, _tree(dest)
+
+
+MERGED_DIR = {
+    "keep.md": b"keep",
+    "sub": None,
+    "sub/new.md": b"new",
+    "sub/precious.md": b"precious",
+    "top.md": b"top",
+}
+
+
+class _TypelessEntry:
+    """A directory entry that cannot tell its type, as on a filesystem without
+    d_type after a transient stat error."""
+
+    def __init__(self, entry: os.DirEntry[str]) -> None:
+        self.name, self.path = entry.name, entry.path
+
+    def _fail(self, *args: object, **kwargs: object) -> bool:
+        raise OSError(errno.EIO, "simulated I/O error", self.path)
+
+    is_dir = is_file = is_symlink = is_junction = stat = inode = _fail
+
+    def __fspath__(self) -> str:
+        return self.path
+
+
+class _Listing:
+    """``os.scandir`` whose entry ``name`` is a :class:`_TypelessEntry`."""
+
+    def __init__(self, listing: Iterator[os.DirEntry[str]], name: str) -> None:
+        self._listing, self._name = listing, name
+
+    def __iter__(self) -> _Listing:
+        return self
+
+    def __next__(self) -> object:
+        entry = next(self._listing)
+        return _TypelessEntry(entry) if entry.name == self._name else entry
+
+    def __enter__(self) -> _Listing:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._listing.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("listing", [1, 2], ids=["first-listing", "second-listing"])
+def test_merge_takes_no_type_from_a_directory_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: int
+) -> None:
+    """All platforms: a staged directory whose type the listing of staging
+    cannot tell is still merged as a directory, since the merge looks at
+    each entry itself. os.walk took it for a file, so the merge moved the
+    user's directory of that name in dest aside, deleted it with everything
+    in it, and reported success."""
+    archive, dest, before = _dir_in_dest(tmp_path, "dir")
+    real_scandir = os.scandir
+    listed: list[str] = []
+
+    def scandir(*args: object) -> object:
+        found = real_scandir(*args)
+        path = os.fspath(args[0]) if args and isinstance(args[0], (str, os.PathLike)) else ""
+        if os.path.basename(path).startswith(".unpacking-") and _from_aphelion():
+            listed.append(path)
+            if len(listed) == listing:
+                return _Listing(found, "sub")
+        return found
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    try:
+        unpack(archive, dest)
+        failed = False
+    except OSError:
+        failed = True
+    monkeypatch.undo()
+
+    assert _tree(dest) == (before if failed else MERGED_DIR)
+
+
+def test_staged_directory_is_merged_only_after_a_look_that_cannot_fail_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: the merge reads a staged directory's type from an lstat
+    of the entry itself, and a failure of any look unpack takes at it fails
+    the call and leaves dest as it was."""
+    import secrets
+
+    monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
+    archive, dest, _ = _dir_in_dest(tmp_path / "clean", "dir")
+    with monkeypatch.context() as patch:
+        looks = _looks_at(patch, dest.resolve() / STAGING_NAME / "sub")
+        unpack(archive, dest)
+    assert _tree(dest) == MERGED_DIR
+    assert "lstat" in looks, looks
+
+    for n in range(1, len(looks) + 1):
+        archive, dest, before = _dir_in_dest(tmp_path / str(n), "dir")
+        with monkeypatch.context() as patch:
+            _looks_at(patch, dest.resolve() / STAGING_NAME / "sub", fail_at=n)
+            with pytest.raises(OSError) as exc:
+                unpack(archive, dest)
+        assert exc.value.errno == errno.EIO, looks[n - 1]
+        assert _tree(dest) == before, looks[n - 1]
+
+
+def test_file_over_a_directory_is_refused_whichever_look_at_it_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: where the archive has a file and dest a directory of the
+    same name, a failure of any look unpack takes at that directory fails
+    the call and leaves dest as it was. Path.is_dir() on Python 3.14 returns
+    False on such an error, which skipped the refusal: the directory was
+    moved aside and deleted, and the unpack reported success."""
+    archive, dest, _ = _dir_in_dest(tmp_path / "clean", "file")
+    with monkeypatch.context() as patch:
+        looks = _looks_at(patch, dest.resolve() / "sub")
+        with pytest.raises(FileExistsError, match="file over existing directory"):
+            unpack(archive, dest)
+    assert looks
+
+    for n in range(1, len(looks) + 1):
+        archive, dest, before = _dir_in_dest(tmp_path / str(n), "file")
+        with monkeypatch.context() as patch:
+            _looks_at(patch, dest.resolve() / "sub", fail_at=n)
+            with pytest.raises(OSError):
+                unpack(archive, dest)
+        assert _tree(dest) == before, looks[n - 1]
+
+
+@pytest.mark.parametrize("changed", ["file-in-dest", "staged-file"])
+def test_merge_moves_only_what_is_a_regular_file_right_before_the_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    """All platforms: each entry's type is read again right before it moves.
+    A file in dest that became a directory after the check before any move
+    (another process at work, say) is not moved aside, and a staged file
+    that is no longer a regular file is not moved in: the call fails and is
+    undone, and the directory is left alone."""
+    import secrets
+
+    monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
+    archive, dest, before = _merge_archive(tmp_path)
+    if changed == "file-in-dest":
+        victim = dest / "z.md"
+    else:
+        victim = dest / STAGING_NAME / "z.md"
+    real_replace = os.replace
+
+    def replace(src: str, dst: str, **kwargs: object) -> None:
+        if victim.is_file():  # once, before the first move
+            victim.unlink()
+            victim.mkdir()
+            (victim / "precious.md").write_bytes(b"precious")
+        real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+    with pytest.raises(OSError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    if changed == "file-in-dest":
+        assert "file over existing directory" in str(exc.value)
+        del before["z.md"]
+        assert _tree(dest) == {**before, "z.md": None, "z.md/precious.md": b"precious"}
+    else:
+        assert "not a regular file" in str(exc.value)
+        assert _tree(dest) == before
 
 
 # ---------- the destination itself must not be a link ----------

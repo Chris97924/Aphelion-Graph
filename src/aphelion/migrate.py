@@ -18,6 +18,7 @@ import io
 import os
 import secrets
 import shutil
+import stat
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,7 +114,7 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     src_path = Path(src)
     dst_path = Path(dst)
     manifest_in = src_path / "manifest.json"
-    if not manifest_in.is_file():
+    if not _is_file(manifest_in):
         raise SchemaError(
             code=ErrorCode.MISSING_FILE,
             msg=f"source {src_path} does not contain manifest.json",
@@ -142,7 +143,7 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
             )
             replacement.backup.mkdir()
             try:
-                replacement.put(staging, dst_abs)
+                replacement.replace_entry(staging, dst_abs)
             except BaseException as exc:
                 replacement.rollback(exc)
                 raise
@@ -158,6 +159,12 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     if replacement is not None:
         replacement.commit()
     return dst_path
+
+
+def _is_file(path: Path) -> bool:
+    # Path.is_file, but strict: an error other than "no such file" raises.
+    st = _lstat(path, follow_symlinks=True)
+    return st is not None and stat.S_ISREG(st.st_mode)
 
 
 def _same_entry(a: Path, b: Path) -> bool:
@@ -211,14 +218,14 @@ def migrate_archive(src: Path, dst: Path, *, force: bool = False) -> Path:
     """
     src_path = Path(src)
     dst_path = Path(dst)
-    if not src_path.is_file():
+    if not _is_file(src_path):
         raise SchemaError(
             code=ErrorCode.MISSING_FILE,
             msg=f"source archive {src_path} not found",
             path=str(src_path),
         )
     _refuse_overlap(src_path, dst_path)
-    if os.path.lexists(dst_path) and not force:
+    if _lstat(dst_path) is not None and not force:
         raise SchemaError(
             code=ErrorCode.INIT_REFUSES_EXISTING,
             msg=f"destination {dst_path} already exists; pass force=True to overwrite",
@@ -308,11 +315,12 @@ def migrate(opts: MigrateOptions) -> Path:
     """
     src = Path(opts.src)
     dst = Path(opts.dst)
-    src_is_archive = src.is_file() and src.suffix == ".tar"
+    src_st = _lstat(src, follow_symlinks=True)
+    src_is_archive = src_st is not None and stat.S_ISREG(src_st.st_mode) and src.suffix == ".tar"
     dst_is_archive = dst.suffix == ".tar"
     if src_is_archive and dst_is_archive:
         return migrate_archive(src, dst, force=opts.force)
-    if src.is_dir() and not dst_is_archive:
+    if src_st is not None and stat.S_ISDIR(src_st.st_mode) and not dst_is_archive:
         return migrate_directory(src, dst, force=opts.force)
     raise SchemaError(
         code=ErrorCode.TYPE_MISMATCH,
