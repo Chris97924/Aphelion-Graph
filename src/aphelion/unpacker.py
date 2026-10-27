@@ -326,7 +326,9 @@ def unpack(
     where no note can carry the name (Python 3.10, or a call that
     succeeded), the RuntimeWarning is shown even where warnings are
     ignored or turned into errors. ``dest_dir``
-    itself must not be a symlink or junction. Nor can it be a Windows
+    itself must not be a symlink or junction, and it is never followed:
+    only its parent is resolved, and every look that finds it there refuses
+    a link. Nor can it be a Windows
     mounted folder, which is the same kind of reparse point as a junction:
     unpack into a directory inside it instead.
 
@@ -339,7 +341,7 @@ def unpack(
     Every check goes by path: a process that can replace ``dest_dir``, one
     of its parents or an entry in it while unpack runs can still redirect
     the writes, a window that path-based checks cannot close. Resolving
-    ``dest_dir`` and each member's path (``Path.resolve``) keeps its
+    ``dest_dir``'s parent and each member's path (``Path.resolve``) keeps its
     standard-library behaviour, which can take a component it cannot look
     at for one that is not a link; the merge's strict check of every entry
     in ``dest_dir`` is what refuses a link there. On a filesystem other
@@ -351,13 +353,17 @@ def unpack(
     policy = policy or ExtractPolicy.default()
     archive = Path(archive_path)
     dest = Path(dest_dir)
-    st = _lstat(dest)
-    if st is not None and _is_link(st):
-        # resolve() would follow it, also when dangling, and unpack elsewhere.
-        raise FileExistsError(f"unpack destination is a symlink or junction: {dest}")
-    if st is not None and not stat.S_ISDIR(st.st_mode):
-        raise FileExistsError(f"unpack destination is not a directory: {dest}")
-    dest_resolved = dest.resolve()
+    # dest's own last component is never followed, so not even a look that
+    # wrongly finds nothing there can send the writes through a link. "."
+    # and ".." are no entry of their own: those are resolved whole.
+    if dest.name in ("", ".."):
+        dest_resolved = dest.resolve()
+    else:
+        dest_resolved = dest.parent.resolve() / dest.name
+    if _dest_exists(dest_resolved):
+        # A real directory, as that strict look showed: resolving it follows
+        # nothing, and spells out an 8.3 short name the checks compare with.
+        dest_resolved = dest_resolved.resolve()
     made: list[Path] = []  # parents this call created, each on record before its mkdir
     staging = backup = replacement = None
     renaming = False
@@ -367,7 +373,7 @@ def unpack(
         if staging.parent == dest_resolved:
             backup = _make_unique_dir(staging, ".backup-")
         _extract(archive, staging, dest_resolved, policy, backup)
-        if backup is None and _lstat(dest_resolved) is not None:  # dest appeared beside staging
+        if backup is None and _dest_exists(dest_resolved):  # dest appeared beside staging
             backup = _make_unique_dir(staging, ".backup-")
         if backup is None:
             renaming = True  # on record before the rename, as _Replacement logs its steps
@@ -396,6 +402,22 @@ def unpack(
         _remove_made(made)
         raise
     return dest
+
+
+def _dest_exists(dest: Path) -> bool:
+    """Whether the unpack destination is there, by a strict lstat; a link or
+    anything but a directory there is refused. Asked wherever unpack decides
+    on that, so a look that wrongly finds nothing is followed by one that
+    refuses the link, or by a step that fails if anything is there."""
+    st = _lstat(dest)
+    if st is None:
+        return False
+    if _is_link(st):
+        # resolve() would follow it, also when dangling, and unpack elsewhere.
+        raise FileExistsError(f"unpack destination is a symlink or junction: {dest}")
+    if not stat.S_ISDIR(st.st_mode):
+        raise FileExistsError(f"unpack destination is not a directory: {dest}")
+    return True
 
 
 def _is_link(st: os.stat_result) -> bool:
@@ -845,7 +867,7 @@ def _make_staging_dir(dest: Path) -> Path:
     # in a directory the caller cannot write to. A new dest gets a sibling,
     # which becomes dest by one rename; Path.mkdir (not tempfile.mkdtemp)
     # keeps the umask-derived mode that dest would have had.
-    if _lstat(dest) is not None:
+    if _dest_exists(dest):
         return _make_unique_dir(dest, ".unpacking-")
     return _make_unique_dir(dest.parent, f".{dest.name}.unpacking-")
 

@@ -2285,6 +2285,46 @@ def test_unpack_refuses_a_link_to_a_directory_as_destination(
     assert list(target.iterdir()) == []
 
 
+@pytest.mark.parametrize("wrong", ["first-look", "every-look"])
+@pytest.mark.parametrize("kind", LINK_KINDS)
+def test_unpack_never_writes_through_a_link_dest_wrongly_found_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, wrong: str
+) -> None:
+    """All platforms that can create symlinks, and Windows for junctions: a
+    dest that is a link to a directory, wrongly found absent by the first
+    look or by every look at it (another process at work, say), is still
+    never followed. Only its parent is resolved; a later look refuses the
+    link, or the writes, which go nowhere but dest, fail. The directory it
+    points to is left as it was, and nothing is left over."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    target = tmp_path / "real"
+    target.mkdir()
+    (target / "a.md").write_bytes(b"old a")
+    dest = tmp_path / "dest"
+    _link_or_skip(dest, target, kind)
+    want = os.path.normcase(str(dest.parent.resolve() / dest.name))
+    looks: list[str] = []
+    real_lstat = os.lstat
+
+    def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
+        name = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if not kwargs.get("dir_fd") and name == want and _from_aphelion():
+            looks.append(name)
+            if wrong == "every-look" or len(looks) == 1:
+                raise _not_found(path)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    with pytest.raises((OSError, SecurityError)) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    if wrong == "first-look":
+        assert "symlink or junction" in str(exc.value)
+    assert _tree(target) == {"a.md": b"old a"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest", "real"]
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="junctions exist only on Windows")
 def test_unpack_refuses_a_junction_to_a_drive_root_as_destination(tmp_path: Path) -> None:
     """Windows only: a junction to the root of a volume is refused like any
