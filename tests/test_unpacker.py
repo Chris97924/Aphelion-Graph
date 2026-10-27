@@ -1655,30 +1655,70 @@ def test_unpack_fails_when_an_entry_cannot_be_looked_at(
 SWALLOWING_ANYWHERE = {
     "exists", "lexists", "is_dir", "is_file", "is_symlink", "is_junction", "is_mount", "walk",
 }
-# Also the names of TarInfo methods, so these count only in their os.path form.
-SWALLOWING_IN_OS_PATH = {"isdir", "isfile", "islink", "isjunction", "ismount"}
-OS_PATH_MODULES = {"path", "ntpath", "posixpath", "genericpath"}
+# os.path's forms, also the names of TarInfo methods, so these count only as
+# os.path functions or bare names.
+SWALLOWING_OS_PATH = {"isdir", "isfile", "islink", "isjunction", "ismount"}
+SWALLOWING_IN_OS = {"access"}  # os.access answers False on any error
+# The os.path functions unpack and migrate may use; any other is flagged.
+OS_PATH_ALLOWED = {"abspath", "normcase", "realpath", "samefile"}
+OS_PATH_MODULES = {"ntpath", "posixpath", "genericpath"}
 
 
 def _swallowing_checks(source: str) -> list[str]:
-    """``line: code`` for every swallowing type or existence check in ``source``."""
+    """``line: code`` for every swallowing type or existence check in
+    ``source``, whether reached as an attribute, a bare name, through
+    ``getattr`` or through an alias of os or os.path, and for every os.path
+    function outside :data:`OS_PATH_ALLOWED`."""
+    tree = ast.parse(source)
+    os_names, path_names = {"os"}, set(OS_PATH_MODULES)
+    for node in ast.walk(tree):
+        for alias in node.names if isinstance(node, ast.Import) else ():
+            if alias.name == "os":
+                os_names.add(alias.asname or "os")
+            elif alias.name == "os.path" and alias.asname:  # plain "import os.path" binds os
+                path_names.add(alias.asname)
+            elif alias.name in OS_PATH_MODULES:
+                path_names.add(alias.asname or alias.name)
+
+    def is_os(node: ast.expr) -> bool:
+        return isinstance(node, ast.Name) and node.id in os_names
+
+    def is_os_path(node: ast.expr) -> bool:
+        return (isinstance(node, ast.Attribute) and node.attr == "path" and is_os(node.value)) or (
+            isinstance(node, ast.Name) and node.id in path_names
+        )
+
+    def swallows(owner: ast.expr, name: str) -> bool:
+        if name in SWALLOWING_ANYWHERE:
+            return True
+        if is_os_path(owner):
+            return name not in OS_PATH_ALLOWED
+        return is_os(owner) and name in SWALLOWING_IN_OS
+
     found = []
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module in {"os", "os.path", *OS_PATH_MODULES}:
-            names = SWALLOWING_ANYWHERE | SWALLOWING_IN_OS_PATH | OS_PATH_MODULES
-            found += [f"{node.lineno}: import {a.name}" for a in node.names if a.name in names]
-        elif isinstance(node, ast.Attribute):
-            on_os_path = (isinstance(node.value, ast.Attribute) and node.value.attr == "path") or (
-                isinstance(node.value, ast.Name) and node.value.id in OS_PATH_MODULES
-            )
-            if node.attr in SWALLOWING_ANYWHERE or (node.attr in SWALLOWING_IN_OS_PATH and on_os_path):
-                found.append(f"{node.lineno}: {ast.unparse(node)}")
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in SWALLOWING_ANYWHERE | SWALLOWING_IN_OS_PATH
-        ):
-            found.append(f"{node.lineno}: {node.func.id}()")
+            if node.module == "os":
+                names = SWALLOWING_ANYWHERE | SWALLOWING_IN_OS | {"path"}
+                found += [f"{node.lineno}: import {a.name}" for a in node.names if a.name in names]
+            else:
+                found += [
+                    f"{node.lineno}: import {a.name}"
+                    for a in node.names
+                    if a.name not in OS_PATH_ALLOWED
+                ]
+        elif isinstance(node, ast.Attribute) and swallows(node.value, node.attr):
+            found.append(f"{node.lineno}: {ast.unparse(node)}")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in SWALLOWING_ANYWHERE | SWALLOWING_OS_PATH | SWALLOWING_IN_OS:
+                found.append(f"{node.lineno}: {node.func.id}()")
+            elif node.func.id == "getattr" and len(node.args) >= 2:
+                owner, name = node.args[0], node.args[1]
+                if isinstance(name, ast.Constant) and isinstance(name.value, str):
+                    if swallows(owner, name.value):
+                        found.append(f"{node.lineno}: {ast.unparse(node)}")
+                elif is_os(owner) or is_os_path(owner):  # a name chosen at run time
+                    found.append(f"{node.lineno}: {ast.unparse(node)}")
     return found
 
 
@@ -1686,14 +1726,40 @@ def test_unpack_and_migrate_never_use_a_check_that_swallows_errors() -> None:
     """All platforms: every function in aphelion/unpacker.py and
     aphelion/migrate.py decides whether an entry exists, and what it is,
     only through the strict lstat helper, never through a pathlib, os.path
-    or DirEntry predicate or os.walk, which turn an error into "absent" or
-    "not a directory". Such a check let unpack move a whole directory in
-    dest aside and delete it; this keeps one from coming back unnoticed."""
+    or DirEntry predicate, os.access or os.walk, which turn an error into
+    "absent" or "not a directory", whether called directly, through getattr
+    or through an alias of os.path; and uses only the os.path functions on
+    an allow-list. Such a check let unpack move a whole directory in dest
+    aside and delete it; this keeps one from coming back unnoticed."""
     import aphelion.migrate as migrate_module
     import aphelion.unpacker as unpacker_module
 
-    sample = "os.path.isdir(p)\nPath(p).is_dir()\nos.walk(p)\nmember.isdir()\nentry.is_file()\n"
-    assert len(_swallowing_checks(sample)) == 4  # the scan finds what it must, TarInfo aside
+    may_use = [
+        "import os.path as osp",
+        "import ntpath",
+        "member.isdir()",  # TarInfo
+        "os.path.samefile(a, b)",
+        "os.path.realpath(p, strict=True)",
+        'getattr(st, "st_file_attributes", 0)',
+        "path.name",
+    ]
+    must_find = [
+        "os.path.isdir(p)",
+        "Path(p).is_dir()",
+        "os.walk(p)",
+        "entry.is_file()",
+        "osp.isdir(p)",
+        "ntpath.exists(p)",
+        'getattr(os.path, "isdir")(p)',
+        'getattr(p, "is_dir")()',
+        "getattr(os.path, name)(p)",
+        "os.access(p, os.F_OK)",
+        "os.path.getsize(p)",
+        "from os.path import isdir as d",
+    ]
+    found = _swallowing_checks("\n".join(may_use + must_find))
+    lines = range(len(may_use) + 1, len(may_use) + len(must_find) + 1)
+    assert {int(f.split(":")[0]) for f in found} == set(lines), found  # each, and only those
     for module in (unpacker_module, migrate_module):
         source = Path(str(module.__file__)).read_text(encoding="utf-8")
         assert _swallowing_checks(source) == [], module.__name__
