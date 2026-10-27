@@ -238,7 +238,7 @@ def test_unpack_error_line_names_a_staging_dir_it_could_not_remove(
 
     from test_unpacker import _fail_to_unlink, _fails_after_first_member
 
-    archive, _ = _fails_after_first_member(tmp_path)
+    archive, _ = _fails_after_first_member(tmp_path, monkeypatch)
     dest = tmp_path / "dest"
     dest.mkdir()
     _fail_to_unlink(monkeypatch, "manifest.json")
@@ -251,7 +251,7 @@ def test_unpack_error_line_names_a_staging_dir_it_could_not_remove(
     assert code == 3, err
     payload = _error_payload(err)
     assert payload is not None
-    assert payload["code"] == ErrorCode.FILE_BYTES_EXCEEDED.value
+    assert payload["code"] == ErrorCode.ARCHIVE_BOMB.value
     (leftover,) = [p for p in dest.resolve().iterdir() if p.name.startswith(".unpacking-")]
     assert any(str(leftover) in note for note in payload["notes"])
 

@@ -336,6 +336,80 @@ def test_compression_ratio_exceeded(tmp_path: Path) -> None:
     assert exc.value.code == ErrorCode.COMPRESSION_RATIO_EXCEEDED
 
 
+# ---------- declared sizes are checked before the scan reads past a member ----------
+
+
+BIG_MEMBER = 16 * 1024 * 1024  # zeros: a few KiB once compressed
+
+
+def _count_decompressed(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """A one-item list that counts the bytes gzip decompresses from now on."""
+    import gzip
+
+    reader = getattr(gzip, "_GzipReader", None)
+    if reader is None:
+        pytest.skip("this Python's gzip has no reader to count with")
+    count = [0]
+    real_read = reader.read
+
+    def read(self: object, size: int = -1) -> bytes:
+        data = real_read(self, size)
+        count[0] += len(data)
+        return data
+
+    monkeypatch.setattr(reader, "read", read)
+    return count
+
+
+@pytest.mark.parametrize("via", ["unpack", "check_member_names"])
+@pytest.mark.parametrize("budget", ["per-file", "total", "ratio"])
+def test_member_over_a_budget_is_refused_before_its_data_is_decompressed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: str, via: str
+) -> None:
+    """All platforms: in a compressed archive, reading on to the next header
+    decompresses a member's data. A member whose declared size is over the
+    per-file, the total or the compression-ratio budget is refused, with
+    the code unpack uses for it, before that: what is decompressed stays
+    within the budgets (here under 1 MiB, for a 16 MiB member), for unpack
+    and for the header check signature validation runs."""
+    from aphelion.unpacker import check_member_names
+
+    archive = tmp_path / "a.tar.gz"
+    with tarfile.open(archive, "w:gz", compresslevel=1) as tar:
+        for name, size in [("a.bin", 4096), ("big.bin", BIG_MEMBER)]:
+            info = tarfile.TarInfo(name)
+            info.size = size
+            tar.addfile(info, io.BytesIO(bytes(size)))
+    policy, code = {
+        "per-file": (ExtractPolicy(max_file_bytes=1024 * 1024), ErrorCode.FILE_BYTES_EXCEEDED),
+        "total": (
+            ExtractPolicy(max_file_bytes=2 * BIG_MEMBER, max_total_bytes=1024 * 1024),
+            ErrorCode.TOTAL_BYTES_EXCEEDED,
+        ),
+        "ratio": (
+            ExtractPolicy(
+                max_file_bytes=2 * BIG_MEMBER,
+                max_total_bytes=2 * BIG_MEMBER,
+                max_compression_ratio=10,
+            ),
+            ErrorCode.COMPRESSION_RATIO_EXCEEDED,
+        ),
+    }[budget]
+    count = _count_decompressed(monkeypatch)
+
+    with pytest.raises(SecurityError) as exc:
+        if via == "unpack":
+            unpack(archive, tmp_path / "dest", policy=policy)
+        else:
+            check_member_names(archive, policy)
+    decompressed = count[0]
+    monkeypatch.undo()
+
+    assert exc.value.code == code
+    assert decompressed < 1024 * 1024, decompressed
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar.gz"]
+
+
 # ---------- A1: collisions after normalisation ----------
 
 WIN32_STRIPS_TRAILING = pytest.mark.skipif(
@@ -432,38 +506,54 @@ def _tree(root: Path) -> dict[str, bytes | None]:
     }
 
 
-def _fails_after_first_member(tmp_path: Path) -> tuple[Path, ExtractPolicy]:
-    """Archive whose first members extract fine and whose last member is over
-    the per-file budget, so the failure comes after files were written."""
+def _fails_after_first_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, ExtractPolicy]:
+    """Archive whose first members extract fine and whose last member, within
+    the per-file budget by its header, streams past it (ARCHIVE_BOMB), so
+    the failure comes after files were written: a size the header declares
+    over the budget is refused before anything is written."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [
             (_dir("claims"), None),
             (_reg("claims/a.md"), b"new a"),
             (_reg("manifest.json"), b"new manifest"),
-            (_reg("zz-big.bin"), b"B" * 4096),
+            (_reg("zz-big.bin"), b"B" * 10),
         ],
     )
+    real_extractfile = tarfile.TarFile.extractfile
+
+    def extractfile(self: tarfile.TarFile, member: object) -> object:
+        if getattr(member, "name", member) == "zz-big.bin":
+            return io.BytesIO(b"B" * 4096)
+        return real_extractfile(self, member)
+
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", extractfile)
     return archive, ExtractPolicy(max_file_bytes=1024)
 
 
-def test_failed_unpack_into_missing_dest_creates_nothing(tmp_path: Path) -> None:
+def test_failed_unpack_into_missing_dest_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """All platforms: a failed unpack into a missing dest leaves neither dest nor
     the parents it made for it."""
-    archive, policy = _fails_after_first_member(tmp_path)
+    archive, policy = _fails_after_first_member(tmp_path, monkeypatch)
     dest = tmp_path / "out" / "nested" / "dest"
     with pytest.raises(SecurityError) as exc:
         unpack(archive, dest, policy=policy)
-    assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
+    assert exc.value.code == ErrorCode.ARCHIVE_BOMB
     # Neither the destination nor the parents created for it remain.
     assert not (tmp_path / "out").exists()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar"]
 
 
-def test_failed_unpack_into_existing_dest_leaves_it_unchanged(tmp_path: Path) -> None:
+def test_failed_unpack_into_existing_dest_leaves_it_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """All platforms: a failed unpack into an existing dest leaves it exactly as
     it was, with no staging dir beside it."""
-    archive, policy = _fails_after_first_member(tmp_path)
+    archive, policy = _fails_after_first_member(tmp_path, monkeypatch)
     dest = tmp_path / "dest"
     (dest / "claims").mkdir(parents=True)
     (dest / "claims" / "a.md").write_bytes(b"old a")
@@ -478,9 +568,9 @@ def test_failed_unpack_into_existing_dest_leaves_it_unchanged(tmp_path: Path) ->
 
 
 def test_failed_unpack_on_compression_ratio_leaves_nothing(tmp_path: Path) -> None:
-    """All platforms: the ratio check runs after a member is fully written
-    (ratio 0, as in test_compression_ratio_exceeded: a plain ustar archive
-    never expands), and still nothing is left."""
+    """All platforms: an archive over the compression-ratio budget (ratio 0,
+    as in test_compression_ratio_exceeded: a plain ustar archive never
+    expands) is refused, and nothing is left."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [(_reg("one.txt"), b"1"), (_reg("two.txt"), b"A" * 2048)],
@@ -747,7 +837,7 @@ def test_failed_unpack_names_a_staging_dir_it_cannot_remove(
 ) -> None:
     """All platforms: a staging dir that a failed unpack cannot remove is named
     in a RuntimeWarning."""
-    archive, policy = _fails_after_first_member(tmp_path)
+    archive, policy = _fails_after_first_member(tmp_path, monkeypatch)
     dest = tmp_path / "dest"
     dest.mkdir()
     (dest / "keep.txt").write_bytes(b"keep")
@@ -757,7 +847,7 @@ def test_failed_unpack_names_a_staging_dir_it_cannot_remove(
         unpack(archive, dest, policy=policy)
     monkeypatch.undo()
 
-    assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
+    assert exc.value.code == ErrorCode.ARCHIVE_BOMB
     leftover = [p for p in dest.resolve().iterdir() if p.name.startswith(".unpacking-")]
     assert len(leftover) == 1
     assert any(str(leftover[0]) in str(w.message) for w in warned)
@@ -770,7 +860,7 @@ def test_failed_unpack_keeps_its_error_when_warnings_are_errors(
     still raised (and on Python 3.11+ a note names the staging dir left)."""
     import warnings
 
-    archive, policy = _fails_after_first_member(tmp_path)
+    archive, policy = _fails_after_first_member(tmp_path, monkeypatch)
     dest = tmp_path / "dest"
     dest.mkdir()
     _fail_to_unlink(monkeypatch, "manifest.json")
@@ -781,7 +871,7 @@ def test_failed_unpack_keeps_its_error_when_warnings_are_errors(
             unpack(archive, dest, policy=policy)
     monkeypatch.undo()
 
-    assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
+    assert exc.value.code == ErrorCode.ARCHIVE_BOMB
     if sys.version_info >= (3, 11):  # the warning was an error; a note still names it
         leftover = [p for p in dest.resolve().iterdir() if p.name.startswith(".unpacking-")]
         assert len(leftover) == 1
@@ -2866,7 +2956,7 @@ def test_failed_unpack_keeps_a_parent_another_process_created(
 ) -> None:
     """All platforms: a parent of dest that another process created meanwhile is
     not removed by the failed unpack, nor is anything in it."""
-    archive, policy = _fails_after_first_member(tmp_path)
+    archive, policy = _fails_after_first_member(tmp_path, monkeypatch)
     shared = tmp_path / "shared"
     dest = shared / "mine" / "dest"
     real_mkdir = Path.mkdir
@@ -2883,7 +2973,7 @@ def test_failed_unpack_keeps_a_parent_another_process_created(
         unpack(archive, dest, policy=policy)
     monkeypatch.undo()
 
-    assert exc.value.code == ErrorCode.FILE_BYTES_EXCEEDED
+    assert exc.value.code == ErrorCode.ARCHIVE_BOMB
     assert _tree(shared) == {"theirs.txt": b"theirs"}
 
 

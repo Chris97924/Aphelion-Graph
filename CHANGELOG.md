@@ -112,6 +112,11 @@ the record of what a bump would carry.
   without trailing dots and spaces), so two spellings of one file or
   directory, or a file and a directory of one name, can no longer share an
   archive.
+- **Signature validation (`validate_signatures`) refuses an archive whose
+  members declare sizes `unpack` would refuse**, with the same codes: a
+  member over the per-file limit (`PX_E_6010`), or a running total over the
+  total limit (`PX_E_6011`) or over the compression-ratio limit
+  (`PX_E_6012`), each at `unpack`'s defaults.
 - **`pack` refuses the member paths `unpack` refuses**: empty (`PX_E_6006`),
   absolute (`PX_E_6002`), containing a backslash (`PX_E_6004`),
   drive-prefixed such as `a:b.md` (`PX_E_6003`, on every platform), or with

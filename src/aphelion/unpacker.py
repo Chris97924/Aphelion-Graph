@@ -206,16 +206,22 @@ class MemberNames:
 
 
 def _scan_members(
-    tar: tarfile.TarFile, policy: ExtractPolicy
+    tar: tarfile.TarFile, policy: ExtractPolicy, archive_size: int
 ) -> list[tuple[tarfile.TarInfo, str]]:
     """Check every member header before anything is read or written.
 
     Returns ``(member, relative_path)`` pairs, where ``relative_path`` drops
     ``./`` and empty segments. ``relative_path`` is ``""`` only for a
     directory entry naming the archive root itself (``.``).
+
+    Moving on to the next header reads past a member's data, which in a
+    compressed archive means decompressing it, so a regular member's
+    declared size is checked against the per-file, total and ratio budgets
+    before the scan moves past it, as :func:`_extract` checks them.
     """
     scanned: list[tuple[tarfile.TarInfo, str]] = []
     names = MemberNames()
+    declared = 0
 
     while True:
         member = tar.next()
@@ -264,20 +270,48 @@ def _scan_members(
                 path=member.name,
             )
         scanned.append((member, rel))
+        if not member.isreg():
+            continue
+        if member.size > policy.max_file_bytes:
+            raise SecurityError(
+                code=ErrorCode.FILE_BYTES_EXCEEDED,
+                msg=(
+                    f"member {rel!r} declares size {member.size} "
+                    f"> max-file-bytes {policy.max_file_bytes}"
+                ),
+                path=rel,
+            )
+        if declared + member.size > policy.max_total_bytes:
+            raise SecurityError(
+                code=ErrorCode.TOTAL_BYTES_EXCEEDED,
+                msg=f"total uncompressed size would exceed {policy.max_total_bytes} bytes",
+            )
+        declared += member.size
+        if archive_size > 0 and declared > archive_size * policy.max_compression_ratio:
+            raise SecurityError(
+                code=ErrorCode.COMPRESSION_RATIO_EXCEEDED,
+                msg=(
+                    f"uncompressed size {declared} exceeds "
+                    f"archive size {archive_size} * ratio "
+                    f"{policy.max_compression_ratio}"
+                ),
+            )
     return scanned
 
 
 def check_member_names(
     archive_path: Path | str, policy: ExtractPolicy | None = None
 ) -> None:
-    """Run the header checks of :func:`unpack` without extracting anything.
+    """Run the header checks of :func:`unpack` (member types, names and
+    declared sizes) without extracting anything.
 
     Anything that reads an archive by member name (signature validation,
     signer-manifest lookup) must call this first: once no two members collide,
     a name lookup and an extraction can no longer see different files.
     """
-    with tarfile.open(Path(archive_path), mode="r") as tar:
-        _scan_members(tar, policy or ExtractPolicy.default())
+    archive = Path(archive_path)
+    with tarfile.open(archive, mode="r") as tar:
+        _scan_members(tar, policy or ExtractPolicy.default(), archive.stat().st_size)
 
 
 def unpack(
@@ -1045,7 +1079,7 @@ def _extract(
         # Every header is checked before the first byte is written, so a
         # colliding or forbidden member late in the archive cannot ride on
         # members that were already extracted.
-        for member, normalized in _scan_members(tar, policy):
+        for member, normalized in _scan_members(tar, policy, archive_size):
             # Checked against the real destination: a symlink already inside
             # dest must not carry a member outside it once moved into place.
             final = (dest_resolved / normalized).resolve()
