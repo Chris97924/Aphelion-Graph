@@ -20,6 +20,7 @@ the remaining branches:
 from __future__ import annotations
 
 import ast
+import contextlib
 import errno
 import functools
 import io
@@ -2035,38 +2036,60 @@ def test_file_over_a_directory_is_refused_whichever_look_at_it_fails(
         assert _tree(dest) == before, looks[n - 1]
 
 
+@pytest.mark.parametrize("order", ["a-first", "z-first"])
 @pytest.mark.parametrize("changed", ["file-in-dest", "staged-file"])
 def test_merge_moves_only_what_is_a_regular_file_right_before_the_move(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str, order: str
 ) -> None:
     """All platforms: each entry's type is read again right before it moves.
     A file in dest that became a directory after the check before any move
     (another process at work, say) is not moved aside, and a staged file
     that is no longer a regular file is not moved in: the call fails and is
-    undone, and the directory is left alone."""
+    undone, and the directory is left alone. The change lands just as the
+    merge takes that last look at z.md, whichever of a.md and z.md the
+    staging directory lists first (both orders are run)."""
     import secrets
 
     monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
     archive, dest, before = _merge_archive(tmp_path)
-    if changed == "file-in-dest":
-        victim = dest / "z.md"
-    else:
-        victim = dest / STAGING_NAME / "z.md"
-    real_replace = os.replace
+    staging = dest.resolve() / STAGING_NAME
+    victim = dest.resolve() / "z.md" if changed == "file-in-dest" else staging / "z.md"
+    changes: list[str] = []
+    real_lstat, real_scandir = os.lstat, os.scandir
 
-    def replace(src: str, dst: str, **kwargs: object) -> None:
-        if victim.is_file():  # once, before the first move
+    def moving() -> bool:
+        frame = sys._getframe(2)
+        while frame is not None and frame.f_code.co_name != "put_file":
+            frame = frame.f_back
+        return frame is not None
+
+    def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
+        if not changes and Path(os.fspath(path)) == victim and moving():
+            changes.append(os.fspath(path))
             victim.unlink()
             victim.mkdir()
             (victim / "precious.md").write_bytes(b"precious")
-        real_replace(src, dst, **kwargs)
+        return real_lstat(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "replace", replace)
+    def scandir(path: object = ".") -> object:
+        if (
+            not isinstance(path, (str, os.PathLike))
+            or Path(os.fspath(path)) != staging
+            or not _from_aphelion()
+        ):
+            return real_scandir(path)
+        with real_scandir(path) as listing:
+            entries = sorted(listing, key=lambda e: e.name, reverse=order == "z-first")
+        return contextlib.nullcontext(entries)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "scandir", scandir)
 
     with pytest.raises(OSError) as exc:
         unpack(archive, dest)
     monkeypatch.undo()
 
+    assert changes
     if changed == "file-in-dest":
         assert "file over existing directory" in str(exc.value)
         del before["z.md"]
