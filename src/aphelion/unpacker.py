@@ -215,8 +215,6 @@ _HEADER_BYTES = 4096
 _GLOBAL_HEADER_BYTES = 1024
 # How many reads may find the end of the archive; the next one fails.
 _MAX_EOF_READS = 8
-# Room on top of max_compression_ratio times the archive size.
-_RATIO_SLACK = 1024 * 1024
 _READ_CHUNK = 64 * 1024
 # The most memory the xz and LZMA decoder may use: 1.5 times the 67,175,064
 # bytes the largest xz preset (-9 and -9e, a 64 MiB dictionary) needs.
@@ -411,12 +409,11 @@ def _members(
     take up to ``_GLOBAL_HEADER_BYTES`` more for a global pax header before
     it); with ``check_names``, the names :func:`unpack` refuses; a declared
     size over ``max_file_bytes``, a total over ``max_total_bytes``, and a
-    total over ``max_compression_ratio`` times the archive size. For an
-    archive that is a regular file, a member is refused before its data is
-    read if the bytes handed to tarfile so far plus its data come to more
-    than ``max_compression_ratio`` times the archive size plus 1 MiB;
-    another kind of file reports no size, and there only the other limits
-    apply. After the last member, everything up to ``_HEADER_BYTES`` past
+    declared total over ``max_compression_ratio`` times the archive size
+    (for an archive that is a regular file; another kind of file reports no
+    size, and there only the other limits apply). The ratio counts declared
+    member data only; header bytes are bounded by the per-member allowance
+    above. After the last member, everything up to ``_HEADER_BYTES`` past
     its end must be zeros, else ``tarfile.ReadError`` is raised.
     """
     with open(archive, "rb") as raw:
@@ -519,18 +516,6 @@ def _checked_members(
                     ),
                 )
         stored = -(-member.size // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE if member.isreg() else 0
-        if (
-            compressed > 0
-            and reader.handed + stored > policy.max_compression_ratio * compressed + _RATIO_SLACK
-        ):
-            raise SecurityError(
-                code=ErrorCode.COMPRESSION_RATIO_EXCEEDED,
-                msg=(
-                    f"reading the archive on to the end of member {member.name!r} comes "
-                    f"to {reader.handed + stored} bytes, more than archive size "
-                    f"{compressed} * ratio {policy.max_compression_ratio} + {_RATIO_SLACK}"
-                ),
-            )
         end = member.offset_data + stored
         reader.limit = end + _HEADER_BYTES
         record = _Member(member.name, member.type, member.size, member.offset, rel)

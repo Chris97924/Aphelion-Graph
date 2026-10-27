@@ -1109,29 +1109,59 @@ def test_accessors_refuse_a_member_whose_size_leads_back_to_its_own_header(
     assert passes[0].handed <= len(raw)
 
 
-def test_reading_on_stops_at_the_ratio_limit_before_member_data(
+@pytest.mark.parametrize("kind", ["one-byte-files", "empty-files", "directories"])
+def test_many_tiny_members_in_a_compressed_archive_are_accepted(
+    tmp_path: Path, passes: list, kind: str
+) -> None:
+    """All platforms: a gzip-compressed archive of 10,000 one-byte files,
+    empty files or directories, the most members the default policy allows,
+    is read in full at the default policy, however well its headers
+    compress: the compression-ratio limit counts the members' declared
+    sizes, and header bytes are bounded by the per-member allowance."""
+    from aphelion.unpacker import check_member_names, extract_signer_manifests
+
+    if kind == "directories":
+        raw = b"".join(_raw_header(b"d%05d" % i, 0, b"5") for i in range(10_000)) + END
+    else:
+        data = b"x" if kind == "one-byte-files" else b""
+        raw = b"".join(_file(b"m%05d" % i, data) for i in range(10_000)) + END
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(gzip.compress(raw, compresslevel=9, mtime=0))
+
+    check_member_names(archive)
+    assert dict(extract_signer_manifests(archive)) == {}
+    if kind == "one-byte-files":
+        dest = unpack(archive, tmp_path / "dest")
+        assert len(list(dest.iterdir())) == 10_000
+    assert len(passes) == (4 if kind == "one-byte-files" else 2)
+    assert all(reader.handed <= len(raw) for reader in passes)
+
+
+def test_header_bytes_of_max_files_members_stay_within_the_pass_bound(
     tmp_path: Path, passes: list
 ) -> None:
-    """All platforms: 10,000 members with 3 KiB pax headers of repeated
-    text come to 40 MB that compress to a few kilobytes. Before a member's
-    data is read, the bytes handed to tarfile plus that data may not pass
-    max-compression-ratio times the archive size plus 1 MiB: the archive is
-    refused (PX_E_6012) once they would."""
-    from aphelion.unpacker import check_member_names
+    """All platforms: as many members as the default policy allows, each
+    with 4,096 bytes of header blocks (a pax header of 3 KiB of records and
+    its own header) and one byte of data, come to 46 MB that compress to a
+    few hundred kilobytes. Whatever the outcome, no pass hands tarfile more
+    than the per-pass bound: header bytes are bounded per member."""
+    from aphelion.unpacker import check_member_names, extract_signer_manifests
 
-    members = b"".join(
-        _pax({"comment": "y" * 2900}) + _file(b"m%05d" % i, b"") for i in range(10_000)
+    assert len(_pax({"comment": "y" * 3000}) + _raw_header(b"m", 1)) == HEADER_BYTES
+    raw = b"".join(
+        _pax({"comment": "y" * 3000}) + _file(b"m%05d" % i, b"x") for i in range(10_000)
     )
     archive = tmp_path / "a.tar.gz"
-    archive.write_bytes(gzip.compress(members + END, mtime=0))
-    size = archive.stat().st_size
+    archive.write_bytes(gzip.compress(raw + END, compresslevel=9, mtime=0))
 
-    with pytest.raises(SecurityError) as exc:
-        check_member_names(archive)
-
-    assert exc.value.code == ErrorCode.COMPRESSION_RATIO_EXCEEDED
-    assert len(passes) == 1
-    assert passes[0].handed <= 100 * size + MIB + HEADER_BYTES, (passes[0].handed, size)
+    outcomes = [
+        _outcome(lambda: check_member_names(archive)),
+        _outcome(lambda: extract_signer_manifests(archive)),
+    ]
+    assert len(passes) == 2
+    assert all(reader.handed <= _pass_limit(ExtractPolicy.default()) for reader in passes)
+    assert all(reader.handed <= len(raw) + HEADER_BYTES for reader in passes)
+    assert outcomes == ["ok", "ok"]
 
 
 def test_unpack_refuses_an_archive_that_changes_between_its_passes(

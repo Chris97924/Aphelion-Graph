@@ -132,7 +132,9 @@ the record of what a bump would carry.
   `max_total_bytes` plus 4,607 bytes per `max_files` member plus 5,120
   bytes: 150,932,720 bytes at the default policy. A decompressing reader
   (gzip, bzip2, zstd) may decompress up to `io.DEFAULT_BUFFER_SIZE` (8 KiB,
-  or 128 KiB from Python 3.14) ahead of that.
+  or 128 KiB from Python 3.14) ahead of that. Header bytes are bounded by
+  this per-member allowance; the compression-ratio limit (`PX_E_6012`)
+  counts the members' declared sizes only, as before.
 - **Each call reads an archive a fixed number of times**, whatever it
   holds: `check_member_names`, `extract_signatures_jsonl`,
   `extract_signer_manifests` and `validate_signatures` once (signature
@@ -160,12 +162,6 @@ the record of what a bump would carry.
   with `tarfile.ReadError` ("data after the end of the archive"). Anything
   further on is not read, as `tar` reads only the first of two archives
   written one after the other.
-- **Compression ratio is also checked before a member's data is read**
-  (`PX_E_6012`): for an archive that is a regular file, the bytes handed
-  to `tarfile` so far plus the member's data may not exceed
-  `max_compression_ratio` times the archive's size plus 1 MiB, headers
-  included. Where the archive is not a regular file its size is not
-  known, and only the other limits apply.
 - **xz and LZMA-alone archives are decompressed with at most 100,762,596
   bytes of decoder memory**, 1.5 times what the largest xz preset (`-9`,
   `-9e`) needs; one that needs more fails with `PX_E_6013` before the

@@ -144,7 +144,7 @@ All raise sites import the `ErrorCode` enum — no string literals.
 | PX_E_6009  | FILE_COUNT_EXCEEDED         | Archive exceeds `max_files` budget.                   |
 | PX_E_6010  | FILE_BYTES_EXCEEDED         | Member declares size > `max_file_bytes`; or a negative size where `tarfile` reports one (where `tarfile` stops at that header instead, reading fails with `tarfile.ReadError`); or a size given in a local or global pax header; or a directory member declares a size. |
 | PX_E_6011  | TOTAL_BYTES_EXCEEDED        | Aggregate size > `max_total_bytes`.                   |
-| PX_E_6012  | COMPRESSION_RATIO_EXCEEDED  | Uncompressed bytes / archive size > ratio budget; also, for an archive that is a regular file, when the bytes read so far plus a member's data would pass `max_compression_ratio` times the archive size plus 1 MiB, headers included (checked before that data is read). |
+| PX_E_6012  | COMPRESSION_RATIO_EXCEEDED  | Uncompressed bytes / archive size > ratio budget. Member data only: header bytes are bounded by the per-member allowance (`PX_E_6013`). |
 | PX_E_6013  | ARCHIVE_BOMB                | Stream overran a budget mid-extraction; or reading the archive would go past what its checked member headers allow (more than 4,096 bytes of headers before a member past the end of the one before it, 5,120 before the first), or past its end more than 8 times; or a member does not start where the one before it ends (other than after a global pax header); or the archive changed between `unpack`'s two passes; or decompressing an xz or LZMA-alone archive needs more decoder memory than the limit. |
 
 ## 9NN — GENERIC
