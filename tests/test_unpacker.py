@@ -1167,7 +1167,10 @@ def test_merge_stopped_at_any_step_leaves_dest_unchanged(
 ) -> None:
     """All platforms: an unpack into an existing dest stopped at any rename or
     directory creation, also right after it returned (a move-aside included),
-    puts dest back and raises that same error, an interrupt included."""
+    puts dest back and raises that same error, an interrupt included. An
+    OSError from mkdir means it made nothing, so the undo never removes a
+    directory for one: raised after a mkdir in dest that returned, which no
+    real mkdir does, it leaves that one directory, empty."""
     call, _, _ = _unpack_merge(tmp_path / "clean")
     steps, exc, _ = _run_steps(monkeypatch, call, {})
     assert exc is None
@@ -1181,6 +1184,10 @@ def test_merge_stopped_at_any_step_leaves_dest_unchanged(
         _, exc, _ = _run_steps(monkeypatch, call, {n: (error, after)})
         assert exc is error, (steps[n - 1], exc)
         left = _tree(dest)
+        if kind is OSError and after and steps[n - 1].startswith("mkdir"):
+            made = Path(steps[n - 1].split(" ", 1)[1])  # as the first run spelled it
+            if made.parent.parent == (tmp_path / "clean").resolve() and made.name[0] != ".":
+                assert left.pop(made.name) is None, steps[n - 1]
         assert {p: d for p, d in left.items() if not p.startswith(".unpacking-")} == before, (
             steps[n - 1]
         )
@@ -2174,6 +2181,44 @@ def test_undo_never_moves_an_original_over_its_staged_copy(
     monkeypatch.undo()
 
     assert "simulated I/O error" in str(exc.value)
+    assert _tree(dest) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
+
+
+def test_undo_leaves_a_directory_its_failed_mkdir_did_not_make(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: dest/sub is there and empty, and the archive has
+    sub/new.md. Where the look at sub wrongly finds nothing and making it
+    then fails with an error other than "exists" (Windows raises a network
+    error as "not found" for both), nothing was made, so the undo leaves
+    sub alone instead of removing the user's directory."""
+    archive = _write_tar(tmp_path / "a.tar", [(_dir("sub"), None), (_reg("sub/new.md"), b"new")])
+    dest = tmp_path / "dest"
+    (dest / "sub").mkdir(parents=True)
+    before = _tree(dest)
+    sub = dest.resolve() / "sub"
+    failed: list[Path] = []
+    real_lstat, real_mkdir = os.lstat, Path.mkdir
+
+    def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
+        if not failed and Path(os.fspath(path)) == sub and _from_aphelion():
+            raise _not_found(path)
+        return real_lstat(path, *args, **kwargs)
+
+    def mkdir(self: Path, *args: object, **kwargs: object) -> None:
+        if self == sub:
+            failed.append(self)
+            raise _not_found(self, 53)
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    with pytest.raises(FileNotFoundError):
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert failed
     assert _tree(dest) == before
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
 

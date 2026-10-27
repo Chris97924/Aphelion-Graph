@@ -504,7 +504,7 @@ class _Replacement:
         self._log.append((None, target, None))
         try:
             target.mkdir()
-        except FileExistsError:  # made by someone else meanwhile: not ours to remove
+        except OSError:  # nothing was made; what is there, if anything, is not this call's
             self._log.pop()
             raise
         self._remember(target)
