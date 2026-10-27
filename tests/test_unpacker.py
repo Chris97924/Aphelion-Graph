@@ -339,7 +339,7 @@ def test_compression_ratio_exceeded(tmp_path: Path) -> None:
 # ---------- declared sizes are checked before the scan reads past a member ----------
 
 
-BIG_MEMBER = 16 * 1024 * 1024  # zeros: a few KiB once compressed
+BIG_MEMBER = 16 * 1024 * 1024  # zeros: about 160 KB once gzipped at level 1
 
 
 def _count_decompressed(monkeypatch: pytest.MonkeyPatch) -> list[int]:
