@@ -98,18 +98,20 @@ the record of what a bump would carry.
     archive that would replace or merge into an existing entry, since
     whether two members reach that entry cannot be checked there.
 - **On Windows, `pack`, `unpack`, signature validation
-  (`validate_signatures`) and `verify` refuse member names Win32 cannot
-  create**: device names such as `CON` or `aux.md`, names ending in a dot
-  or a space, and the characters `<>:"|?*` and control characters. They
-  also treat names that differ only by trailing dots or spaces as
-  colliding. Other platforms accept both, as before.
+  (`validate_signatures`) and `verify_package` (`aphe verify` on a package
+  file) refuse member names Win32 cannot create**: device names such as
+  `CON` or `aux.md`, names ending in a dot or a space, and the characters
+  `<>:"|?*` and control characters. They also treat names that differ
+  only by trailing dots or spaces as colliding. Other platforms accept
+  both, as before.
 - **Member names that collide once normalised are refused** (`PX_E_6007`)
   by `pack`, `unpack`, signature validation (`validate_signatures`) and
-  `verify`, before anything is written. Names are compared without a
-  leading `./` or empty and `.` segments, after NFC normalisation and case
-  folding (on Windows also without trailing dots and spaces), so two
-  spellings of one file or directory, or a file and a directory of one
-  name, can no longer share an archive.
+  `verify_package` (`aphe verify` on a package file), before anything is
+  written. Names are compared without a leading `./` or empty and `.`
+  segments, after NFC normalisation and case folding (on Windows also
+  without trailing dots and spaces), so two spellings of one file or
+  directory, or a file and a directory of one name, can no longer share an
+  archive.
 - **`pack` refuses the member paths `unpack` refuses**: empty (`PX_E_6006`),
   absolute (`PX_E_6002`), containing a backslash (`PX_E_6004`),
   drive-prefixed such as `a:b.md` (`PX_E_6003`, on every platform), or with
@@ -131,10 +133,10 @@ the record of what a bump would carry.
   (`PX_E_5002`). `spec/error-codes.md` gains `PX_E_4011`, `PX_E_4012` and
   `PX_E_5005`. Every sample and valid fixture in the repository passes.
 - **`aphe verify --require-signed` and `--require-notary` need the package
-  file.** Given an unpacked directory, or any path that is not a file, they
-  fail with `E_SIGNER_REQUIRED` (exit 3) instead of passing on the semantic
-  checks alone: signatures can only be checked on the `.aphelion.tar`.
-  Verifying a directory without these flags is unchanged.
+  file.** Given an unpacked directory (which passed on the semantic checks
+  alone) or any other path that is not a file, they now fail with
+  `E_SIGNER_REQUIRED` (exit 3): signatures can only be checked on the
+  `.aphelion.tar`. Verifying a directory without these flags is unchanged.
 - **Malformed signer input is refused with typed errors, and base64 is
   decoded strictly.** A signer manifest is checked against spec v0.5 §2.3
   before it is used (a JSON object with a string `signer_id` equal to the
