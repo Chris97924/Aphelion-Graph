@@ -100,8 +100,57 @@ the record of what a bump would carry.
   `CON` or `aux.md`, names ending in a dot or a space, and the characters
   `<>:"|?*` and control characters. They also treat names that differ only
   by trailing dots or spaces as colliding. Other platforms accept both, as
-  before. A drive-prefixed name such as `a:b.md` is refused on every
-  platform, now by `pack` as well as `unpack`.
+  before.
+- **Member names that collide once normalised are refused** (`PX_E_6007`)
+  by `pack`, `unpack` and the archive checks of `validate` and `verify`,
+  before anything is written. Names are compared without a leading `./` or
+  empty and `.` segments, after NFC normalisation and case folding (on
+  Windows also without trailing dots and spaces), so two spellings of one
+  file or directory, or a file and a directory of one name, can no longer
+  share an archive.
+- **`pack` refuses the member paths `unpack` refuses**: empty (`PX_E_6006`),
+  absolute (`PX_E_6002`), containing a backslash (`PX_E_6004`),
+  drive-prefixed such as `a:b.md` (`PX_E_6003`, on every platform), or with
+  a `..` segment (`PX_E_6001`). It can no longer write an archive `unpack`
+  rejects.
+- **`aphe sign --signer-id` must be a single path component.** An empty id,
+  `.`, `..`, or an id containing `/`, `\` or NUL is refused (`PX_E_6001`)
+  before any file is read or written; the id names
+  `signers/<signer_id>.json`.
+- **`verify` (and so `aphe verify`) performs the semantic checks
+  `spec/validator.md` requires**, so a package that passed before can now
+  fail: a `claim_instance_id` used by two manifest entries or emitted by two
+  provenance events (`PX_E_4011`, ERR-SEM-005); an `event_id` used twice
+  (`PX_E_4012`, ERR-SEM-006); a manifest state that disagrees with the
+  claim's last event (`PX_E_5005`, ERR-SEM-013); a
+  `target_claim_instance_id` that is not the instance in force at that
+  event, or a manifest `claim_instance_id` its claim's provenance never
+  emitted (`PX_E_5004`); a manifest path other than `claims/<claim_id>.md`
+  (`PX_E_5002`). `spec/error-codes.md` gains `PX_E_4011`, `PX_E_4012` and
+  `PX_E_5005`. Every sample and valid fixture in the repository passes.
+- **Malformed signer input is refused with typed errors, and base64 is
+  decoded strictly.** A signer manifest is checked against spec v0.5 §2.3
+  before it is used (a JSON object with a string `signer_id` equal to the
+  file's stem and a string `algorithm`, standard-base64 `public_key_b64`,
+  64-character lowercase hex `key_fingerprint`, and a string or null
+  `notary_uri`); anything else is `E_SIGNER_MALFORMED`, where a raw
+  `TypeError` or a later, unrelated code came out before. Public keys,
+  private keys and signatures with characters outside the base64 alphabet
+  are rejected instead of silently trimmed. A malformed
+  `package_canonical_hash` in an envelope is `E_SIGNATURE_MALFORMED`, an
+  Ed25519 key of the wrong length is `E_SIGNER_MALFORMED`, and `aphe sign`
+  checks the key file before reading the package (exit 3 on a bad key).
+
+### Removed
+
+- **`aphe sign --algorithm hmac-sha256`.** `aphe sign` now accepts only
+  `ed25519`; any other algorithm is a usage error. hmac-sha256 is a
+  test-only algorithm (spec v0.5 §3.2) whose signer manifest carries the
+  shared secret as `public_key_b64`; the library's `HMACSigner` and
+  `HMACVerifier` stay for test fixtures. Packages already signed with it
+  verify as before, with the test-algorithm warning. To sign from the CLI,
+  pass `--algorithm ed25519` and a raw 32-byte Ed25519 private key as
+  `--key-file` (this needs the `aphelion[signer]` extra).
 
 ### Fixed
 
