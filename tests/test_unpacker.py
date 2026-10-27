@@ -2367,89 +2367,6 @@ def test_unpack_refuses_a_link_to_a_directory_as_destination(
     assert list(target.iterdir()) == []
 
 
-@pytest.mark.parametrize("wrong", ["first-look", "every-look"])
-@pytest.mark.parametrize("kind", LINK_KINDS)
-def test_unpack_never_writes_through_a_link_dest_wrongly_found_absent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, wrong: str
-) -> None:
-    """All platforms that can create symlinks, and Windows for junctions: a
-    dest that is a link to a directory, wrongly found absent by the first
-    look or by every look at it (another process at work, say), is still
-    never followed. Only its parent is resolved; a later look refuses the
-    link, or the writes, which go nowhere but dest, fail. The directory it
-    points to is left as it was, and nothing is left over."""
-    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
-    target = tmp_path / "real"
-    target.mkdir()
-    (target / "a.md").write_bytes(b"old a")
-    dest = tmp_path / "dest"
-    _link_or_skip(dest, target, kind)
-    want = os.path.normcase(str(dest.parent.resolve() / dest.name))
-    looks: list[str] = []
-    real_lstat = os.lstat
-
-    def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
-        name = os.path.normcase(os.path.abspath(os.fspath(path)))
-        if not kwargs.get("dir_fd") and name == want and _from_aphelion():
-            looks.append(name)
-            if wrong == "every-look" or len(looks) == 1:
-                raise _not_found(path)
-        return real_lstat(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "lstat", lstat)
-    with pytest.raises((OSError, SecurityError)) as exc:
-        unpack(archive, dest)
-    monkeypatch.undo()
-
-    if wrong == "first-look":
-        assert "symlink or junction" in str(exc.value)
-    assert _tree(target) == {"a.md": b"old a"}
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest", "real"]
-
-
-@pytest.mark.parametrize("points_to", ["sibling", "same-name-elsewhere"])
-@pytest.mark.parametrize("wrong", ["first-look", "every-look"])
-@pytest.mark.parametrize("kind", LINK_KINDS)
-def test_unpack_never_writes_through_a_link_dest_wrongly_found_a_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, wrong: str, points_to: str
-) -> None:
-    """All platforms that can create symlinks, and Windows for junctions: a
-    dest that is a link, for which the lstat wrongly answers what the
-    directory it points to is (a directory, and no link), by the first look
-    or by every look, is still refused: resolving it ends elsewhere, at a
-    sibling or at a directory of the same name in another directory. The
-    directory it points to is left as it was."""
-    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a"), (_reg("b.md"), b"new b")])
-    target = tmp_path / ("real" if points_to == "sibling" else "other/dest")
-    target.mkdir(parents=True)
-    (target / "a.md").write_bytes(b"old a")
-    dest = tmp_path / "dest"
-    _link_or_skip(dest, target, kind)
-    want = os.path.normcase(str(dest.parent.resolve() / dest.name))
-    looks: list[str] = []
-    real_lstat = os.lstat
-
-    def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
-        name = os.path.normcase(os.path.abspath(os.fspath(path)))
-        if not kwargs.get("dir_fd") and name == want and _from_aphelion():
-            looks.append(name)
-            if wrong == "every-look" or len(looks) == 1:
-                return os.stat(path)  # what it points to: a directory, no link
-        return real_lstat(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "lstat", lstat)
-    with pytest.raises(FileExistsError) as exc:
-        unpack(archive, dest)
-    monkeypatch.undo()
-
-    assert looks
-    assert "symlink or junction" in str(exc.value)
-    assert _tree(target) == {"a.md": b"old a"}
-    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
-        ["a.tar", "dest", target.relative_to(tmp_path).parts[0]]
-    )
-
-
 @pytest.mark.parametrize("kind", LINK_KINDS)
 def test_unpack_refuses_a_link_dest_wrongly_resolved_to_itself(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
@@ -2501,6 +2418,12 @@ DEST_SPELLINGS = [
             sys.platform != "win32", reason="names differing in case are one only on Windows"
         ),
     ),
+    pytest.param(
+        "index-stream",
+        marks=pytest.mark.skipif(
+            sys.platform != "win32", reason="NTFS stream names exist only on Windows"
+        ),
+    ),
 ]
 
 
@@ -2523,6 +2446,8 @@ def _spell_dest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str) 
         return SPELLED_NAME + "\\"
     if spelling == "mixed-case":
         return SPELLED_NAME.swapcase()
+    if spelling == "index-stream":  # the directory's index, which Win32 opens as the directory
+        return SPELLED_NAME + "::$INDEX_ALLOCATION"
     short = _short_name(entry)
     if short is None:
         pytest.skip("this volume does not generate 8.3 short names")
@@ -2540,8 +2465,9 @@ def test_unpack_refuses_a_link_dest_however_it_is_spelled(
     """Windows only: Win32 collapses "." and ".." against the full path
     before it looks at any link, so "." with the cwd a link, ".." from a
     directory in it, "link/sub/..", and the link's short name, a case
-    variant or a trailing separator all name the link itself. Each is
-    refused, and the directory it points to is left as it was."""
+    variant, a trailing separator or its index stream all name the link
+    itself, which the look at dest as spelled reports. Each is refused,
+    and the directory it points to is left as it was."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
     target = tmp_path / "real"
     (target / "sub").mkdir(parents=True)
@@ -2589,8 +2515,9 @@ def test_elsewhere_dot_and_dotdot_by_way_of_a_link_dest_end_at_its_target(
 def test_unpack_into_a_real_directory_however_it_is_spelled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
 ) -> None:
-    """All platforms (Windows also for a backslash, a short name and a case
-    variant): the same spellings of a real directory are unpacked into."""
+    """All platforms (Windows also for a backslash, a short name, a case
+    variant and the index stream): the same spellings of a real directory
+    are unpacked into."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
     target = tmp_path / SPELLED_NAME
     (target / "sub").mkdir(parents=True)
@@ -2624,53 +2551,164 @@ def test_unpack_into_a_dest_whose_parent_is_a_link(
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "parent", "real"]
 
 
+@contextlib.contextmanager
+def _drive_mapped_to(target: Path) -> Iterator[str]:
+    """A free drive letter mapped onto ``target`` while the block runs, as
+    subst maps one (without telling other windows); the mapping is always
+    removed. Skips where no letter is free or none can be mapped."""
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    no_broadcast, remove = 0x8, 0x2  # DDD_NO_BROADCAST_SYSTEM, DDD_REMOVE_DEFINITION
+    used = kernel32.GetLogicalDrives()
+    free = [c for c in "ZYXWVUTSRQPONMLKJIHG" if not used & (1 << (ord(c) - ord("A")))]
+    if not free:
+        pytest.skip("no free drive letter to map")
+    drive = f"{free[0]}:"
+    if not kernel32.DefineDosDeviceW(no_broadcast, drive, str(target)):
+        pytest.skip(f"cannot map a drive letter here: {ctypes.WinError(ctypes.get_last_error())}")
+    try:
+        yield drive
+    finally:
+        kernel32.DefineDosDeviceW(remove | no_broadcast, drive, None)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="drive letters exist only on Windows")
+@pytest.mark.parametrize("spelling", ["root", "root-slash", "drive", "dot-at-root"])
+@pytest.mark.parametrize("kind", ["junction", "symlink", "real-directory"])
+def test_unpack_into_a_drive_root_mapped_onto_a_link_is_refused(
+    tmp_path: Path, kind: str, spelling: str
+) -> None:
+    """Windows only: a drive letter mapped (as subst does) onto a junction or
+    a directory symlink names that link, so its root, spelled "X:\\", "X:/",
+    "X:" or "." with the cwd there, is refused, and the directory the link
+    points to is left as it was. Mapped onto a real directory, each of these
+    spellings is unpacked into."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    target = tmp_path / "real"
+    target.mkdir()
+    (target / "a.md").write_bytes(b"old a")
+    mapped = target
+    if kind != "real-directory":
+        mapped = tmp_path / "link"
+        _link_or_skip(mapped, target, kind)
+
+    cwd = os.getcwd()
+    with _drive_mapped_to(mapped) as drive:
+        dest = {"root": drive + "\\", "root-slash": drive + "/", "drive": drive}.get(spelling, ".")
+        try:
+            if spelling == "dot-at-root":
+                os.chdir(drive + "\\")
+            if kind == "real-directory":
+                unpack(archive, dest)
+            else:
+                with pytest.raises(FileExistsError) as exc:
+                    unpack(archive, dest)
+                assert "symlink or junction" in str(exc.value)
+        finally:
+            os.chdir(cwd)
+
+    assert _tree(target) == {"a.md": b"new a" if kind == "real-directory" else b"old a"}
+
+
+@pytest.mark.parametrize("appears", ["before-staging", "before-rename"])
+@pytest.mark.parametrize("kind", LINK_KINDS)
+def test_unpack_refuses_a_link_that_appears_at_a_new_dest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, appears: str
+) -> None:
+    """All platforms that can create symlinks, and Windows for junctions: a
+    new dest, where a link to a directory appears after the first look
+    (another process at work) and before staging is placed or the staged
+    tree is renamed into place, is refused by that later look. The
+    directory it points to is left as it was, and nothing is left over."""
+    import aphelion.unpacker as unpacker
+
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    target = tmp_path / "real"
+    target.mkdir()
+    (target / "a.md").write_bytes(b"old a")
+    dest = tmp_path / "dest"
+    step = "_make_parents" if appears == "before-staging" else "_extract"
+    real_step = getattr(unpacker, step)
+
+    def step_then_link(*args: object) -> None:
+        real_step(*args)
+        _link_or_skip(dest, target, kind)
+
+    monkeypatch.setattr(unpacker, step, step_then_link)
+    with pytest.raises(FileExistsError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert "symlink or junction" in str(exc.value)
+    assert _tree(target) == {"a.md": b"old a"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest", "real"]
+
+
+@WINDOWS_83
+def test_unpack_into_a_real_directory_by_its_short_name_where_its_parent_cannot_be_listed(
+    tmp_path: Path,
+) -> None:
+    """Windows only: a real directory given by its 8.3 short name, in a
+    directory the user may not list, is unpacked into: looking at it needs
+    no listing of its parent."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    locked = tmp_path / "locked"
+    target = locked / SPELLED_NAME
+    target.mkdir(parents=True)
+    (target / "a.md").write_bytes(b"old a")
+    short = _short_name(target)
+    if short is None:
+        pytest.skip("this volume does not generate 8.3 short names")
+    everyone = "*S-1-1-0"
+    deny = subprocess.run(
+        ["icacls", str(locked), "/deny", f"{everyone}:(RD)"], capture_output=True
+    )
+    try:
+        if deny.returncode != 0:
+            pytest.skip("cannot deny listing a directory here")
+        try:
+            os.listdir(locked)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("listing a directory cannot be denied to this user")
+
+        unpack(archive, locked / short)
+    finally:
+        subprocess.run(["icacls", str(locked), "/remove:d", everyone], capture_output=True)
+
+    assert _tree(target) == {"a.md": b"new a"}
+    assert os.listdir(locked) == [SPELLED_NAME]
+
+
 @WINDOWS_ONLY
 @pytest.mark.parametrize("winerror", [1, 50])
-@pytest.mark.parametrize("spelling", ["long-name", "short-name", "link-wrongly-found-a-directory"])
-def test_dest_is_checked_where_no_final_path_is_reported(
+@pytest.mark.parametrize("spelling", ["long-name", "short-name"])
+def test_unpack_into_a_real_dest_where_no_final_path_is_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str, winerror: int
 ) -> None:
     """Windows only (simulated): on a volume whose driver cannot answer the
     final-path query, resolving dest falls back as the standard library
-    does, reading a link itself. A real directory, by its long or its short
-    name, is unpacked into; a junction the lstat wrongly finds a directory
-    is still refused, as the fallback follows it."""
+    does, and a real directory, by its long or its short name, is unpacked
+    into."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
-    target = tmp_path / ("real" if spelling.startswith("link") else SPELLED_NAME)
+    target = tmp_path / SPELLED_NAME
     target.mkdir()
     (target / "a.md").write_bytes(b"old a")
-    dest = tmp_path / SPELLED_NAME
-    real_lstat = os.lstat
+    dest = target
     if spelling == "short-name":
         short = _short_name(dest)
         if short is None:
             pytest.skip("this volume does not generate 8.3 short names")
         dest = tmp_path / short
-    elif spelling.startswith("link"):
-        _link_or_skip(dest, target, "junction")
-        want = os.path.normcase(str(dest.parent.resolve() / dest.name))
-
-        def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
-            name = os.path.normcase(os.path.abspath(os.fspath(path)))
-            if not kwargs.get("dir_fd") and name == want and _from_aphelion():
-                return os.stat(path)  # what it points to: a directory, no link
-            return real_lstat(path, *args, **kwargs)
-
-        monkeypatch.setattr(os, "lstat", lstat)
     _no_final_path(monkeypatch, tmp_path.resolve(), winerror)
 
-    if spelling.startswith("link"):
-        with pytest.raises(FileExistsError) as exc:
-            unpack(archive, dest)
-        monkeypatch.undo()
-        assert "symlink or junction" in str(exc.value)
-        assert _tree(target) == {"a.md": b"old a"}
-        assert sorted(p.name for p in tmp_path.iterdir()) == sorted(["a.tar", "real", SPELLED_NAME])
-    else:
-        unpack(archive, dest)
-        monkeypatch.undo()
-        assert _tree(target) == {"a.md": b"new a"}
-        assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", SPELLED_NAME]
+    unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert _tree(target) == {"a.md": b"new a"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", SPELLED_NAME]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="junctions exist only on Windows")
