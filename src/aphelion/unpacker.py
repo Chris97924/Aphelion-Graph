@@ -5,8 +5,8 @@ distinct PX_E_6NNN code (see :mod:`aphelion.error_codes`):
   * path traversal ('..' / absolute / Windows drive / backslash)
   * member names that collide once normalized the way any supported
     filesystem would see them (leading ``./``, repeated or ``.`` separators,
-    Unicode NFC, case folding, Windows trailing dots/spaces), or that reach
-    one entry on disk under different names (8.3 short names)
+    Unicode NFC, case folding, and on Windows trailing dots/spaces), or that
+    reach one entry on disk under different names (8.3 short names)
   * disallowed member types (symlink, hardlink, device, fifo)
   * zip-bomb (enforced streaming, per-file and per-total budgets)
   * too many files, overly long paths
@@ -142,13 +142,15 @@ def member_path_key(parts: list[str]) -> str:
     """Collision key for a member path, as a case-insensitive filesystem sees it.
 
     Two members with the same key land on the same file on at least one
-    supported platform: NTFS and APFS compare names case-insensitively, APFS
-    is also normalization-insensitive, and Win32 drops trailing dots and
-    spaces from each component.
+    supported platform: NTFS and APFS compare names case-insensitively, and
+    APFS is also normalization-insensitive. On Windows, where Win32 drops
+    trailing dots and spaces from each component, those are dropped too;
+    elsewhere ``trail.`` and ``trail`` are two files.
     """
     folded = []
     for part in parts:
-        part = part.rstrip(" .") or part
+        if sys.platform == "win32":
+            part = part.rstrip(" .") or part
         folded.append(
             unicodedata.normalize("NFC", unicodedata.normalize("NFC", part).casefold())
         )

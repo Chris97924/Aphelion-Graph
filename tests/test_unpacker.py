@@ -334,6 +334,10 @@ def test_compression_ratio_exceeded(tmp_path: Path) -> None:
 
 # ---------- A1: collisions after normalisation ----------
 
+WIN32_STRIPS_TRAILING = pytest.mark.skipif(
+    sys.platform != "win32", reason="only Win32 drops trailing dots and spaces from names"
+)
+
 
 @pytest.mark.parametrize(
     "first, second",
@@ -346,16 +350,17 @@ def test_compression_ratio_exceeded(tmp_path: Path) -> None:
         ("claims/a.md", "Claims/a.md"),
         ("straße.md", "STRASSE.md"),  # casefold, not lower()
         ("café.md", "café.md"),  # NFC vs NFD
-        ("manifest.json", "manifest.json."),  # Windows strips trailing dots
-        ("manifest.json", "manifest.json "),  # ... and trailing spaces
+        # Windows strips trailing dots and spaces; elsewhere these are two files.
+        pytest.param("manifest.json", "manifest.json.", marks=WIN32_STRIPS_TRAILING),
+        pytest.param("manifest.json", "manifest.json ", marks=WIN32_STRIPS_TRAILING),
     ],
 )
 def test_names_colliding_after_normalisation_rejected(
     tmp_path: Path, first: str, second: str
 ) -> None:
-    """All platforms: two members whose names reach one file once normalized
-    (``./``, case, Unicode form, trailing dots or spaces) are refused before
-    anything is written."""
+    """All platforms (the trailing dot and space pairs on Windows only): two
+    members whose names reach one file once normalized (``./``, case, Unicode
+    form, trailing dots or spaces) are refused before anything is written."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [(_reg(first), b"first"), (_reg(second), b"second")],
@@ -1515,7 +1520,7 @@ def test_pack_refuses_exactly_the_names_unpack_refuses(tmp_path: Path, name: str
         unpacked = exc.code
 
     assert packed == unpacked
-    if name == "a:b.md":  # a drive prefix: refused everywhere, as it always was
+    if name == "a:b.md":  # a drive prefix: unpack always refused it everywhere; now pack too
         assert packed == ErrorCode.WINDOWS_DRIVE
     else:
         refused = sys.platform == "win32" and name in NON_PORTABLE_NAMES
@@ -1539,6 +1544,28 @@ def test_names_only_windows_refuses_work_elsewhere(tmp_path: Path, name: str) ->
     check_member_names(archive)
     unpack(archive, tmp_path / "dest")
     assert (tmp_path / "dest" / name).read_bytes() == b"x"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Win32 drops trailing dots and spaces; Windows refuses these"
+)
+@pytest.mark.parametrize("first, second", [("trail", "trail."), ("x/a:b", "x/a:b ")])
+def test_names_differing_by_a_trailing_dot_or_space_are_two_files_elsewhere(
+    tmp_path: Path, first: str, second: str
+) -> None:
+    """POSIX only: names that differ only by a trailing dot or space are two
+    files here, so pack, validate and unpack accept both."""
+    from aphelion.canonical_tar import TarMember, pack
+    from aphelion.unpacker import check_member_names
+
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(
+        pack([TarMember(path=first, data=b"1"), TarMember(path=second, data=b"2")])
+    )
+    check_member_names(archive)
+    unpack(archive, tmp_path / "dest")
+    assert (tmp_path / "dest" / first).read_bytes() == b"1"
+    assert (tmp_path / "dest" / second).read_bytes() == b"2"
 
 
 @ONLY_WINDOWS_REFUSES
