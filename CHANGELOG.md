@@ -117,50 +117,76 @@ the record of what a bump would carry.
   member over the per-file limit (`PX_E_6010`), or a running total over the
   total limit (`PX_E_6011`) or over the compression-ratio limit
   (`PX_E_6012`), each at `unpack`'s defaults.
-- **Reading an archive stops at a limit, whatever its headers declare**
-  (`PX_E_6013`). Each time `unpack`, `check_member_names`,
-  `extract_signatures_jsonl`, `extract_signer_manifests` or the manifest
-  read in signature validation opens an archive, every byte that reader
-  reads from it, or decompresses, counts against its own limit, a number
-  of passes. One pass is `max_total_bytes` of member data plus, per
-  `max_files` member, room for its headers and padding (4,095 bytes at
-  the default policy), 16 KiB for the end of the archive, and
-  `io.DEFAULT_BUFFER_SIZE` (8 KiB, or 128 KiB from Python 3.14) for the
-  decompressor's read-ahead, which counts each time a compressed archive
-  is opened: 145,955,056 bytes at the default policy on Python 3.14.
-  `check_member_names` has one pass, the other readers two each. A reader
-  of a compressed archive that goes back to a point within the last 64 KiB
-  it read (128 KiB from Python 3.14) is served from those bytes; one that
-  goes back further decompresses the archive again from the start, and
-  that counts again.
-  The count is checked after every read of at most 64 KiB, so the read
-  that fails may end up to 64 KiB past the limit. One call to signature
-  validation (`validate_signatures`) runs `check_member_names`, both
-  accessors and the manifest read, up to seven passes in all;
-  `verify_package` runs `unpack` before them, up to nine. Where the
-  members those readers look up lie within the last 64 KiB (128 KiB from
-  Python 3.14) of a compressed package's tar stream, each of them
-  decompresses it once, so `validate_signatures` decompresses it four
-  times, and `verify_package`, whose `unpack` decompresses it twice, six.
+- **Every reader reads an archive once from front to back, and what it
+  hands `tarfile` is bounded by the member headers it has checked**
+  (`PX_E_6013`). `unpack`, `check_member_names`,
+  `extract_signatures_jsonl`, `extract_signer_manifests`, signature
+  validation (`validate_signatures`) and `verify_package` read an archive
+  in `tarfile`'s stream mode, which never goes back. Before reading on
+  from a member, `tarfile` may be handed up to 4,096 bytes past the end of
+  that member's data, for the next member's headers (pax or GNU long-name
+  headers and its own); before the first member, 5,120 bytes, as its
+  headers may take 1,024 bytes more for a global pax header in front of
+  it. Asking for more, or reading on after reaching the end of the
+  archive 8 times, fails before another byte is handed out. So one pass hands `tarfile` at most
+  `max_total_bytes` plus 4,607 bytes per `max_files` member plus 5,120
+  bytes: 150,932,720 bytes at the default policy. A decompressing reader
+  (gzip, bzip2, zstd) may decompress up to `io.DEFAULT_BUFFER_SIZE` (8 KiB,
+  or 128 KiB from Python 3.14) ahead of that.
+- **Each call reads an archive a fixed number of times**, whatever it
+  holds: `check_member_names`, `extract_signatures_jsonl`,
+  `extract_signer_manifests` and `validate_signatures` once (signature
+  validation collects `signatures.jsonl`, the signer manifests and
+  `manifest.json` in the pass that checks the headers), `unpack` twice,
+  and `verify_package` twice (the second pass of its unpack also collects
+  what the signature checks read). `unpack` refuses (`PX_E_6013`), before
+  writing it, a member its second pass sees with another name, type, size
+  or place than its first, and an archive with one member more or fewer.
   The accessors, signature validation and `verify_package` use the
-  default policy.
+  default policy. The accessors run `unpack`'s header checks other than
+  the name checks, so they too now refuse a link, device or other member
+  type `unpack` refuses (`PX_E_6008`), and an archive whose declared sizes
+  `unpack` refuses.
+- **A member that would take a reader further than its size says is
+  refused before its data is read**: a sparse member or any
+  `GNU.sparse.*` key (`PX_E_6008`); a negative size, a size given in a
+  local or global pax header, or a directory with a size (`PX_E_6010`); a
+  member that does not start where the one before it ends, other than
+  after a global pax header (`PX_E_6013`). Where Python's `tarfile` itself
+  stops at a header with a negative size (recent releases), the reader
+  fails with `tarfile.ReadError`. A package never has any of these.
+- **Bytes after the end of the archive**: everything up to 4,096 bytes
+  past the end of the last member must be zeros, else every reader fails
+  with `tarfile.ReadError` ("data after the end of the archive"). Anything
+  further on is not read, as `tar` reads only the first of two archives
+  written one after the other.
+- **Compression ratio is also checked before a member's data is read**
+  (`PX_E_6012`): for an archive that is a regular file, the bytes handed
+  to `tarfile` so far plus the member's data may not exceed
+  `max_compression_ratio` times the archive's size plus 1 MiB, headers
+  included. Where the archive is not a regular file its size is not
+  known, and only the other limits apply.
+- **xz and LZMA-alone archives are decompressed with at most 100,762,596
+  bytes of decoder memory**, 1.5 times what the largest xz preset (`-9`,
+  `-9e`) needs; one that needs more fails with `PX_E_6013` before the
+  memory is taken. Concatenated xz streams are read one after another, as
+  `lzma.LZMAFile` reads them.
 - **`unpack`, `check_member_names` and the accessors tell a compressed
   archive by its first bytes**, as `tarfile`'s stream mode does: gzip,
-  bzip2, xz, zstd (Python 3.14 and later) and LZMA-alone with the default
-  properties and an 8 MiB dictionary; anything else is read as an
-  uncompressed tar. An LZMA-alone archive with any other dictionary size,
-  or a zstd archive that starts with a skippable frame, which
-  `tarfile.open` read before, now fails with `tarfile.ReadError`. A
-  package, an uncompressed or gzip-compressed ustar archive, is not
-  affected.
-- **Sparse members are refused (`PX_E_6008`)** by `unpack`,
-  `check_member_names`, signature validation and `verify_package`, and so
-  are **members declaring a negative size (`PX_E_6010`)** where Python's
-  `tarfile` reports them. Recent `tarfile` releases do not: for a
-  negative size in the first header they raise `tarfile.ReadError`, and
-  for one in a later header they end the archive there, so the members
-  before it are read, those after it are not, and no error is raised. A
-  package never has either.
+  bzip2, xz, zstd (Python 3.14 and later) and LZMA-alone whose header
+  starts `5d 00 00 80` (the default properties, and a dictionary of 8 MiB
+  or 8 MiB plus a multiple of 16 MiB); anything else is read as an
+  uncompressed tar. Any other LZMA-alone archive, or a zstd archive that
+  starts with a skippable frame, which `tarfile.open` read before, now
+  fails with `tarfile.ReadError`. A package, an uncompressed or
+  gzip-compressed ustar archive, is not affected.
+- **Recommended Python versions for reading archives**: 3.10.21, 3.11.16,
+  3.12.14, 3.13.15 or 3.14.7 and later. Their `tarfile` carries the fixes
+  for CVE-2024-6232 (from 3.10.15, 3.11.10 and 3.12.6), CVE-2025-8194
+  (from 3.10.19, 3.11.14, 3.12.12, 3.13.6 and 3.14.0rc2) and
+  CVE-2026-11972 (from 3.10.21, 3.11.16, 3.12.14, 3.13.15 and 3.14.7). The
+  limits above hold on earlier releases too; there, parsing a member's
+  headers can take longer.
 - **`pack` refuses the member paths `unpack` refuses**: empty (`PX_E_6006`),
   absolute (`PX_E_6002`), containing a backslash (`PX_E_6004`),
   drive-prefixed such as `a:b.md` (`PX_E_6003`, on every platform), or with
