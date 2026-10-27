@@ -752,6 +752,38 @@ def test_verify_with_require_signed_rejects_unsigned(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
+def test_verify_with_require_notary_alone_rejects_unsigned(tmp_path: Path) -> None:
+    """require_notary=True implies require_signed, as ``aphe verify
+    --require-notary`` does: an unsigned package → E_SIGNER_REQUIRED."""
+    from aphelion.verifier import verify_package
+
+    src = tmp_path / "src"
+    _build_minimal_source(src)
+    tar_path = tmp_path / "pkg.tar"
+    _pack_source(src, tar_path)
+
+    with pytest.raises(SignerVerificationError) as exc_info:
+        verify_package(tar_path, require_notary=True)
+    assert exc_info.value.code == "E_SIGNER_REQUIRED"
+    assert "--require-notary" in str(exc_info.value)
+
+
+@pytest.mark.integration
+def test_require_notary_alone_on_a_signed_package_checks_its_attestation(
+    tmp_path: Path,
+) -> None:
+    """require_notary=True without require_signed on a signed package: the
+    attestation is checked as before (local only → E_SIGNER_NOTARY_REQUIRED)."""
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+
+    with pytest.raises(SignerVerificationError) as exc_info:
+        verify_package(tar_path, require_notary=True)
+    assert exc_info.value.code == "E_SIGNER_NOTARY_REQUIRED"
+
+
+@pytest.mark.integration
 def test_tampered_payload_fails_hash_check(tmp_path: Path) -> None:
     """Envelope carrying wrong package_canonical_hash → E_SIGNATURE_HASH_MISMATCH.
 

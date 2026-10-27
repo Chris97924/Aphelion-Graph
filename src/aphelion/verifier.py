@@ -13,6 +13,8 @@ v0.5 extension:
 Backward-compat: ``require_signed=False, require_notary=False`` preserves v0.4
 behavior. Presence of ``signatures.jsonl`` always invokes §5 — the
 ``require_signed`` flag only controls whether ABSENCE of signatures is an error.
+``require_notary=True`` implies ``require_signed=True``, as
+``aphe verify --require-notary`` does.
 """
 
 from __future__ import annotations
@@ -380,7 +382,8 @@ def verify_package(
        Failure here uses v0.4 error codes; signatures are NOT checked.
     2. Run §5 signature validation, reusing the parsed signer manifests it
        already extracted (no per-envelope tar re-read).
-    3. If ``require_signed=True`` and envelopes is empty: raise E_SIGNER_REQUIRED.
+    3. If ``require_signed=True`` or ``require_notary=True`` (which implies
+       it, as in the CLI) and envelopes is empty: raise E_SIGNER_REQUIRED.
     4. For each envelope, resolve notary. If ``require_notary=True`` and any
        attestation is ``"verified-locally"`` only: raise E_SIGNER_NOTARY_REQUIRED.
 
@@ -405,11 +408,12 @@ def verify_package(
     # re-parsing per envelope.
     envelopes, signer_manifests_by_id = _validate_signatures_full(tar_path)
 
-    # Step 3: require_signed check
-    if require_signed and len(envelopes) == 0:
+    # Step 3: require_signed check; require_notary implies it, as in the CLI
+    if (require_signed or require_notary) and len(envelopes) == 0:
         raise SignerVerificationError(
             "E_SIGNER_REQUIRED",
-            "package has no signatures but caller requires --require-signed",
+            "package has no signatures but caller requires "
+            + ("--require-signed" if require_signed else "--require-notary"),
         )
 
     # Step 4: notary resolution

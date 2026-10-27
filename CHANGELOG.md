@@ -189,6 +189,10 @@ the record of what a bump would carry.
   not `str.isspace`, which is also true for NBSP, form feed, vertical tab and
   the Unicode separators. Skipping those let the reader accept, between two
   claim objects, bytes it would refuse inside one.
+- **`verify_package(..., require_notary=True)` implies `require_signed`,**
+  as `aphe verify --require-notary` always has: a package with no
+  signatures now fails with `E_SIGNER_REQUIRED` instead of passing when a
+  caller passes `require_notary=True` alone.
 
 ### Compatibility
 
