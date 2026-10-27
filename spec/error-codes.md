@@ -172,8 +172,8 @@ are used by the v0.5 signature verification path in `validator.validate_signatur
 | `E_SIGNER_ALGORITHM_MISMATCH`  | Envelope `algorithm` does not match the signer manifest `algorithm`. Raised before verifier dispatch to close confused-deputy gap. |
 | `E_SIGNATURE_INVALID`          | Signature bytes fail cryptographic verification against the public key.                   |
 | `E_SIGNATURE_ORDER`            | Lines in `signatures.jsonl` violate §2.4 lex-ascending sort order.                       |
-| `E_SIGNER_REQUIRED`            | Caller passed `--require-signed` but package has no `signatures.jsonl`.                  |
-| `E_SIGNER_NOTARY_REQUIRED`     | Caller passed `--require-notary` but all attestations are `"verified-locally"` only.     |
+| `E_SIGNER_REQUIRED`            | Caller passed `--require-signed` (or `--require-notary`, which implies it) but the package has no signatures, or the target is not a package file (an unpacked directory, say), on which no signature can be checked. |
+| `E_SIGNER_NOTARY_REQUIRED`     | Caller passed `--require-notary` for a signed package file, and a signer's attestation is `"verified-locally"` only. |
 | `E_SIGNER_ALGORITHM_UNAVAILABLE`| `cryptography` extra is not installed; `ed25519` cannot be used.                        |
 
 ## v0.6 — Notary attestation error codes (R7.2)
