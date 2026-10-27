@@ -47,6 +47,10 @@ the record of what a bump would carry.
   comparison into an implementation checked against itself. This is what
   unblocks the pinned M5 gate: 30/30 packages in a deterministic stress corpus
   and 6/6 packable committed samples are byte-identical to `aphelion.packer.pack`.
+- **The CLI's JSON error line carries the error's notes.** When an error has
+  notes (Python 3.11+), such as one naming a directory a failed `unpack` or
+  `migrate --force` left behind, the line includes them as a `"notes"` list
+  of strings. Lines for errors without notes are unchanged.
 
 ### Changed
 
@@ -66,6 +70,38 @@ the record of what a bump would carry.
   building the independent implementation above and byte-comparing it against
   the reference. **No producer or consumer behaviour changes** — the reference
   already emitted the now-documented form; the document was what was wrong.
+- **`unpack` and `migrate --force` are all-or-nothing.** `unpack` extracts
+  into a staging directory and moves entries into place only once every
+  member has passed every check; `migrate --force` builds the new tree beside
+  the destination and then swaps it in. If either fails or is interrupted
+  (Ctrl-C included) before every entry is in place, the destination is put
+  back as it was, or the error names the directory that still holds the
+  original files, which is deleted only once it is empty. A staging or
+  backup directory left behind is named in a note on the error (Python
+  3.11+) or in a `RuntimeWarning` that is shown even where warnings are
+  ignored or turned into errors. A file in the destination is replaced by
+  renaming the new one onto its name, so other hard links to it keep their
+  content.
+- **`unpack` refuses more destinations and archives**, each before anything
+  in the destination changes:
+  - a destination that is a symlink, a junction or a Windows mounted folder
+    (unpack into a directory inside it instead);
+  - a symlink or junction already in the destination where the archive has a
+    file or a directory, and a directory where it has a file; such entries
+    are left as they are;
+  - two members that reach one entry on the target filesystem, for instance
+    by a Windows 8.3 short name (`PX_E_6007`). `pack` does not see such
+    aliases;
+  - on a filesystem that reports no file identity (inode number 0), an
+    archive that would replace or merge into an existing entry, since
+    whether two members reach that entry cannot be checked there.
+- **On Windows, `pack`, `unpack` and the archive checks of `validate` and
+  `verify` refuse member names Win32 cannot create**: device names such as
+  `CON` or `aux.md`, names ending in a dot or a space, and the characters
+  `<>:"|?*` and control characters. They also treat names that differ only
+  by trailing dots or spaces as colliding. Other platforms accept both, as
+  before. A drive-prefixed name such as `a:b.md` is refused on every
+  platform, now by `pack` as well as `unpack`.
 
 ### Fixed
 
