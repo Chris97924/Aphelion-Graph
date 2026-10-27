@@ -594,29 +594,114 @@ def test_reading_an_archive_stays_within_its_read_limit(
 def test_seeking_back_in_a_compressed_archive_counts_what_is_decompressed_again(
     tmp_path: Path,
 ) -> None:
-    """All platforms: a seek back reopens a compressed archive and
-    decompresses it again from the start, reading the right bytes; those
-    bytes count, so going back and forth fails (PX_E_6013) once the total
-    passes the limit."""
+    """All platforms: a seek back past the bytes just read reopens a
+    compressed archive and decompresses it again from the start, reading the
+    right bytes; those bytes count, so going back and forth fails
+    (PX_E_6013) once the total passes the limit."""
     from aphelion.unpacker import _BoundedArchive
 
-    data = random.Random(2).randbytes(64 * 1024)
+    data = random.Random(2).randbytes(512 * 1024)
     path = tmp_path / "a.gz"
     path.write_bytes(gzip.compress(data, mtime=0))
-    stream = _BoundedArchive(path, gzip.GzipFile, compressed=True, limit=1024 * 1024)
+    stream = _BoundedArchive(path, gzip.GzipFile, compressed=True, limit=4 * 1024 * 1024)
     try:
-        assert stream.seek(1000) == 1000
-        assert stream.read(10) == data[1000:1010]
+        assert stream.seek(400 * 1024) == 400 * 1024
+        assert stream.read(10) == data[400 * 1024 : 400 * 1024 + 10]
         assert stream.seek(5) == 5
         assert stream.read(10) == data[5:15]
         assert stream.tell() == 15
         with pytest.raises(SecurityError) as exc:
             for _ in range(100):
-                stream.seek(60 * 1024)
+                stream.seek(len(data) - 1)
                 stream.seek(0)
         assert exc.value.code == ErrorCode.ARCHIVE_BOMB
     finally:
         stream.close()
+
+
+def test_seeking_back_within_the_bytes_just_read_does_not_decompress_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: a seek back that lands within the last
+    max(64 KiB, io.DEFAULT_BUFFER_SIZE) bytes read is served from them: the
+    right bytes, the file not opened again, nothing decompressed twice, and
+    the count still exactly what was decompressed."""
+    from aphelion.unpacker import _READ_CHUNK, _BoundedArchive
+
+    held = max(_READ_CHUNK, io.DEFAULT_BUFFER_SIZE)
+    data = random.Random(4).randbytes(4 * held)
+    path = tmp_path / "a.gz"
+    path.write_bytes(gzip.compress(data, mtime=0))
+    opened: list[Path] = []
+
+    def open_file(p: Path) -> gzip.GzipFile:
+        opened.append(p)
+        return gzip.GzipFile(p)
+
+    count = _count_decompressed(monkeypatch)
+    stream = _BoundedArchive(path, open_file, compressed=True, limit=len(data) * 16)
+    try:
+        end = 2 * held + 1000
+        assert stream.seek(end - 1000) == end - 1000
+        assert stream.read(1000) == data[end - 1000 : end]
+        for back in (1, 512, held // 2, held):
+            assert stream.seek(end - back) == end - back
+            assert stream.read(back) == data[end - back : end]
+        assert stream.seek(-held, io.SEEK_CUR) == end - held
+        assert stream.read(held + 10) == data[end - held : end + 10]
+        end += 10
+        assert stream.tell() == end
+        assert stream._produced == io.DEFAULT_BUFFER_SIZE + end
+    finally:
+        stream.close()
+    monkeypatch.undo()
+
+    assert opened == [path]
+    assert count[0] <= end + io.DEFAULT_BUFFER_SIZE, count[0]
+
+
+def test_accessors_read_a_compressed_archive_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: signatures.jsonl and the signer manifests at the end
+    of a compressed archive, after 1 MiB of other member data, are read
+    back from the bytes just read: each accessor opens the archive once and
+    decompresses it once."""
+    from aphelion.unpacker import (
+        _BoundedArchive,
+        extract_signatures_jsonl,
+        extract_signer_manifests,
+    )
+
+    raw = _tar_bytes(
+        [
+            ("data/big.bin", random.Random(5).randbytes(1024 * 1024)),
+            ("signatures.jsonl", b"{}\n"),
+            ("signers/s.json", b"{}"),
+        ]
+    )
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(gzip.compress(raw, compresslevel=1, mtime=0))
+    opens = [0]
+    real_open = _BoundedArchive._open
+
+    def counting_open(self: _BoundedArchive) -> object:
+        opens[0] += 1
+        return real_open(self)
+
+    monkeypatch.setattr(_BoundedArchive, "_open", counting_open)
+    count = _count_decompressed(monkeypatch)
+
+    results = []
+    for accessor in (extract_signatures_jsonl, extract_signer_manifests):
+        opens[0] = count[0] = 0
+        results.append(accessor(archive))
+        assert opens[0] == 1, accessor.__name__
+        assert count[0] <= len(raw) + io.DEFAULT_BUFFER_SIZE, (accessor.__name__, count[0])
+    monkeypatch.undo()
+
+    assert results[0] == b"{}\n"
+    assert dict(results[1]) == {"s": b"{}"}
 
 
 _FORMATS = ["tar", "gz", "bz2", "xz", "zst"]

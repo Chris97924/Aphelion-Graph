@@ -244,12 +244,16 @@ class _BoundedArchive:
 
     tarfile skips member data, and can move backwards, by seeking. A
     compressed stream is only ever read forwards here: a forward seek reads
-    what it skips, and a backward seek opens the file again and decompresses
-    from the start, all of it counted, as is the read-ahead the decompressing
-    file object may hold each time it is opened. Whatever the member headers
-    say, past ``limit`` (checked after every read of at most ``_READ_CHUNK``
-    bytes) reading fails with ARCHIVE_BOMB. An uncompressed file seeks
-    directly, and the bytes read are counted.
+    what it skips. The last ``max(_READ_CHUNK, io.DEFAULT_BUFFER_SIZE)``
+    bytes read are held, and a backward seek that lands within them is
+    served from them, counted once. A seek further back opens the file again
+    and decompresses from the start, all of it counted again, as is the
+    read-ahead (``io.DEFAULT_BUFFER_SIZE``) the decompressing file object may
+    hold each time it is opened. Whatever the member headers say, past
+    ``limit`` reading fails with ARCHIVE_BOMB; the count is checked after
+    every read of at most ``_READ_CHUNK`` bytes, so the read that fails may
+    end up to that much past ``limit``. An uncompressed file seeks directly,
+    and the bytes read are counted.
     """
 
     def __init__(
@@ -264,7 +268,9 @@ class _BoundedArchive:
         self._compressed = compressed
         self._limit = limit
         self._produced = 0
-        self._pos = 0
+        self._pos = 0  # where tarfile is
+        self._end = 0  # how far the open file has been read
+        self._held = bytearray()  # the bytes just before ``_end``
         self._file = self._open()
 
     def _open(self) -> BinaryIO:
@@ -286,16 +292,32 @@ class _BoundedArchive:
     def read(self, size: int | None = -1) -> bytes:
         remaining = -1 if size is None or size < 0 else size
         chunks = []
+        if self._pos < self._end:
+            start = len(self._held) - (self._end - self._pos)
+            stop = len(self._held) if remaining < 0 else min(len(self._held), start + remaining)
+            chunks.append(bytes(self._held[start:stop]))
+            self._pos += stop - start
+            if remaining > 0:
+                remaining -= stop - start
         while remaining:
             data = self._file.read(_READ_CHUNK if remaining < 0 else min(remaining, _READ_CHUNK))
             if not data:
                 break
             self._pos += len(data)
+            self._end = self._pos
             self._count(len(data))
+            if self._compressed:
+                self._hold(data)
             chunks.append(data)
             if remaining > 0:
                 remaining -= len(data)
         return b"".join(chunks)
+
+    def _hold(self, data: bytes) -> None:
+        keep = max(_READ_CHUNK, io.DEFAULT_BUFFER_SIZE)
+        self._held += data
+        if len(self._held) > keep:
+            del self._held[: len(self._held) - keep]
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
         if whence == io.SEEK_CUR:
@@ -303,12 +325,18 @@ class _BoundedArchive:
         elif whence != io.SEEK_SET:
             raise io.UnsupportedOperation("an archive is only read from its start")
         if not self._compressed:
-            self._pos = self._file.seek(offset)
+            self._pos = self._end = self._file.seek(offset)
             return self._pos
-        if offset < self._pos:
+        if self._end - len(self._held) <= offset <= self._end:
+            self._pos = offset
+            return self._pos
+        if offset < self._end:
             self._file.close()
             self._file = self._open()
-            self._pos = 0
+            self._pos = self._end = 0
+            self._held.clear()
+        else:
+            self._pos = self._end
         while self._pos < offset and self.read(min(offset - self._pos, _READ_CHUNK)):
             pass
         return self._pos
