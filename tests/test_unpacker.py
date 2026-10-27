@@ -2407,6 +2407,272 @@ def test_unpack_never_writes_through_a_link_dest_wrongly_found_absent(
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest", "real"]
 
 
+@pytest.mark.parametrize("points_to", ["sibling", "same-name-elsewhere"])
+@pytest.mark.parametrize("wrong", ["first-look", "every-look"])
+@pytest.mark.parametrize("kind", LINK_KINDS)
+def test_unpack_never_writes_through_a_link_dest_wrongly_found_a_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, wrong: str, points_to: str
+) -> None:
+    """All platforms that can create symlinks, and Windows for junctions: a
+    dest that is a link, for which the lstat wrongly answers what the
+    directory it points to is (a directory, and no link), by the first look
+    or by every look, is still refused: resolving it ends elsewhere, at a
+    sibling or at a directory of the same name in another directory. The
+    directory it points to is left as it was."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a"), (_reg("b.md"), b"new b")])
+    target = tmp_path / ("real" if points_to == "sibling" else "other/dest")
+    target.mkdir(parents=True)
+    (target / "a.md").write_bytes(b"old a")
+    dest = tmp_path / "dest"
+    _link_or_skip(dest, target, kind)
+    want = os.path.normcase(str(dest.parent.resolve() / dest.name))
+    looks: list[str] = []
+    real_lstat = os.lstat
+
+    def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
+        name = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if not kwargs.get("dir_fd") and name == want and _from_aphelion():
+            looks.append(name)
+            if wrong == "every-look" or len(looks) == 1:
+                return os.stat(path)  # what it points to: a directory, no link
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    with pytest.raises(FileExistsError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert looks
+    assert "symlink or junction" in str(exc.value)
+    assert _tree(target) == {"a.md": b"old a"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        ["a.tar", "dest", target.relative_to(tmp_path).parts[0]]
+    )
+
+
+@pytest.mark.parametrize("kind", LINK_KINDS)
+def test_unpack_refuses_a_link_dest_wrongly_resolved_to_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """All platforms that can create symlinks, and Windows for junctions: a
+    dest that is a link, which resolving wrongly leaves where it is (as if
+    it were no link), is refused by the lstat, and the directory it points
+    to is left as it was."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    target = tmp_path / "real"
+    target.mkdir()
+    (target / "a.md").write_bytes(b"old a")
+    dest = tmp_path / "dest"
+    _link_or_skip(dest, target, kind)
+    want = os.path.normcase(str(dest.parent.resolve() / dest.name))
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, *args: object, **kwargs: object) -> Path:
+        if os.path.normcase(os.path.abspath(self)) == want:
+            return Path(os.path.abspath(self))
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    with pytest.raises(FileExistsError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert "symlink or junction" in str(exc.value)
+    assert _tree(target) == {"a.md": b"old a"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest", "real"]
+
+
+SPELLED_NAME = "aLongDirectoryName"  # long enough to get an 8.3 short name
+DEST_SPELLINGS = [
+    "dot",
+    "dotdot",
+    "absolute-dotdot",
+    "trailing-slash",
+    pytest.param(
+        "trailing-backslash",
+        marks=pytest.mark.skipif(
+            sys.platform != "win32", reason="a backslash separates only on Windows"
+        ),
+    ),
+    pytest.param("short-name", marks=WINDOWS_83),
+    pytest.param(
+        "mixed-case",
+        marks=pytest.mark.skipif(
+            sys.platform != "win32", reason="names differing in case are one only on Windows"
+        ),
+    ),
+]
+
+
+def _spell_dest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str) -> str:
+    """A spelling of tmp_path/SPELLED_NAME (which has a ``sub`` directory) as
+    dest, changing the cwd where the spelling needs one."""
+    entry = tmp_path / SPELLED_NAME
+    if spelling == "dot":
+        monkeypatch.chdir(entry)
+        return "."
+    if spelling == "dotdot":
+        monkeypatch.chdir(entry / "sub")
+        return ".."
+    if spelling == "absolute-dotdot":
+        return f"{entry}/sub/.."
+    monkeypatch.chdir(tmp_path)
+    if spelling == "trailing-slash":
+        return SPELLED_NAME + "/"
+    if spelling == "trailing-backslash":
+        return SPELLED_NAME + "\\"
+    if spelling == "mixed-case":
+        return SPELLED_NAME.swapcase()
+    short = _short_name(entry)
+    if short is None:
+        pytest.skip("this volume does not generate 8.3 short names")
+    return short
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="elsewhere '..' is resolved physically: see the next test"
+)
+@pytest.mark.parametrize("spelling", DEST_SPELLINGS)
+@pytest.mark.parametrize("kind", LINK_KINDS)
+def test_unpack_refuses_a_link_dest_however_it_is_spelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, spelling: str
+) -> None:
+    """Windows only: Win32 collapses "." and ".." against the full path
+    before it looks at any link, so "." with the cwd a link, ".." from a
+    directory in it, "link/sub/..", and the link's short name, a case
+    variant or a trailing separator all name the link itself. Each is
+    refused, and the directory it points to is left as it was."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    target = tmp_path / "real"
+    (target / "sub").mkdir(parents=True)
+    (target / "a.md").write_bytes(b"old a")
+    _link_or_skip(tmp_path / SPELLED_NAME, target, kind)
+    dest = _spell_dest(tmp_path, monkeypatch, spelling)
+
+    with pytest.raises(FileExistsError) as exc:
+        unpack(archive, dest)
+
+    assert "symlink or junction" in str(exc.value)
+    assert _tree(target) == {"a.md": b"old a", "sub": None}
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(["a.tar", "real", SPELLED_NAME])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows collapses '..' first: see above")
+@pytest.mark.parametrize("spelling", ["dot", "dotdot", "absolute-dotdot", "trailing-slash"])
+def test_elsewhere_dot_and_dotdot_by_way_of_a_link_dest_end_at_its_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
+    """Elsewhere than Windows the cwd is a physical path and ".." is resolved
+    physically, so "." with the cwd entered by way of a symlink, ".." from a
+    directory in it and "link/sub/.." end at the directory it points to, a
+    real directory, which is unpacked into. "link/" names the link itself
+    and is refused."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    target = tmp_path / "real"
+    (target / "sub").mkdir(parents=True)
+    (target / "a.md").write_bytes(b"old a")
+    _link_or_skip(tmp_path / SPELLED_NAME, target, "symlink")
+    dest = _spell_dest(tmp_path, monkeypatch, spelling)
+
+    if spelling == "trailing-slash":
+        with pytest.raises(FileExistsError) as exc:
+            unpack(archive, dest)
+        assert "symlink or junction" in str(exc.value)
+        assert _tree(target) == {"a.md": b"old a", "sub": None}
+    else:
+        unpack(archive, dest)
+        assert _tree(target) == {"a.md": b"new a", "sub": None}
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(["a.tar", "real", SPELLED_NAME])
+
+
+@pytest.mark.parametrize("spelling", DEST_SPELLINGS)
+def test_unpack_into_a_real_directory_however_it_is_spelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
+    """All platforms (Windows also for a backslash, a short name and a case
+    variant): the same spellings of a real directory are unpacked into."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    target = tmp_path / SPELLED_NAME
+    (target / "sub").mkdir(parents=True)
+    (target / "a.md").write_bytes(b"old a")
+    dest = _spell_dest(tmp_path, monkeypatch, spelling)
+
+    unpack(archive, dest)
+
+    assert _tree(target) == {"a.md": b"new a", "sub": None}
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(["a.tar", SPELLED_NAME])
+
+
+@pytest.mark.parametrize("dest_exists", [False, True], ids=["new-dest", "existing-dest"])
+@pytest.mark.parametrize("kind", LINK_KINDS)
+def test_unpack_into_a_dest_whose_parent_is_a_link(
+    tmp_path: Path, kind: str, dest_exists: bool
+) -> None:
+    """All platforms that can create symlinks, and Windows for junctions: a
+    link above dest is followed, as any parent is; only dest itself must
+    not be one."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    if dest_exists:
+        (real_parent / "dest").mkdir()
+    _link_or_skip(tmp_path / "parent", real_parent, kind)
+
+    unpack(archive, tmp_path / "parent" / "dest")
+
+    assert _tree(real_parent) == {"dest": None, "dest/a.md": b"new a"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "parent", "real"]
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("winerror", [1, 50])
+@pytest.mark.parametrize("spelling", ["long-name", "short-name", "link-wrongly-found-a-directory"])
+def test_dest_is_checked_where_no_final_path_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str, winerror: int
+) -> None:
+    """Windows only (simulated): on a volume whose driver cannot answer the
+    final-path query, resolving dest falls back as the standard library
+    does, reading a link itself. A real directory, by its long or its short
+    name, is unpacked into; a junction the lstat wrongly finds a directory
+    is still refused, as the fallback follows it."""
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a")])
+    target = tmp_path / ("real" if spelling.startswith("link") else SPELLED_NAME)
+    target.mkdir()
+    (target / "a.md").write_bytes(b"old a")
+    dest = tmp_path / SPELLED_NAME
+    real_lstat = os.lstat
+    if spelling == "short-name":
+        short = _short_name(dest)
+        if short is None:
+            pytest.skip("this volume does not generate 8.3 short names")
+        dest = tmp_path / short
+    elif spelling.startswith("link"):
+        _link_or_skip(dest, target, "junction")
+        want = os.path.normcase(str(dest.parent.resolve() / dest.name))
+
+        def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
+            name = os.path.normcase(os.path.abspath(os.fspath(path)))
+            if not kwargs.get("dir_fd") and name == want and _from_aphelion():
+                return os.stat(path)  # what it points to: a directory, no link
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", lstat)
+    _no_final_path(monkeypatch, tmp_path.resolve(), winerror)
+
+    if spelling.startswith("link"):
+        with pytest.raises(FileExistsError) as exc:
+            unpack(archive, dest)
+        monkeypatch.undo()
+        assert "symlink or junction" in str(exc.value)
+        assert _tree(target) == {"a.md": b"old a"}
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted(["a.tar", "real", SPELLED_NAME])
+    else:
+        unpack(archive, dest)
+        monkeypatch.undo()
+        assert _tree(target) == {"a.md": b"new a"}
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", SPELLED_NAME]
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="junctions exist only on Windows")
 def test_unpack_refuses_a_junction_to_a_drive_root_as_destination(tmp_path: Path) -> None:
     """Windows only: a junction to the root of a volume is refused like any

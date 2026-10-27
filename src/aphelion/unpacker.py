@@ -328,7 +328,12 @@ def unpack(
     ignored or turned into errors. ``dest_dir``
     itself must not be a symlink or junction, and it is never followed:
     only its parent is resolved, and every look that finds it there refuses
-    a link. Nor can it be a Windows
+    a link, accepting it only where a strict lstat and a look by another
+    call (resolving it on Windows, readlink elsewhere) agree that it is a
+    directory and no link. That is the entry the
+    spelling ends at as the OS resolves it: on Windows ``.`` is the current
+    directory as named and ``x/..`` is ``x``'s parent, so a junction named
+    either way is refused. Nor can it be a Windows
     mounted folder, which is the same kind of reparse point as a junction:
     unpack into a directory inside it instead.
 
@@ -353,17 +358,19 @@ def unpack(
     policy = policy or ExtractPolicy.default()
     archive = Path(archive_path)
     dest = Path(dest_dir)
-    # dest's own last component is never followed, so not even a look that
-    # wrongly finds nothing there can send the writes through a link. "."
-    # and ".." are no entry of their own: those are resolved whole.
-    if dest.name in ("", ".."):
-        dest_resolved = dest.resolve()
+    # dest's own entry is never followed, so not even a look that wrongly
+    # finds nothing there can send the writes through a link. The entry is
+    # the one the OS's own resolution of the spelling ends at: Windows
+    # collapses "." and ".." against the full path before it looks at any
+    # link ("." is the cwd as named, "x/.." is x's parent), as abspath does;
+    # elsewhere ".." is resolved physically, and a path that names no entry
+    # of its own (a root, "." or "..") is resolved whole.
+    entry = Path(os.path.abspath(dest)) if sys.platform == "win32" else dest
+    if entry.name in ("", ".."):
+        entry = entry.resolve()
     else:
-        dest_resolved = dest.parent.resolve() / dest.name
-    if _dest_exists(dest_resolved):
-        # A real directory, as that strict look showed: resolving it follows
-        # nothing, and spells out an 8.3 short name the checks compare with.
-        dest_resolved = dest_resolved.resolve()
+        entry = entry.parent.resolve() / entry.name
+    dest_resolved = _dest_exists(entry) or entry
     made: list[Path] = []  # parents this call created, each on record before its mkdir
     staging = backup = replacement = None
     renaming = False
@@ -404,20 +411,57 @@ def unpack(
     return dest
 
 
-def _dest_exists(dest: Path) -> bool:
-    """Whether the unpack destination is there, by a strict lstat; a link or
-    anything but a directory there is refused. Asked wherever unpack decides
-    on that, so a look that wrongly finds nothing is followed by one that
-    refuses the link, or by a step that fails if anything is there."""
+def _dest_exists(dest: Path) -> Path | None:
+    """The unpack destination, resolved, if it is there; None if a strict
+    lstat finds nothing. A link or anything but a directory there is
+    refused. Asked wherever unpack decides on that, so a look that wrongly
+    finds nothing is followed by one that refuses the link, or by a step
+    that fails if anything is there.
+
+    Accepting dest takes two looks that agree: the lstat shows a directory
+    that is no link, and a look by another call finds no link there either.
+    On Windows that is resolving it, which follows a link, ending at that
+    same entry (where the volume reports no final path, the standard
+    library reads the link itself); elsewhere, where resolving asks lstat
+    too, it is readlink. So no one wrong answer accepts a link.
+    """
     st = _lstat(dest)
     if st is None:
-        return False
+        return None
     if _is_link(st):
         # resolve() would follow it, also when dangling, and unpack elsewhere.
         raise FileExistsError(f"unpack destination is a symlink or junction: {dest}")
     if not stat.S_ISDIR(st.st_mode):
         raise FileExistsError(f"unpack destination is not a directory: {dest}")
-    return True
+    resolved = dest.resolve()
+    if os.path.normcase(resolved) != os.path.normcase(dest) and os.path.normcase(
+        resolved
+    ) != os.path.normcase(_long_name(dest)):
+        raise FileExistsError(
+            f"unpack destination is a symlink or junction: {dest} resolves to {resolved}"
+        )
+    if sys.platform != "win32":
+        try:
+            os.readlink(dest)
+        except OSError as err:
+            if err.errno != errno.EINVAL:  # EINVAL: no link there
+                raise
+        else:
+            raise FileExistsError(f"unpack destination is a symlink or junction: {dest}")
+    return resolved
+
+
+def _long_name(path: Path) -> Path:
+    """``path`` with its 8.3 short names spelled out, as listed in each
+    parent directory (GetLongPathNameW), so its last component is not
+    followed; ``path`` itself off Windows or where that fails."""
+    if sys.platform != "win32":
+        return path
+    import ctypes
+
+    buf = ctypes.create_unicode_buffer(32768)
+    size = ctypes.WinDLL("kernel32").GetLongPathNameW(str(path), buf, len(buf))
+    return Path(buf.value) if 0 < size < len(buf) else path
 
 
 def _is_link(st: os.stat_result) -> bool:

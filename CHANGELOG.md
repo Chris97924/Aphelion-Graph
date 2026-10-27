@@ -85,7 +85,9 @@ the record of what a bump would carry.
 - **`unpack` refuses more destinations and archives**, and leaves the
   destination as it was:
   - a destination that is a symlink, a junction or a Windows mounted folder
-    (unpack into a directory inside it instead);
+    (unpack into a directory inside it instead), on Windows also when it is
+    spelled `.` or `x/..` and the current directory or `x`'s parent, as
+    named, is such a link;
   - a symlink or junction already in the destination where the archive has a
     file or a directory, and a directory where it has a file; such entries
     are left as they are;
