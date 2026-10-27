@@ -228,7 +228,11 @@ def _read_limit(policy: ExtractPolicy) -> int:
 
     That is ``max_total_bytes`` of member data, the header allowance for
     ``max_files`` members, the end of the archive, and the read-ahead
-    (``io.DEFAULT_BUFFER_SIZE``) a decompressing file object holds back.
+    (``io.DEFAULT_BUFFER_SIZE``: 8 KiB, or 128 KiB from Python 3.14) a
+    decompressing file object holds back, counted each time a compressed
+    archive is opened. 145,955,056 bytes at the default policy on Python
+    3.14. A reader has a limit of one or two passes (see
+    :func:`_open_archive`).
     """
     return (
         policy.max_total_bytes
@@ -352,7 +356,10 @@ def _compression(head: bytes) -> tuple[str, Callable[[Path], BinaryIO], tuple[ty
     """The compression an archive's leading bytes name (the test tarfile's
     stream mode uses), how to open such a file, and the errors that, while the
     first header is read, mean it is not one (as in tarfile's ``gzopen``,
-    ``bz2open``, ``xzopen`` and ``zstopen``)."""
+    ``bz2open``, ``xzopen`` and ``zstopen``). LZMA-alone is recognised only
+    with the default properties and an 8 MiB dictionary, and zstd only from
+    a data frame (not a skippable one) on Python 3.14 and later; anything
+    else is read as an uncompressed tar."""
     try:
         if head.startswith(b"\x1f\x8b\x08"):
             import gzip
@@ -379,11 +386,15 @@ def _compression(head: bytes) -> tuple[str, Callable[[Path], BinaryIO], tuple[ty
 def _open_archive(
     archive: Path, policy: ExtractPolicy, passes: int = 2
 ) -> Iterator[tarfile.TarFile]:
-    """Open ``archive`` for reading as ``tarfile.open(archive, "r")`` would,
-    with every byte read, or decompressed, counted against ``passes`` times
-    :func:`_read_limit` (see :class:`_BoundedArchive`). A reader that checks
-    the headers and then reads member data makes two passes: once it has
-    seen the last header, reading a member's data seeks back."""
+    """Open ``archive`` for reading, decompressed as its first bytes say
+    (see :func:`_compression`), with every byte read, or decompressed,
+    counted against ``passes`` times :func:`_read_limit` (see
+    :class:`_BoundedArchive`). Each call has its own count, so a caller
+    that opens an archive several times may read up to the sum of their
+    limits. A reader that checks the headers and then reads member data may
+    make two passes: once it has seen the last header, reading a member's
+    data seeks back, and in a compressed archive a seek back past the bytes
+    still held decompresses it again from the start."""
     with open(archive, "rb") as fh:
         head = fh.read(10)
     kind, open_file, not_this_kind = _compression(head)
@@ -414,8 +425,11 @@ def _scan_members(
     before the scan moves past it, as :func:`_extract` checks them. A sparse
     member, or one declaring a negative size, is refused first: tarfile
     would skip a different extent than the size it reports, or move
-    backwards. Neither occurs in a canonical package. Whatever the headers
-    say, the bytes read stay within :func:`_read_limit` (see
+    backwards. Recent tarfile releases never hand out a negative size: they
+    raise ``tarfile.ReadError`` for one in the first header and otherwise
+    end the archive at that header, so the scan sees only the members
+    before it. Neither occurs in a canonical package. Whatever the headers
+    say, reading fails once it passes the reader's limit (see
     :func:`_open_archive`).
     """
     scanned: list[tuple[tarfile.TarInfo, str]] = []
@@ -536,12 +550,17 @@ def unpack(
     Uses a streaming tarfile.next() loop - NEVER tar.extractall(), because
     extractall won't catch zip-bomb-class expansion until it's already disk-bound.
     Whatever the member headers say, the bytes read from the archive, or
-    decompressed from it (a seek backwards decompresses again from the
-    start), stay within two passes (the header checks, then the member data)
-    of ``max_total_bytes`` plus, per ``max_files`` member, room for headers
-    and padding (4 KiB at the default policy), 16 KiB for the end of the
-    archive and the decompressor's read-ahead; past that the unpack fails
-    with ARCHIVE_BOMB.
+    decompressed from it, count against a limit of two passes (the header
+    checks, then the member data), each pass ``max_total_bytes`` plus, per
+    ``max_files`` member, room for headers and padding (4,095 bytes at the
+    default policy), 16 KiB for the end of the archive, and
+    ``io.DEFAULT_BUFFER_SIZE`` (8 KiB, or 128 KiB from Python 3.14) for the
+    decompressor's read-ahead, counted each time a compressed archive is
+    opened. In a compressed archive a seek backwards past the last 64 KiB
+    read (128 KiB from Python 3.14) decompresses it again from the start,
+    and that counts again. The count is checked after
+    every read of at most 64 KiB: once it passes the limit the unpack fails
+    with ARCHIVE_BOMB, the last read having gone up to 64 KiB past it.
 
     All-or-nothing: members are extracted into a staging directory and moved
     into place only once every member has passed every check. For an existing
@@ -1437,10 +1456,11 @@ def extract_signatures_jsonl(tar_path: Path | str) -> bytes | None:
     """Return raw bytes of ``signatures.jsonl`` at archive root, or ``None`` if absent.
 
     Spec §5: presence of signatures.jsonl opts the package into v0.5 verification.
-    This is a read-only accessor that does NOT run security checks — it is only
-    used after a package has already been trust-verified at the tar level.
-    It reads no more of the archive than :func:`unpack` may at the default
-    limits.
+    This is a read-only accessor that does NOT run the member checks of
+    :func:`unpack` — it is only used after a package has already been
+    trust-verified at the tar level. It reads no more of the archive than
+    :func:`unpack` may at the default limits (two passes, see
+    :func:`_open_archive`), and fails with ARCHIVE_BOMB past that.
     """
     archive = Path(tar_path)
     with _open_archive(archive, ExtractPolicy.default()) as tar:
@@ -1464,7 +1484,8 @@ def extract_signer_manifests(tar_path: Path | str) -> Mapping[str, bytes]:
     Returns an empty ``MappingProxyType`` if no ``signers/`` directory exists.
     Spec §5: used during signature verification to locate signer manifests.
     It reads no more of the archive than :func:`unpack` may at the default
-    limits.
+    limits (two passes, see :func:`_open_archive`), and fails with
+    ARCHIVE_BOMB past that.
     """
     archive = Path(tar_path)
     result: dict[str, bytes] = {}

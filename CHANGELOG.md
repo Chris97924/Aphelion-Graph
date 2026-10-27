@@ -118,20 +118,49 @@ the record of what a bump would carry.
   total limit (`PX_E_6011`) or over the compression-ratio limit
   (`PX_E_6012`), each at `unpack`'s defaults.
 - **Reading an archive stops at a limit, whatever its headers declare**
-  (`PX_E_6013`). `unpack`, signature validation (`validate_signatures`),
-  `verify_package`, `extract_signatures_jsonl` and
-  `extract_signer_manifests` read, or decompress, at most two passes over
-  `max_total_bytes` of member data plus, per `max_files` member, room for
-  headers and padding (4 KiB at the default policy), 16 KiB for the end of
-  the archive and the decompressor's read-ahead; `check_member_names` one
-  pass. What a
-  compressed archive decompresses again after a seek back counts too. The
-  accessors and `validate_signatures` use the default policy.
-- **Sparse members (`PX_E_6008`) and members declaring a negative size
-  (`PX_E_6010`) are refused** by `unpack`, `check_member_names`, signature
-  validation and `verify_package`; a package never has either. Where
-  Python's `tarfile` itself stops at a negative size, the archive ends
-  there.
+  (`PX_E_6013`). Each time `unpack`, `check_member_names`,
+  `extract_signatures_jsonl`, `extract_signer_manifests` or the manifest
+  read in signature validation opens an archive, every byte that reader
+  reads from it, or decompresses, counts against its own limit, a number
+  of passes. One pass is `max_total_bytes` of member data plus, per
+  `max_files` member, room for its headers and padding (4,095 bytes at
+  the default policy), 16 KiB for the end of the archive, and
+  `io.DEFAULT_BUFFER_SIZE` (8 KiB, or 128 KiB from Python 3.14) for the
+  decompressor's read-ahead, which counts each time a compressed archive
+  is opened: 145,955,056 bytes at the default policy on Python 3.14.
+  `check_member_names` has one pass, the other readers two each. A reader
+  of a compressed archive that goes back to a point within the last 64 KiB
+  it read (128 KiB from Python 3.14) is served from those bytes; one that
+  goes back further decompresses the archive again from the start, and
+  that counts again.
+  The count is checked after every read of at most 64 KiB, so the read
+  that fails may end up to 64 KiB past the limit. One call to signature
+  validation (`validate_signatures`) runs `check_member_names`, both
+  accessors and the manifest read, up to seven passes in all;
+  `verify_package` runs `unpack` before them, up to nine. Where the
+  members those readers look up lie within the last 64 KiB (128 KiB from
+  Python 3.14) of a compressed package's tar stream, each of them
+  decompresses it once, so `validate_signatures` decompresses it four
+  times, and `verify_package`, whose `unpack` decompresses it twice, six.
+  The accessors, signature validation and `verify_package` use the
+  default policy.
+- **`unpack`, `check_member_names` and the accessors tell a compressed
+  archive by its first bytes**, as `tarfile`'s stream mode does: gzip,
+  bzip2, xz, zstd (Python 3.14 and later) and LZMA-alone with the default
+  properties and an 8 MiB dictionary; anything else is read as an
+  uncompressed tar. An LZMA-alone archive with any other dictionary size,
+  or a zstd archive that starts with a skippable frame, which
+  `tarfile.open` read before, now fails with `tarfile.ReadError`. A
+  package, an uncompressed or gzip-compressed ustar archive, is not
+  affected.
+- **Sparse members are refused (`PX_E_6008`)** by `unpack`,
+  `check_member_names`, signature validation and `verify_package`, and so
+  are **members declaring a negative size (`PX_E_6010`)** where Python's
+  `tarfile` reports them. Recent `tarfile` releases do not: for a
+  negative size in the first header they raise `tarfile.ReadError`, and
+  for one in a later header they end the archive there, so the members
+  before it are read, those after it are not, and no error is raised. A
+  package never has either.
 - **`pack` refuses the member paths `unpack` refuses**: empty (`PX_E_6006`),
   absolute (`PX_E_6002`), containing a backslash (`PX_E_6004`),
   drive-prefixed such as `a:b.md` (`PX_E_6003`, on every platform), or with

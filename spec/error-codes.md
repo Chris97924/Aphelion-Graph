@@ -142,10 +142,10 @@ All raise sites import the `ErrorCode` enum — no string literals.
 | PX_E_6007  | DUPLICATE_MEMBER_PATH       | Two members normalise to same path.                   |
 | PX_E_6008  | DISALLOWED_MEMBER_TYPE      | Symlink / hardlink / device / fifo / sparse member rejected. |
 | PX_E_6009  | FILE_COUNT_EXCEEDED         | Archive exceeds `max_files` budget.                   |
-| PX_E_6010  | FILE_BYTES_EXCEEDED         | Member declares size > `max_file_bytes`, or a negative size. |
+| PX_E_6010  | FILE_BYTES_EXCEEDED         | Member declares size > `max_file_bytes`, or a negative size where `tarfile` reports one (recent releases end the archive at that header instead). |
 | PX_E_6011  | TOTAL_BYTES_EXCEEDED        | Aggregate size > `max_total_bytes`.                   |
 | PX_E_6012  | COMPRESSION_RATIO_EXCEEDED  | Uncompressed bytes / archive size > ratio budget.     |
-| PX_E_6013  | ARCHIVE_BOMB                | Stream overran a budget mid-extraction, or reading the archive (decompressing it, again after any seek back) went past its read limit (up to two passes over `max_total_bytes` plus a header allowance). |
+| PX_E_6013  | ARCHIVE_BOMB                | Stream overran a budget mid-extraction, or one reader of the archive (decompressing it, again after a seek back past the bytes it still holds) went past its read limit (one or two passes, each `max_total_bytes` plus header, end-of-archive and read-ahead allowances). |
 
 ## 9NN — GENERIC
 
