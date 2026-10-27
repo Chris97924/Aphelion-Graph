@@ -320,10 +320,11 @@ def unpack(
     deleted only once it is empty. Parent directories this call created are
     removed again. Once every entry is in place the unpack has succeeded,
     and an interrupt while the replaced files are deleted propagates with a
-    note saying so and naming what is left over. Leftovers are named in a
-    RuntimeWarning and, on Python 3.11+, in a note on the raised error; when
-    neither can carry the name (Python 3.10, or a call that succeeded, with
-    warnings turned into errors) it is written to stderr. ``dest_dir``
+    note saying so and naming what is left over. Leftovers are named, on
+    Python 3.11+, in a note on the raised error and in a RuntimeWarning;
+    where no note can carry the name (Python 3.10, or a call that
+    succeeded), the RuntimeWarning is shown even where warnings are
+    ignored or turned into errors. ``dest_dir``
     itself must not be a symlink or junction. Nor can it be a Windows
     mounted folder, which is the same kind of reparse point as a junction:
     unpack into a directory inside it instead.
@@ -750,18 +751,31 @@ def _remove_or_warn(path: Path, exc: BaseException | None = None) -> None:
 
 
 def _report(note: str, exc: BaseException | None) -> None:
-    """Name a leftover in a RuntimeWarning and, on Python 3.11+, in a note on
-    ``exc``; never replaces ``exc``. When neither can carry it (no note to
-    add, on Python 3.10 or without ``exc``, and warnings turned into
-    errors), it is written to stderr, so it is named somewhere."""
-    noted = False
+    """Name a leftover so that it reaches the user; never replaces ``exc``.
+
+    On Python 3.11+ with an error to carry it, a note on ``exc`` names it,
+    and so does a RuntimeWarning, subject to the warnings filters. Otherwise
+    (Python 3.10, or a call that succeeded) the RuntimeWarning is all there
+    is, so it goes straight to :func:`warnings.showwarning`, past the
+    filters: shown once, like any warning, even where RuntimeWarnings are
+    ignored or turned into errors.
+    """
     if exc is not None and hasattr(exc, "add_note"):
         exc.add_note(note)
-        noted = True
+        try:
+            warnings.warn(note, RuntimeWarning, stacklevel=4)
+        except Exception:  # a filter set to "error" must not mask exc; the note names it
+            pass
+        return
     try:
-        warnings.warn(note, RuntimeWarning, stacklevel=4)
-    except Exception:  # a warnings filter set to "error" must not mask exc
-        if not noted and sys.stderr is not None:
+        frame = sys._getframe(3)  # where warnings.warn(stacklevel=4) would point
+        filename, lineno = frame.f_code.co_filename, frame.f_lineno
+    except ValueError:
+        filename, lineno = __file__, 0
+    try:
+        warnings.showwarning(RuntimeWarning(note), RuntimeWarning, filename, lineno)
+    except Exception:  # a replaced showwarning that fails: stderr is what is left
+        if sys.stderr is not None:
             try:
                 sys.stderr.write(f"RuntimeWarning: {note}\n")
             except (OSError, ValueError):  # stderr closed: nowhere left to say it

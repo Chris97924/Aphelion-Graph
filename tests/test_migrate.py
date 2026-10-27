@@ -27,7 +27,7 @@ from aphelion.migrate import (
     migrate_v03_to_v04,
 )
 from aphelion.validator import validate_manifest
-from test_unpacker import MOVES, STOPS, _error, _named, _run_steps
+from test_unpacker import MOVES, STOPS, WARNING_FILTERS, _error, _named, _run_steps, run_python
 
 
 UUID_PKG = "0191aaaa-0000-7000-8000-000000000001"
@@ -811,6 +811,43 @@ def test_force_only_warns_when_the_old_destination_cannot_be_deleted(
     assert loads((dst / "manifest.json").read_bytes())["format_version"] == "2.0"
     (backup,) = [p for p in tmp_path.iterdir() if p.name.startswith(".v04.replaced-")]
     assert any(str(backup) in str(w.message) for w in warned)
+
+
+BACKUP_LEFT_AFTER_FORCE = """
+import os, sys
+from pathlib import Path
+from aphelion.migrate import MigrateOptions, migrate
+
+src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+real_rmdir = os.rmdir
+
+def rmdir(path, *args, **kwargs):
+    if ".replaced-" in os.path.basename(os.fspath(path)):
+        raise PermissionError(13, "Permission denied", os.fspath(path))
+    real_rmdir(path, *args, **kwargs)
+
+os.rmdir = rmdir
+migrate(MigrateOptions(src=src, dst=dst, force=True))
+print("\\n".join(str(p) for p in dst.parent.iterdir() if ".replaced-" in p.name))
+"""
+
+
+@WARNING_FILTERS
+def test_backup_left_after_force_reaches_stderr_once_whatever_the_warnings_filters(
+    tmp_path: Path, warn: str | None
+) -> None:
+    """All platforms, run in a new interpreter: the old destination's backup
+    directory that migrate --force cannot delete after success is named on
+    stderr exactly once, with warnings shown, ignored (-W ignore) or turned
+    into errors (-W error)."""
+    src, dst, _ = _force_setup(tmp_path)
+
+    run = run_python(BACKUP_LEFT_AFTER_FORCE, [str(src), str(dst)], warn)
+
+    assert run.returncode == 0, run.stderr
+    left = run.stdout.splitlines()
+    assert len(left) == 1, (run.stdout, run.stderr)
+    assert run.stderr.count(left[0]) == 1, run.stderr
 
 
 # ---------- --force stopped at any step loses nothing ----------

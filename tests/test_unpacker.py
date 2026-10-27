@@ -26,6 +26,7 @@ import io
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import warnings
@@ -1279,52 +1280,85 @@ def test_interrupt_once_every_entry_is_in_place_says_the_unpack_completed(
             assert str(dest.resolve() / leftover) in named, (steps[n - 1], named)
 
 
-def test_leftover_after_success_is_named_on_stderr_when_warnings_are_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+WARNING_FILTERS = pytest.mark.parametrize(
+    "warn", [None, "ignore", "error"], ids=["warnings-default", "warnings-ignored", "warnings-errors"]
+)
+
+
+def run_python(script: str, args: list[str], warn: str | None) -> subprocess.CompletedProcess[str]:
+    """Run ``script`` in a new interpreter like this one, with ``-W warn`` if
+    given and PYTHONWARNINGS unset, so its stderr is what a user would see."""
+    import aphelion
+
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONWARNINGS"}
+    env["PYTHONPATH"] = str(Path(str(aphelion.__file__)).parents[1])
+    options = ["-W", warn] if warn else []
+    return subprocess.run(
+        [sys.executable, *options, "-c", script, *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+
+
+LEFTOVER_AFTER_UNPACK = """
+import os, sys, traceback
+from pathlib import Path
+from aphelion.unpacker import unpack
+
+archive, dest, case = sys.argv[1], Path(sys.argv[2]).resolve(), sys.argv[3]
+real_rmdir, real_replace = os.rmdir, os.replace
+moves = []
+
+def rmdir(path, *args, **kwargs):
+    if os.path.basename(os.fspath(path)).startswith(".unpacking-"):
+        raise PermissionError(13, "Permission denied", os.fspath(path))
+    real_rmdir(path, *args, **kwargs)
+
+def replace(src, dst, **kwargs):
+    moves.append(src)
+    if len(moves) == 4:  # moving the new z.md in fails,
+        raise OSError(5, "simulated I/O error")
+    if len(moves) == 5:  # and Ctrl-C lands on putting the old one back
+        raise KeyboardInterrupt
+    real_replace(src, dst, **kwargs)
+
+if case == "staging-after-success":
+    os.rmdir = rmdir
+    unpack(archive, dest)
+    left = [p for p in dest.iterdir() if p.name.startswith(".unpacking-")]
+else:
+    os.replace = replace
+    try:
+        unpack(archive, dest)
+    except BaseException as exc:
+        traceback.print_exception(exc)
+    os.replace = real_replace
+    left = list(dest.glob(".unpacking-*/.backup-*"))
+print("\\n".join(map(str, left)))
+"""
+
+
+@WARNING_FILTERS
+@pytest.mark.parametrize("case", ["staging-after-success", "backup-after-failure"])
+def test_leftover_reaches_stderr_once_whatever_the_warnings_filters(
+    tmp_path: Path, case: str, warn: str | None
 ) -> None:
-    """All platforms: a staging dir left over after a complete merge has no
-    error to carry a note, and with warnings turned into errors its warning
-    cannot be shown either, so it is named on stderr."""
+    """All platforms, run in a new interpreter: a staging dir left after a
+    complete merge, or a backup kept after a failed one (a move fails and
+    Ctrl-C lands on putting a file back), is named on stderr exactly once,
+    with warnings shown, ignored (-W ignore) or turned into errors (-W
+    error). Where a note on the error cannot name it (Python 3.10, or no
+    error at all), its RuntimeWarning is shown past the filters."""
     archive, dest, _ = _merge_archive(tmp_path)
-    real_rmdir = os.rmdir
 
-    def rmdir(path: str, *args: object, **kwargs: object) -> None:
-        if os.path.basename(os.fspath(path)).startswith(".unpacking-"):
-            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
-        real_rmdir(path, *args, **kwargs)
+    run = run_python(LEFTOVER_AFTER_UNPACK, [str(archive), str(dest), case], warn)
 
-    monkeypatch.setattr(os, "rmdir", rmdir)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        assert unpack(archive, dest) == dest
-    monkeypatch.undo()
-
-    (leftover,) = [p for p in dest.resolve().iterdir() if p.name.startswith(".unpacking-")]
-    assert str(leftover) in capsys.readouterr().err
-
-
-@pytest.mark.skipif(sys.version_info >= (3, 11), reason="from Python 3.11 a note on the error names it")
-def test_kept_backup_is_named_on_stderr_without_notes_when_warnings_are_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Python 3.10 only (no exception notes): a merge fails at a move, and an
-    interrupt lands on putting a file back. The backup still holding it
-    cannot be named in a note, nor, with warnings turned into errors, in a
-    warning, so it is named on stderr."""
-    call, _, _ = _unpack_merge(tmp_path / "clean")
-    steps, _, _ = _run_steps(monkeypatch, call, {})
-    fail_at = [n for n, line in enumerate(steps, 1) if line.startswith(MOVES)][3]
-
-    call, dest, _ = _unpack_merge(tmp_path / "run")
-    with monkeypatch.context() as patch, warnings.catch_warnings():
-        warnings.simplefilter("error")
-        _steps(patch, {fail_at: (_error(OSError), False), fail_at + 1: (KeyboardInterrupt(), False)})
-        with pytest.raises(KeyboardInterrupt):
-            call()
-
-    (backup,) = dest.resolve().glob(".unpacking-*/.backup-*")
-    assert list(backup.iterdir())
-    assert str(backup) in capsys.readouterr().err
+    assert run.returncode == 0, run.stderr
+    left = run.stdout.splitlines()
+    assert len(left) == 1, (run.stdout, run.stderr)
+    assert run.stderr.count(left[0]) == 1, run.stderr
 
 
 # ---------- two members that reach one entry are refused ----------
