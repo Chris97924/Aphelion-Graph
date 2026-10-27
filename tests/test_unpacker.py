@@ -1201,6 +1201,86 @@ def test_pax_records_are_read_as_tarfile_reads_them(
     assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
 
 
+def _header_chain_cases() -> list:
+    """Members after more than one extension header, where tarfile keeps
+    the first pax header's keys in pax_headers but may take the member's
+    size from a later one, and their one-header counterparts."""
+    a = _file(b"a.md", b"a" * 10)
+    comment = _pax({"comment": "c"})
+    long_name = _raw_header(b"././@LongLink", 6, b"L") + _padded(b"e.md" + bytes(2))
+    size = _pax({"size": "10"})
+    realsize = _pax({"GNU.sparse.realsize": "10"})
+    negative = _raw_header(b"q.md", -512) + _padded(b"q" * 10)
+    q = _file(b"q.md", b"q" * 10)
+    too_big = str(ErrorCode.FILE_BYTES_EXCEEDED)
+    sparse = str(ErrorCode.DISALLOWED_MEMBER_TYPE)
+    cases = {
+        "own-negative-after-a-size-in-a-second-pax-header": (a + comment + size + negative, too_big),
+        "own-negative-after-a-size-in-a-second-pax-header-first-member": (
+            comment + size + negative, too_big
+        ),
+        "own-far-below-zero-after-a-size-in-a-second-pax-header": (
+            a + comment + size + _raw_header(b"q.md", -(1 << 40)) + _padded(b"q" * 10), too_big
+        ),
+        "own-negative-after-a-long-name-and-a-size": (a + long_name + size + negative, too_big),
+        "own-negative-after-a-long-name-between-pax-headers": (
+            a + comment + long_name + size + negative, too_big
+        ),
+        "own-negative-after-a-global-size": (
+            a + comment + _pax({"size": "0"}, b"g") + _raw_header(b"q.md", -512), too_big
+        ),
+        "own-negative-after-a-realsize-in-a-second-pax-header": (
+            a + comment + realsize + negative, too_big
+        ),
+        "own-negative-after-a-global-realsize": (
+            a + comment + _pax({"GNU.sparse.realsize": "0"}, b"g") + _raw_header(b"q.md", -512),
+            too_big,
+        ),
+        "directory-negative-after-a-size-in-a-second-pax-header": (
+            a + comment + _pax({"size": "0"}) + _raw_header(b"dd/", -512, b"5"), too_big
+        ),
+        "directory-negative": (a + _raw_header(b"dd/", -512, b"5"), too_big),
+        "own-negative-after-a-size": (a + size + negative, too_big),
+        "own-negative-after-a-comment-and-a-size": (
+            a + _pax({"comment": "c", "size": "10"}) + negative, too_big
+        ),
+        "size-in-a-second-pax-header": (a + comment + size + q, too_big),
+        "size": (a + size + q, too_big),
+        "realsize-in-a-second-pax-header": (a + comment + realsize + q, sparse),
+        "realsize": (a + realsize + q, sparse),
+        "global-size-after-a-pax-header": (
+            a + comment + _pax({"size": "1"}, b"g") + _file(b"q.md", b"q"), too_big
+        ),
+    }
+    b = _file(b"b.md", b"b")
+    return [
+        pytest.param(raw + b + END, outcome, id=name) for name, (raw, outcome) in cases.items()
+    ]
+
+
+@pytest.mark.parametrize("fmt", ["tar", "gz"])
+@pytest.mark.parametrize("raw, expected", _header_chain_cases())
+def test_every_header_before_a_member_is_read_from_the_bytes(
+    tmp_path: Path, passes: list, raw: bytes, expected: str, fmt: str
+) -> None:
+    """All platforms and Python versions: every header block before a
+    member's data, the member's own header included, and the records of
+    every pax header there (local or global, first or later) are read from
+    the bytes handed to tarfile, not from what tarfile made of them. A
+    negative size in any of them is refused (PX_E_6010), as is a size
+    given in any of those pax headers; a GNU.sparse.* key in any of them is
+    refused as sparse (PX_E_6008). Every entry point gives the same
+    outcome on every release, within the pass bound."""
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compress(raw, fmt))
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    for entry, call in calls.items():
+        passes.clear()
+        assert _outcome(call) == expected, entry
+        assert all(reader.handed <= len(raw) for reader in passes), entry
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
 def _xz_needing_too_much_memory(raw: bytes) -> bytes:
     """An xz stream of ``raw`` that declares the largest dictionary the
     format can, which the decoder limit refuses."""

@@ -580,7 +580,9 @@ def test_validate_signatures_non_regular_manifest_member(tmp_path: Path) -> None
     assert not isinstance(exc_info.value, AttributeError)
 
     # Verify under -O semantics: assert statements are stripped, so the guard
-    # must hold without relying on `assert`. Re-import the validator under -O.
+    # must hold without relying on `assert`. Re-import the validator under -O,
+    # from where this process imports it (the package need not be installed).
+    import os
     import subprocess
     import sys
     import textwrap
@@ -602,6 +604,7 @@ def test_validate_signatures_non_regular_manifest_member(tmp_path: Path) -> None
         [sys.executable, "-O", "-c", script],
         capture_output=True,
         text=True,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)},
     )
     assert proc.returncode == 0, (
         f"under -O expected typed AphelionError (rc=0), got rc={proc.returncode}\n"

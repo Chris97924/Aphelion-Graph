@@ -137,7 +137,7 @@ the record of what a bump would carry.
   member whose pax header holds larger records, such as an extended
   attribute of about 3 KB or more (`tar --xattrs`). `max_path_length`
   counts characters after NFC normalisation, so a name stored decomposed
-  (NFD, as macOS stores names) can need more than four bytes per counted
+  (NFD, as HFS+ stores names) can need more than four bytes per counted
   character, and a member whose header blocks then take more than H is
   refused (`PX_E_6013`) too. Asking for more, or
   reading on after reaching the end of the archive 8 times, fails before
@@ -165,19 +165,23 @@ the record of what a bump would carry.
   type `unpack` refuses (`PX_E_6008`), more members than `max_files`
   (`PX_E_6009`), and an archive whose declared sizes `unpack` refuses.
 - **A member that would take a reader further than its size says is
-  refused before its data is read**: a sparse member, or one with a
-  `GNU.sparse.*` pax key `tarfile` can parse (`PX_E_6008`); a negative
-  size, in the member's header, in a pax or GNU long-name header before it
-  or in a pax record, and a size given in a local or global pax header
-  (`PX_E_6010`); header blocks that do not lead, size by size, from where
-  the member before ends to the member's own header (`PX_E_6013`). These
-  header blocks, pax records included, are read again from the bytes
-  handed to `tarfile`, so for the member headers the outcome (refused or
-  not, and the code) is the same on every Python release, whether its
-  `tarfile` reports a member with a negative size, skips it, stops there
-  or reads on. A package never has any of these. A directory's size field
-  is ignored, as `tar` and `tarfile` ignore it: no data follows a
-  directory.
+  refused before its data is read**: a sparse member, or one after a pax
+  header with a `GNU.sparse.*` key `tarfile` can parse (`PX_E_6008`); a
+  negative size, in the member's header, in a pax or GNU long-name header
+  before it or in a pax record, and a member after a pax header with a
+  `size` key (`PX_E_6010`); header blocks that do not lead, size by size,
+  from where the member before ends to the member's own header
+  (`PX_E_6013`). A pax header here is any before the member, local or
+  global, the first or a later one (`tarfile` may take a member's size
+  from a later one). These header blocks, the member's own header and
+  every pax record included, are read again from the bytes handed to
+  `tarfile`, and nothing is taken from what `tarfile` made of them, so for
+  the member headers the outcome (refused or not, and the code) is the
+  same on every Python release, whether its `tarfile` reports a member
+  with a negative size, skips it, stops there or reads on. A package never
+  has any of these. A directory's size, if not negative, is ignored, as
+  `tar` and `tarfile` ignore it (no data follows a directory); a negative
+  size is refused for every member type.
 - **What `tarfile` or the decompressor raises for a damaged archive is
   `tarfile.ReadError`**: anything `tarfile` raises while it parses a member
   header other than an operating-system or out-of-memory error (for
