@@ -855,12 +855,13 @@ def test_a_pass_over_an_archive_hands_tarfile_a_bounded_number_of_bytes(
 
 
 def test_xz_archive_needing_more_decoder_memory_than_the_limit_is_refused(
-    tmp_path: Path,
+    tmp_path: Path, passes: list
 ) -> None:
     """All platforms: an xz archive of a few bytes can declare a 4 GiB
     dictionary, which the decoder would allocate. It is refused (PX_E_6013)
-    while the memory traced stays under the decoder limit; an archive
-    compressed with xz -9e, the largest preset, unpacks."""
+    while the memory traced stays under the decoder limit, before tarfile
+    is handed a byte; an archive compressed with xz -9e, the largest
+    preset, unpacks."""
     import struct
     import tracemalloc
     import zlib
@@ -886,12 +887,15 @@ def test_xz_archive_needing_more_decoder_memory_than_the_limit_is_refused(
         tracemalloc.stop()
     assert exc.value.code == ErrorCode.ARCHIVE_BOMB
     assert peak < _XZ_MEMLIMIT, peak
+    assert [reader.handed for reader in passes] == [0]
 
     members = [("a.md", b"a" * 4096), ("b/c.md", b"c")]
-    archive.write_bytes(lzma.compress(_tar_bytes(members), preset=9 | lzma.PRESET_EXTREME))
+    raw = _tar_bytes(members)
+    archive.write_bytes(lzma.compress(raw, preset=9 | lzma.PRESET_EXTREME))
     dest = unpack(archive, tmp_path / "dest")
     assert (dest / "a.md").read_bytes() == b"a" * 4096
     assert (dest / "b" / "c.md").read_bytes() == b"c"
+    assert all(reader.handed <= len(raw) for reader in passes)
 
 
 def test_xz_and_lzma_archives_read_concatenated_streams_and_ignore_what_follows(
@@ -912,10 +916,12 @@ def test_xz_and_lzma_archives_read_concatenated_streams_and_ignore_what_follows(
     assert unpack(alone, tmp_path / "dest2").joinpath("b.md").read_bytes() == b"b"
 
 
-def test_zstd_frames_outside_the_supported_form_are_not_tar_archives(tmp_path: Path) -> None:
+def test_zstd_frames_outside_the_supported_form_are_not_tar_archives(
+    tmp_path: Path, passes: list
+) -> None:
     """Python 3.14+: a zstd frame that needs a 2 GiB window is refused by
-    the decoder, and an archive starting with a skippable frame is not read
-    as zstd; both are tarfile.ReadError."""
+    the decoder before tarfile is handed a byte, and an archive starting
+    with a skippable frame is not read as zstd; both are tarfile.ReadError."""
     pytest.importorskip("compression.zstd", reason="zstd needs Python 3.14+")
     from aphelion.unpacker import check_member_names
 
@@ -923,11 +929,13 @@ def test_zstd_frames_outside_the_supported_form_are_not_tar_archives(tmp_path: P
     # frame header: no single segment, window descriptor 2**31; one raw last block
     frame = b"\x28\xb5\x2f\xfd\x00\xa8" + ((len(raw) << 3) | 1).to_bytes(3, "little") + raw
     skippable = b"\x50\x2a\x4d\x18" + (4).to_bytes(4, "little") + b"skip"
-    for body in (frame, skippable + frame):
+    for body, limit in ((frame, 0), (skippable + frame, FIRST_LIMIT)):
         archive = tmp_path / "a.tar.zst"
         archive.write_bytes(body)
+        passes.clear()
         with pytest.raises(tarfile.ReadError):
             check_member_names(archive)
+        assert [reader.handed <= limit for reader in passes] == [True]
 
 
 @pytest.mark.parametrize("body", [bytes(1024), bytes(10240), bytes(512), b""],

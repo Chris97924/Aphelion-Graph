@@ -427,7 +427,9 @@ def _members(
         with closing(open_source(raw)) as source:
             reader = _ForwardReader(source, _HEADER_BYTES + _GLOBAL_HEADER_BYTES)
             try:
-                tar = tarfile.open(fileobj=reader, mode="r|")
+                # tarfile asks for up to _READ_CHUNK bytes at a time; the
+                # reader still hands out nothing past its limit.
+                tar = tarfile.open(fileobj=reader, mode="r|", bufsize=_READ_CHUNK)
             except not_this_kind as exc:
                 raise tarfile.ReadError(f"not a {kind} file") from exc
             found: list[_Member] = []
