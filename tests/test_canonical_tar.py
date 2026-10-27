@@ -111,12 +111,15 @@ def test_roundtrip_preserves_bytes() -> None:
     ],
 )
 def test_pack_rejects_member_paths_that_escape(path: str, code: ErrorCode) -> None:
+    """All platforms: pack refuses a member path that names something outside
+    the archive root, with the code unpack would use."""
     with pytest.raises(SchemaError) as exc:
         pack([TarMember(path=path, data=b"x", is_dir=False)])
     assert exc.value.code == code
 
 
 def test_pack_rejects_directory_member_that_escapes() -> None:
+    """All platforms: the same holds for a directory member."""
     with pytest.raises(SchemaError) as exc:
         pack([TarMember(path="a/../..", data=None, is_dir=True)])
     assert exc.value.code == ErrorCode.PATH_TRAVERSAL
@@ -129,6 +132,8 @@ def test_pack_rejects_directory_member_that_escapes() -> None:
 def test_pack_rejects_paths_that_unpack_would_reject_as_colliding(
     first: str, second: str
 ) -> None:
+    """All platforms: pack refuses two paths that collide once normalized,
+    as unpack does."""
     with pytest.raises(SchemaError) as exc:
         pack([
             TarMember(path=first, data=b"1", is_dir=False),

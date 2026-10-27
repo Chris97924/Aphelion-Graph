@@ -599,7 +599,9 @@ def test_sign_manifest_absent_in_archive_emits_missing_file(tmp_path: Path) -> N
 
 
 def test_sign_hmac_is_refused_and_writes_nothing(tmp_path: Path) -> None:
-    """hmac-sha256 stores its shared secret as public_key_b64 (spec §3.2), so
+    """All platforms: `aphe sign` refuses hmac-sha256 and writes nothing.
+
+    hmac-sha256 stores its shared secret as public_key_b64 (spec §3.2), so
     `aphe sign` does not offer it: a signed package would hand the signing key
     to every reader. (This test used to assert an hmac round trip.)"""
     pkg = _packed_tar(tmp_path)
@@ -687,9 +689,9 @@ def _secret_forms(key: bytes) -> list[bytes]:
 def test_sign_never_writes_key_file_contents_into_package(
     tmp_path: Path, algorithm: str
 ) -> None:
-    """Whatever `aphe sign` accepts, the key file's bytes must not end up in
-    the signed package in any encoding: anyone holding the package could
-    otherwise sign as that signer."""
+    """All platforms: whatever `aphe sign` accepts, the key file's bytes must
+    not end up in the signed package in any encoding: anyone holding the
+    package could otherwise sign as that signer."""
     if algorithm == "ed25519":
         pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
     pkg = _packed_tar(tmp_path)
@@ -717,7 +719,8 @@ def test_sign_never_writes_key_file_contents_into_package(
 def test_sign_cmd_refuses_hmac_even_when_called_directly(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The handler itself fails closed, not just the argparse choices."""
+    """All platforms: the handler itself fails closed, not just the argparse
+    choices."""
     from aphelion.cli import _cmd_sign
     from aphelion.output import Writer
 
@@ -749,6 +752,8 @@ def test_sign_cmd_refuses_hmac_even_when_called_directly(
 def test_sign_malformed_ed25519_key_emits_signer_malformed(
     tmp_path: Path, key: bytes
 ) -> None:
+    """All platforms: an ed25519 key file of the wrong length fails with
+    E_SIGNER_MALFORMED and writes nothing."""
     pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
     pkg = _packed_tar(tmp_path)
     key_file = tmp_path / "key.bin"
@@ -783,6 +788,8 @@ def test_sign_malformed_ed25519_key_emits_signer_malformed(
 def test_sign_rejects_signer_id_that_is_not_a_single_path_component(
     tmp_path: Path, signer_id: str
 ) -> None:
+    """All platforms: a --signer-id that would name a file outside signers/
+    fails with PX_E_6001 and writes nothing."""
     pkg = _packed_tar(tmp_path)
     key_file = tmp_path / "key.bin"
     key_file.write_bytes(HMAC_KEY)

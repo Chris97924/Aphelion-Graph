@@ -397,6 +397,8 @@ def _assert_refused(src: Path, dst: Path) -> None:
 
 
 def test_force_refuses_destination_that_is_the_source(tmp_path: Path) -> None:
+    """All platforms: --force refuses a destination that is the source and
+    changes nothing."""
     src = tmp_path / "v03"
     _write_v03_directory(src)
     before = _snapshot(src)
@@ -405,6 +407,8 @@ def test_force_refuses_destination_that_is_the_source(tmp_path: Path) -> None:
 
 
 def test_force_refuses_destination_spelled_differently_but_same_dir(tmp_path: Path) -> None:
+    """All platforms: the same for the source under another spelling
+    (``v03/claims/..``)."""
     src = tmp_path / "v03"
     _write_v03_directory(src)
     before = _snapshot(src)
@@ -413,6 +417,7 @@ def test_force_refuses_destination_spelled_differently_but_same_dir(tmp_path: Pa
 
 
 def test_force_refuses_destination_that_contains_the_source(tmp_path: Path) -> None:
+    """All platforms: --force refuses a destination that contains the source."""
     parent = tmp_path / "work"
     src = parent / "v03"
     _write_v03_directory(src)
@@ -423,6 +428,7 @@ def test_force_refuses_destination_that_contains_the_source(tmp_path: Path) -> N
 
 
 def test_force_refuses_destination_inside_the_source(tmp_path: Path) -> None:
+    """All platforms: --force refuses a destination inside the source."""
     src = tmp_path / "v03"
     _write_v03_directory(src)
     (src / "out").mkdir()
@@ -432,6 +438,8 @@ def test_force_refuses_destination_inside_the_source(tmp_path: Path) -> None:
 
 
 def test_force_refuses_symlink_resolving_to_the_source(tmp_path: Path) -> None:
+    """All platforms that can create symlinks: --force refuses a destination
+    that is a symlink to the source."""
     src = tmp_path / "v03"
     _write_v03_directory(src)
     link = tmp_path / "link"
@@ -442,6 +450,8 @@ def test_force_refuses_symlink_resolving_to_the_source(tmp_path: Path) -> None:
 
 
 def test_force_refuses_symlink_resolving_to_a_parent_of_the_source(tmp_path: Path) -> None:
+    """All platforms that can create symlinks: the same for a symlink to a
+    directory that contains the source."""
     parent = tmp_path / "work"
     src = parent / "v03"
     _write_v03_directory(src)
@@ -453,6 +463,8 @@ def test_force_refuses_symlink_resolving_to_a_parent_of_the_source(tmp_path: Pat
 
 
 def test_force_refuses_source_reached_through_a_symlink(tmp_path: Path) -> None:
+    """All platforms that can create symlinks: the same when the source is
+    given through a symlink."""
     real = tmp_path / "real"
     _write_v03_directory(real)
     src_link = tmp_path / "src-link"
@@ -463,7 +475,8 @@ def test_force_refuses_source_reached_through_a_symlink(tmp_path: Path) -> None:
 
 
 def test_force_refuses_destination_differing_only_by_case(tmp_path: Path) -> None:
-    """On NTFS / APFS ``V03`` is the same directory as ``v03``."""
+    """Windows and macOS (case-insensitive filesystems; skipped elsewhere):
+    on NTFS / APFS ``V03`` is the same directory as ``v03``."""
     src = tmp_path / "v03"
     _write_v03_directory(src)
     if not (tmp_path / "V03").exists():
@@ -476,6 +489,8 @@ def test_force_refuses_destination_differing_only_by_case(tmp_path: Path) -> Non
 def test_force_replaces_a_symlinked_destination_without_following_it(
     tmp_path: Path,
 ) -> None:
+    """All platforms that can create symlinks: a destination that is a
+    symlink is replaced as an entry; its target is not touched."""
     src = tmp_path / "v03"
     _write_v03_directory(src)
     elsewhere = tmp_path / "elsewhere"
@@ -492,6 +507,8 @@ def test_force_replaces_a_symlinked_destination_without_following_it(
 
 
 def test_force_does_not_follow_symlinks_inside_the_destination(tmp_path: Path) -> None:
+    """All platforms that can create symlinks: a symlink inside the old
+    destination is removed, never followed."""
     src = tmp_path / "v03"
     _write_v03_directory(src)
     elsewhere = tmp_path / "elsewhere"
@@ -519,11 +536,12 @@ def test_force_does_not_follow_symlinks_inside_the_destination(tmp_path: Path) -
 def test_force_does_not_follow_a_directory_replaced_by_a_symlink_during_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A directory inside the replaced destination is replaced by a symlink
-    after it was inspected but before it is opened for listing, as another
-    process could do. Removing the old tree (now in a backup directory) must
-    stop there instead of deleting through the link; that only warns, since
-    the new tree is already in place."""
+    """POSIX only (where rmtree can resist it): a directory inside the
+    replaced destination is replaced by a symlink after it was inspected but
+    before it is opened for listing, as another process could do. Removing
+    the old tree (now in a backup directory) must stop there instead of
+    deleting through the link; that only warns, since the new tree is
+    already in place."""
     import os
 
     src = tmp_path / "v03"
@@ -570,7 +588,8 @@ def test_force_does_not_follow_a_directory_replaced_by_a_symlink_during_removal(
 
 
 def test_force_keeps_destination_when_source_is_not_migratable(tmp_path: Path) -> None:
-    """The manifest check is a safety check too: it runs before the removal."""
+    """All platforms: the manifest check is a safety check too: it runs
+    before the removal."""
     src = tmp_path / "v03"
     _write_v03_directory(src)
     manifest = loads((src / "manifest.json").read_bytes())
@@ -616,6 +635,8 @@ def test_migrate_stops_when_the_destination_cannot_be_looked_at(
 
 
 def test_force_refuses_archive_destination_that_is_the_source(tmp_path: Path) -> None:
+    """All platforms: --force refuses an archive destination that is the
+    source archive."""
     archive = tmp_path / "in.aphelion.tar"
     _write_v03_archive(tmp_path / "pkg_v03", archive)
     before = archive.read_bytes()
@@ -624,6 +645,8 @@ def test_force_refuses_archive_destination_that_is_the_source(tmp_path: Path) ->
 
 
 def test_force_refuses_archive_destination_symlinked_to_the_source(tmp_path: Path) -> None:
+    """All platforms that can create symlinks: the same for a symlink to the
+    source archive."""
     archive = tmp_path / "in.aphelion.tar"
     _write_v03_archive(tmp_path / "pkg_v03", archive)
     link = tmp_path / "out.aphelion.tar"
@@ -636,7 +659,7 @@ def test_force_refuses_archive_destination_symlinked_to_the_source(tmp_path: Pat
 def test_overlap_check_uses_filesystem_identity_not_spelling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Runs everywhere: simulate a case-insensitive filesystem by making
+    """All platforms: simulate a case-insensitive filesystem by making
     samefile() compare names case-insensitively, as NTFS/APFS lookups do.
     The check must rely on that identity, not on path string equality."""
     import os
@@ -659,6 +682,8 @@ def test_overlap_check_uses_filesystem_identity_not_spelling(
 
 
 def test_cli_migrate_force_onto_source_is_refused(tmp_path: Path) -> None:
+    """All platforms: `aphe migrate --force` onto the source exits 3 with
+    PX_E_2006 INIT_REFUSES_EXISTING and changes nothing."""
     from conftest import run_cli
 
     src = tmp_path / "v03"
@@ -675,7 +700,8 @@ def test_cli_migrate_force_onto_source_is_refused(tmp_path: Path) -> None:
 def test_force_onto_current_directory_spelled_dot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Path(".") has no name; staging must use the absolute destination."""
+    """POSIX only (Windows cannot remove the current directory): Path(".")
+    has no name; staging must use the absolute destination."""
     import sys
 
     if sys.platform == "win32":
@@ -725,6 +751,8 @@ def _fail_replace(monkeypatch: pytest.MonkeyPatch, *prefixes: str) -> None:
 def test_force_keeps_destination_when_the_new_tree_cannot_be_moved_in(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """All platforms: if the new tree cannot be renamed into place, the old
+    destination is put back."""
     src, dst, before = _force_setup(tmp_path)
     _fail_replace(monkeypatch, ".v04.migrating-")
 
@@ -740,6 +768,8 @@ def test_force_keeps_destination_when_the_new_tree_cannot_be_moved_in(
 def test_force_names_the_backup_when_the_destination_cannot_be_restored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """All platforms: if the old destination cannot be put back either, the
+    error names the backup directory that holds it."""
     src, dst, before = _force_setup(tmp_path)
     _fail_replace(monkeypatch, ".v04.migrating-", ".v04.replaced-")
 
@@ -758,8 +788,8 @@ def test_force_names_the_backup_when_the_destination_cannot_be_restored(
 def test_force_only_warns_when_the_old_destination_cannot_be_deleted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The new tree is already in place, so a leftover of the old one (a file
-    held open, say) is reported, not raised."""
+    """All platforms: the new tree is already in place, so a leftover of
+    the old one (a file held open, say) is reported, not raised."""
     import errno
     import os
 

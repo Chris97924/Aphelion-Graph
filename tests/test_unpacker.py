@@ -353,6 +353,9 @@ def test_compression_ratio_exceeded(tmp_path: Path) -> None:
 def test_names_colliding_after_normalisation_rejected(
     tmp_path: Path, first: str, second: str
 ) -> None:
+    """All platforms: two members whose names reach one file once normalized
+    (``./``, case, Unicode form, trailing dots or spaces) are refused before
+    anything is written."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [(_reg(first), b"first"), (_reg(second), b"second")],
@@ -366,8 +369,8 @@ def test_names_colliding_after_normalisation_rejected(
 
 
 def test_directory_component_colliding_by_case_rejected(tmp_path: Path) -> None:
-    """``Claims/a.md`` and ``claims/b.md`` share one directory on NTFS/APFS
-    but two on ext4, so the extracted tree would differ by platform."""
+    """All platforms: ``Claims/a.md`` and ``claims/b.md`` share one directory on
+    NTFS/APFS but two on ext4, so the extracted tree would differ by platform."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [(_reg("Claims/a.md"), b"a"), (_reg("claims/b.md"), b"b")],
@@ -378,6 +381,7 @@ def test_directory_component_colliding_by_case_rejected(tmp_path: Path) -> None:
 
 
 def test_file_and_directory_with_same_name_rejected(tmp_path: Path) -> None:
+    """All platforms: a file member and a directory member of one name are refused."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [(_reg("claims"), b"x"), (_reg("claims/a.md"), b"a")],
@@ -388,8 +392,9 @@ def test_file_and_directory_with_same_name_rejected(tmp_path: Path) -> None:
 
 
 def test_explicit_directory_entries_do_not_count_as_collisions(tmp_path: Path) -> None:
-    """A directory member plus files inside it (and ``./`` prefixes as plain
-    ``tar -C dir .`` produces) is a normal archive, not a collision."""
+    """All platforms: a directory member plus files inside it (and ``./``
+    prefixes as plain ``tar -C dir .`` produces) is a normal archive, not a
+    collision."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [
@@ -434,6 +439,8 @@ def _fails_after_first_member(tmp_path: Path) -> tuple[Path, ExtractPolicy]:
 
 
 def test_failed_unpack_into_missing_dest_creates_nothing(tmp_path: Path) -> None:
+    """All platforms: a failed unpack into a missing dest leaves neither dest nor
+    the parents it made for it."""
     archive, policy = _fails_after_first_member(tmp_path)
     dest = tmp_path / "out" / "nested" / "dest"
     with pytest.raises(SecurityError) as exc:
@@ -445,6 +452,8 @@ def test_failed_unpack_into_missing_dest_creates_nothing(tmp_path: Path) -> None
 
 
 def test_failed_unpack_into_existing_dest_leaves_it_unchanged(tmp_path: Path) -> None:
+    """All platforms: a failed unpack into an existing dest leaves it exactly as
+    it was, with no staging dir beside it."""
     archive, policy = _fails_after_first_member(tmp_path)
     dest = tmp_path / "dest"
     (dest / "claims").mkdir(parents=True)
@@ -460,8 +469,9 @@ def test_failed_unpack_into_existing_dest_leaves_it_unchanged(tmp_path: Path) ->
 
 
 def test_failed_unpack_on_compression_ratio_leaves_nothing(tmp_path: Path) -> None:
-    """The ratio check runs after a member is fully written (ratio 0, as in
-    test_compression_ratio_exceeded: a plain ustar archive never expands)."""
+    """All platforms: the ratio check runs after a member is fully written
+    (ratio 0, as in test_compression_ratio_exceeded: a plain ustar archive
+    never expands), and still nothing is left."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [(_reg("one.txt"), b"1"), (_reg("two.txt"), b"A" * 2048)],
@@ -475,6 +485,8 @@ def test_failed_unpack_on_compression_ratio_leaves_nothing(tmp_path: Path) -> No
 
 
 def test_failed_unpack_on_streamed_bomb_leaves_nothing(tmp_path: Path) -> None:
+    """All platforms: an archive over the total byte budget leaves an existing
+    empty dest empty."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [(_reg("one.txt"), b"1"), (_reg("two.txt"), b"x" * 2048)],
@@ -487,8 +499,8 @@ def test_failed_unpack_on_streamed_bomb_leaves_nothing(tmp_path: Path) -> None:
 
 
 def test_successful_unpack_into_existing_dest_merges_like_before(tmp_path: Path) -> None:
-    """Success keeps the old contract: archive files are written into dest,
-    replacing same-named files and leaving unrelated ones alone."""
+    """All platforms: success keeps the old contract: archive files are written
+    into dest, replacing same-named files and leaving unrelated ones alone."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [(_dir("claims"), None), (_reg("claims/a.md"), b"new a"), (_reg("m.json"), b"{}")],
@@ -510,6 +522,8 @@ def test_successful_unpack_into_existing_dest_merges_like_before(tmp_path: Path)
 
 
 def test_successful_unpack_into_new_dest(tmp_path: Path) -> None:
+    """All platforms: an unpack into a missing dest creates it, and nothing else
+    beside it."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg("claims/a.md"), b"a")])
     dest = tmp_path / "new" / "dest"
     unpack(archive, dest)
@@ -520,8 +534,9 @@ def test_successful_unpack_into_new_dest(tmp_path: Path) -> None:
 def test_unpack_into_existing_dest_moves_only_within_its_filesystem(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An existing dest may be a mount point, where a rename from anywhere
-    outside it fails with EXDEV. Simulate that: the merge must not need one."""
+    """All platforms: an existing dest may be a mount point (on POSIX; Windows
+    refuses a mounted folder as dest), where a rename from anywhere outside it
+    fails with EXDEV. Simulate that: the merge must not need one."""
     archive = _write_tar(
         tmp_path / "a.tar",
         [(_dir("claims"), None), (_reg("claims/a.md"), b"a"), (_reg("m.json"), b"{}")],
@@ -559,6 +574,9 @@ def test_unpack_into_existing_dest_moves_only_within_its_filesystem(
     reason="directory write permission is only enforced on POSIX for non-root users",
 )
 def test_unpack_into_existing_dest_whose_parent_is_not_writable(tmp_path: Path) -> None:
+    """POSIX only, not as root (where directory write permission is enforced):
+    an existing dest in a read-only parent is still unpacked into, since
+    staging sits inside dest."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg("claims/a.md"), b"a")])
     parent = tmp_path / "read-only"
     dest = parent / "dest"
@@ -575,8 +593,9 @@ def test_unpack_into_existing_dest_whose_parent_is_not_writable(tmp_path: Path) 
 
 
 def test_failed_merge_into_existing_dest_leaves_it_unchanged(tmp_path: Path) -> None:
-    """Guards the in-dest staging placement rather than a past regression: a
-    conflict found by the pre-move check leaves no staging dir inside dest."""
+    """All platforms: guards the in-dest staging placement rather than a past
+    regression: a conflict found by the pre-move check leaves no staging dir
+    inside dest."""
     archive = _write_tar(
         tmp_path / "a.tar", [(_reg("a.md"), b"new a"), (_reg("claims"), b"file")]
     )
@@ -642,8 +661,10 @@ def _staging_alias(dest: Path, kind: str, name: str = STAGING_NAME) -> str:
 def test_member_reaching_the_staging_dir_is_not_silently_dropped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    """A member under a name that reaches the staging dir would be moved into
-    the staging tree and deleted with it. It must be refused instead."""
+    """All platforms (the case spelling where names are case-insensitive, the
+    8.3 spelling on Windows): a member under a name that reaches the staging
+    dir would be moved into the staging tree and deleted with it. It must be
+    refused instead."""
     import secrets
 
     monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
@@ -666,9 +687,10 @@ def test_member_reaching_the_staging_dir_is_not_silently_dropped(
 def test_member_reaching_the_staging_dir_is_refused_before_any_move(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    """Such a member also hides a conflict from the pre-move check (its target
-    looks absent), so the merge would fail halfway. It must be refused before
-    anything in dest changes."""
+    """All platforms (the case spelling where names are case-insensitive, the
+    8.3 spelling on Windows): such a member also hides a conflict from the
+    pre-move check (its target looks absent), so the merge would fail halfway.
+    It must be refused before anything in dest changes."""
     import secrets
 
     monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
@@ -714,6 +736,8 @@ def _fail_to_unlink(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
 def test_failed_unpack_names_a_staging_dir_it_cannot_remove(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """All platforms: a staging dir that a failed unpack cannot remove is named
+    in a RuntimeWarning."""
     archive, policy = _fails_after_first_member(tmp_path)
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -733,6 +757,8 @@ def test_failed_unpack_names_a_staging_dir_it_cannot_remove(
 def test_failed_unpack_keeps_its_error_when_warnings_are_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """All platforms: with warnings turned into errors, the unpack's own error is
+    still raised (and on Python 3.11+ a note names the staging dir left)."""
     import warnings
 
     archive, policy = _fails_after_first_member(tmp_path)
@@ -756,9 +782,10 @@ def test_failed_unpack_keeps_its_error_when_warnings_are_errors(
 def test_failed_unpack_removes_read_only_staged_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A read-only file (the Windows attribute blocks deletion) in the staging
-    tree is made writable and removed, not left inside dest. Guards Windows
-    only: POSIX deletes a read-only file in a writable directory anyway."""
+    """Windows (runs everywhere; POSIX deletes a read-only file in a writable
+    directory anyway): a read-only file in the staging tree, which the Windows
+    attribute keeps from being deleted, is made writable and removed, not left
+    inside dest."""
     import aphelion.unpacker as unpacker
 
     real_extract = unpacker._extract
@@ -797,11 +824,10 @@ def test_failed_unpack_removes_read_only_staged_files(
 def test_failed_unpack_never_changes_a_link_target_in_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str
 ) -> None:
-    """A link in the staging tree that cannot be removed is reported, never
-    made writable: that would change the read-only entry it points to. The
-    symlink case guards POSIX, where chmod follows links; Windows chmod did
-    not change a symlink's target even before, and the junction case covers
-    the other kind of Windows link."""
+    """POSIX (symlink case, where chmod follows links) and Windows (junction
+    case): a link in the staging tree that cannot be removed is reported, never
+    made writable: that would change the read-only entry it points to. Windows
+    chmod did not change a symlink's target even before."""
     import aphelion.unpacker as unpacker
 
     if link_kind == "symlink":
@@ -895,8 +921,9 @@ def _fail_moves(
 def test_failed_move_into_existing_dest_is_undone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An OS error after some files were replaced (a full disk, a file held
-    open on Windows) puts every replaced file back and removes what was added."""
+    """All platforms: an OS error after some files were replaced (a full disk, a
+    file held open on Windows) puts every replaced file back and removes what
+    was added."""
     archive, dest, before = _merge_archive(tmp_path)
     _fail_moves(monkeypatch, nth_staged=3)  # after a.md and z.md were replaced
 
@@ -912,6 +939,8 @@ def test_failed_move_into_existing_dest_is_undone(
 def test_failed_undo_keeps_the_backup_and_names_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """All platforms: if replaced files cannot be put back either, the backup
+    holding them is kept and named in the error."""
     archive, dest, _ = _merge_archive(tmp_path)
     _fail_moves(monkeypatch, nth_staged=3, restores=True)
 
@@ -938,7 +967,7 @@ def test_new_file_that_cannot_be_moved_back_is_replaced_by_the_original(
 
     def replace(src: str, dst: str, **kwargs: object) -> None:
         back_to_staging = ".unpacking-" in os.fspath(dst) and ".backup-" not in os.fspath(dst)
-        if Path(os.fspath(src)) == dest / "a.md" and back_to_staging:
+        if Path(os.fspath(src)) == dest.resolve() / "a.md" and back_to_staging:
             raise PermissionError(errno.EACCES, "Permission denied", os.fspath(src))
         real_replace(src, dst, **kwargs)
 
@@ -958,6 +987,8 @@ def test_new_file_that_cannot_be_moved_back_is_replaced_by_the_original(
     reason="only Windows refuses to rename a file that another handle holds open",
 )
 def test_unpack_over_a_file_held_open_leaves_dest_unchanged(tmp_path: Path) -> None:
+    """Windows only: a file another handle holds open cannot be replaced, so the
+    merge is undone and dest is left unchanged."""
     archive, dest, before = _merge_archive(tmp_path)
 
     with open(dest / "z.md", "rb"), pytest.raises(PermissionError) as exc:
@@ -972,6 +1003,8 @@ def test_unpack_over_a_file_held_open_leaves_dest_unchanged(tmp_path: Path) -> N
     reason="only on Windows does the read-only attribute stop a file being replaced",
 )
 def test_unpack_replaces_a_read_only_file(tmp_path: Path) -> None:
+    """Windows only: a file with the read-only attribute in dest is still
+    replaced, and no staging dir is left."""
     archive, dest, _ = _merge_archive(tmp_path)
     (dest / "z.md").chmod(stat.S_IREAD)
 
@@ -984,8 +1017,8 @@ def test_unpack_replaces_a_read_only_file(tmp_path: Path) -> None:
 def test_staging_left_after_a_complete_merge_only_warns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """dest is fully updated, so failing to remove the empty staging dir
-    afterwards must not report the unpack as failed."""
+    """All platforms: dest is fully updated, so failing to remove the empty
+    staging dir afterwards must not report the unpack as failed."""
     archive, dest, _ = _merge_archive(tmp_path)
     real_rmdir = os.rmdir
 
@@ -1011,8 +1044,10 @@ BACKUP_NAME = ".backup-" + "00" * 8  # with secrets.token_hex patched to zeros
 def test_member_reaching_the_backup_dir_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    """The backup directory for replaced files sits in staging; a member that
-    reaches it under any spelling is refused before anything is moved."""
+    """All platforms (the case spelling where names are case-insensitive, the
+    8.3 spelling on Windows): the backup directory for replaced files sits in
+    staging; a member that reaches it under any spelling is refused before
+    anything is moved."""
     import secrets
 
     monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
@@ -1315,7 +1350,8 @@ def test_unpack_fails_when_an_entry_cannot_be_looked_at(
     leaves dest as it was. Taken as "not there", it let a file be replaced
     without a backup, or a check pass that never ran."""
     archive, dest, before = _merge_archive(tmp_path)
-    broken = os.path.normcase(dest if name == "dest" else dest / name)
+    # unpack looks at dest as given, and at files in it through dest resolved.
+    broken = os.path.normcase(dest if name == "dest" else dest.resolve() / name)
     module = os if call == "lstat" else os.path
     real = getattr(module, call)
 
@@ -1360,6 +1396,8 @@ LINK_KINDS = [
 
 @pytest.mark.parametrize("kind", LINK_KINDS)
 def test_unpack_refuses_a_dangling_link_as_destination(tmp_path: Path, kind: str) -> None:
+    """All platforms that can create symlinks, and Windows for junctions: a dest
+    that is a dangling link is refused, and nothing is made where it points."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"a")])
     target = tmp_path / "elsewhere" / "target"
     target.mkdir(parents=True)  # a junction can only be made to an existing dir
@@ -1379,6 +1417,8 @@ def test_unpack_refuses_a_dangling_link_as_destination(tmp_path: Path, kind: str
 def test_unpack_refuses_a_link_to_a_directory_as_destination(
     tmp_path: Path, kind: str
 ) -> None:
+    """All platforms that can create symlinks, and Windows for junctions: a dest
+    that is a link to a directory is refused, and the directory stays empty."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"a")])
     target = tmp_path / "target"
     target.mkdir()
@@ -1433,6 +1473,9 @@ ONLY_WINDOWS_REFUSES = pytest.mark.skipif(
 @ONLY_WINDOWS_REFUSES
 @pytest.mark.parametrize("name", NON_PORTABLE_NAMES)
 def test_non_portable_member_name_is_refused(tmp_path: Path, name: str) -> None:
+    """Windows only: a member name Win32 cannot create as a file (a stream name,
+    a reserved character, a device name, a trailing dot or space) is refused
+    before anything is written."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg(name), b"x")])
     dest = tmp_path / "dest"
 
@@ -1446,6 +1489,7 @@ def test_non_portable_member_name_is_refused(tmp_path: Path, name: str) -> None:
 
 @pytest.mark.parametrize("name", NEAR_DEVICE_NAMES)
 def test_portable_names_near_device_names_are_accepted(tmp_path: Path, name: str) -> None:
+    """All platforms: names that only look like device names are unpacked."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg(name), b"x")])
     unpack(archive, tmp_path / "dest")
     assert (tmp_path / "dest" / name).read_bytes() == b"x"
@@ -1499,6 +1543,8 @@ def test_names_only_windows_refuses_work_elsewhere(tmp_path: Path, name: str) ->
 
 @ONLY_WINDOWS_REFUSES
 def test_stream_name_does_not_replace_an_existing_file(tmp_path: Path) -> None:
+    """Windows only: a member named like a stream of an existing file is
+    refused, and the file keeps its content."""
     archive = _write_tar(tmp_path / "a.tar", [(_reg("old.txt:evil"), b"x")])
     dest = tmp_path / "dest"
     dest.mkdir()
@@ -1517,6 +1563,8 @@ def test_stream_name_does_not_replace_an_existing_file(tmp_path: Path) -> None:
 def test_failed_unpack_keeps_a_parent_another_process_created(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """All platforms: a parent of dest that another process created meanwhile is
+    not removed by the failed unpack, nor is anything in it."""
     archive, policy = _fails_after_first_member(tmp_path)
     shared = tmp_path / "shared"
     dest = shared / "mine" / "dest"
