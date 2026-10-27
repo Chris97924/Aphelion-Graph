@@ -2135,6 +2135,49 @@ def test_elsewhere_enoent_and_enotdir_still_mean_absent(
     assert _taken_as_absent(site, tmp_path, monkeypatch, err) is True
 
 
+@pytest.mark.parametrize("winerror", [2, pytest.param(53, marks=WINDOWS_ONLY)])
+def test_undo_never_moves_an_original_over_its_staged_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    """All platforms: moving z.md aside fails (a sharing violation, a network
+    hiccup), so the undo finds the original still in dest. Where the look
+    at its staged copy wrongly finds nothing (another process at work, say;
+    on Windows also a network error raised as "not found"), the undo still
+    cannot move the original over that copy, into staging and away with it:
+    it moves back only by a step that fails if anything is there."""
+    archive, dest, before = _merge_archive(tmp_path)
+    z_in_dest = dest.resolve() / "z.md"
+    undoing: list[str] = []
+    real_replace, real_lstat = os.replace, os.lstat
+
+    def replace(src: str, dst: str, **kwargs: object) -> None:
+        if Path(os.fspath(src)) == z_in_dest and ".backup-" in os.fspath(dst):
+            undoing.append(os.fspath(src))
+            raise OSError(errno.EIO, "simulated I/O error", os.fspath(src))
+        real_replace(src, dst, **kwargs)
+
+    def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
+        staged = Path(os.fspath(path))
+        if (
+            undoing
+            and staged.name == "z.md"
+            and staged.parent.name.startswith(".unpacking-")
+            and _from_aphelion()
+        ):
+            raise _not_found(path, winerror)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "lstat", lstat)
+    with pytest.raises(OSError) as exc:
+        unpack(archive, dest)
+    monkeypatch.undo()
+
+    assert "simulated I/O error" in str(exc.value)
+    assert _tree(dest) == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
+
+
 # ---------- the destination itself must not be a link ----------
 
 

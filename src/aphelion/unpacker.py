@@ -467,7 +467,8 @@ class _Replacement:
     entry found absent is placed by a step that fails if anything is there
     by then: a file over an empty placeholder made by an exclusive create
     (removed again by ``rollback``), a directory by a rename that replaces
-    nothing on Windows and only an empty directory elsewhere.
+    nothing on Windows and only an empty directory elsewhere. ``rollback``
+    moves an entry back the same way, so it never replaces what it moves to.
 
     Known limits: the log is in memory only (no recovery after a kill or a
     power loss; ``backup`` then still holds the replaced entries), an undo
@@ -564,14 +565,7 @@ class _Replacement:
     def _unclaim(self, target: Path) -> None:
         # The placeholder of a move that did not happen goes; anything else
         # at target (the moved file, if it could not be moved back) stays.
-        st = _lstat(target)
-        if (
-            st is not None
-            and st.st_ino
-            and stat.S_ISREG(st.st_mode)
-            and (st.st_dev, st.st_ino) == self._claims[target]
-        ):
-            os.unlink(target)
+        _remove_placeholder(target, self._claims[target])
 
     def _refuse_placed(self, st: os.stat_result, target: Path) -> None:
         # Two entries distinct in staging can still name one entry here: the
@@ -702,9 +696,39 @@ def _maybe_present(path: Path) -> bool:
 
 
 def _move_back(path: Path, back: Path) -> None:
-    # Only a rename that happened is reversed, and nothing is overwritten.
-    if _lstat(path) is not None and _lstat(back) is None:
+    # Only a rename that happened is reversed, by a step that fails if
+    # anything is at back by then, as the look that found it free can be
+    # wrong: a directory by a rename (which replaces nothing on Windows and
+    # elsewhere only an empty directory), anything else over an empty
+    # placeholder made by an exclusive create, removed again if the move fails.
+    st = _lstat(path)
+    if st is None or _lstat(back) is not None:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        os.rename(path, back)
+        return
+    fd = os.open(back, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        claim = os.fstat(fd)
+    finally:
+        os.close(fd)
+    try:
         os.replace(path, back)
+    except BaseException:
+        _remove_placeholder(back, (claim.st_dev, claim.st_ino))
+        raise
+
+
+def _remove_placeholder(path: Path, claim: tuple[int, int]) -> None:
+    # The empty file this call made at path goes; anything else there stays.
+    st = _lstat(path)
+    if (
+        st is not None
+        and st.st_ino
+        and stat.S_ISREG(st.st_mode)
+        and (st.st_dev, st.st_ino) == claim
+    ):
+        os.unlink(path)
 
 
 def _restore(saved: Path, target: Path, src: Path) -> None:
