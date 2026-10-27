@@ -75,15 +75,15 @@ the record of what a bump would carry.
   member has passed every check; `migrate --force` builds the new tree beside
   the destination and then swaps it in. If either fails or is interrupted
   (Ctrl-C included) before every entry is in place, the destination is put
-  back as it was, or the error names the directory that still holds the
-  original files, which is deleted only once it is empty. A staging or
-  backup directory left behind is named in a note on the error (Python
-  3.11+) or in a `RuntimeWarning` that is shown even where warnings are
-  ignored or turned into errors. A file in the destination is replaced by
-  renaming the new one onto its name, so other hard links to it keep their
-  content.
-- **`unpack` refuses more destinations and archives**, each before anything
-  in the destination changes:
+  back as it was, or the error or a `RuntimeWarning` names the directory
+  that still holds the original files, which is deleted only once it is
+  empty. A staging or backup directory left behind is named in a note on
+  the error (Python 3.11+) or in a `RuntimeWarning` that is shown even
+  where warnings are ignored or turned into errors. A file in the
+  destination is replaced by renaming the new one onto its name, so other
+  hard links to it keep their content.
+- **`unpack` refuses more destinations and archives**, and leaves the
+  destination as it was:
   - a destination that is a symlink, a junction or a Windows mounted folder
     (unpack into a directory inside it instead);
   - a symlink or junction already in the destination where the archive has a
@@ -95,24 +95,24 @@ the record of what a bump would carry.
   - on a filesystem that reports no file identity (inode number 0), an
     archive that would replace or merge into an existing entry, since
     whether two members reach that entry cannot be checked there.
-- **On Windows, `pack`, `unpack` and the archive checks of `validate` and
-  `verify` refuse member names Win32 cannot create**: device names such as
-  `CON` or `aux.md`, names ending in a dot or a space, and the characters
-  `<>:"|?*` and control characters. They also treat names that differ only
-  by trailing dots or spaces as colliding. Other platforms accept both, as
-  before.
+- **On Windows, `pack`, `unpack`, signature validation
+  (`validate_signatures`) and `verify` refuse member names Win32 cannot
+  create**: device names such as `CON` or `aux.md`, names ending in a dot
+  or a space, and the characters `<>:"|?*` and control characters. They
+  also treat names that differ only by trailing dots or spaces as
+  colliding. Other platforms accept both, as before.
 - **Member names that collide once normalised are refused** (`PX_E_6007`)
-  by `pack`, `unpack` and the archive checks of `validate` and `verify`,
-  before anything is written. Names are compared without a leading `./` or
-  empty and `.` segments, after NFC normalisation and case folding (on
-  Windows also without trailing dots and spaces), so two spellings of one
-  file or directory, or a file and a directory of one name, can no longer
-  share an archive.
+  by `pack`, `unpack`, signature validation (`validate_signatures`) and
+  `verify`, before anything is written. Names are compared without a
+  leading `./` or empty and `.` segments, after NFC normalisation and case
+  folding (on Windows also without trailing dots and spaces), so two
+  spellings of one file or directory, or a file and a directory of one
+  name, can no longer share an archive.
 - **`pack` refuses the member paths `unpack` refuses**: empty (`PX_E_6006`),
   absolute (`PX_E_6002`), containing a backslash (`PX_E_6004`),
   drive-prefixed such as `a:b.md` (`PX_E_6003`, on every platform), or with
-  a `..` segment (`PX_E_6001`). It can no longer write an archive `unpack`
-  rejects.
+  a `..` segment (`PX_E_6001`). It no longer writes member paths that
+  `unpack` on the same platform refuses.
 - **`aphe sign --signer-id` must be a single path component.** An empty id,
   `.`, `..`, or an id containing `/`, `\` or NUL is refused (`PX_E_6001`)
   before any file is read or written; the id names
