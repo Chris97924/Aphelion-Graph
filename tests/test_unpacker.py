@@ -1013,7 +1013,7 @@ def test_header_blocks_of_a_member_stay_within_their_allowance(
     assert not (tmp_path / "dest").exists()
 
 
-def test_data_after_the_end_of_the_archive_is_not_ignored(tmp_path: Path) -> None:
+def test_data_after_the_end_of_the_archive_is_not_ignored(tmp_path: Path, passes: list) -> None:
     """All platforms: non-zero bytes within 4,096 bytes after the end of the
     last member make every reader fail with tarfile.ReadError, none of them
     returning as if the archive ended there; past that they are not read,
@@ -1043,6 +1043,8 @@ def test_data_after_the_end_of_the_archive_is_not_ignored(tmp_path: Path) -> Non
         "signatures.jsonl",
         "signers",
     ]
+    assert len(passes) == 7
+    assert all(reader.handed <= 2048 + HEADER_BYTES for reader in passes)
 
 
 @pytest.mark.parametrize("via", ["unpack", "check_member_names"])
@@ -1133,7 +1135,7 @@ def test_reading_on_stops_at_the_ratio_limit_before_member_data(
 
 
 def test_unpack_refuses_an_archive_that_changes_between_its_passes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passes: list
 ) -> None:
     """All platforms: unpack checks every header, then reads the archive
     again to write the members. If the second pass sees a member the first
@@ -1159,11 +1161,14 @@ def test_unpack_refuses_an_archive_that_changes_between_its_passes(
             return seen
 
         monkeypatch.setattr(unpacker, "_scan", scan_then_change)
+        passes.clear()
         with pytest.raises(SecurityError) as exc:
             unpack(archive, tmp_path / "dest")
         assert exc.value.code == ErrorCode.ARCHIVE_BOMB
         assert "changed" in str(exc.value)
         assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar"]
+        assert len(passes) == 2
+        assert passes[0].handed <= len(first) and passes[1].handed <= len(second)
 
 
 def test_each_entry_point_reads_the_archive_a_fixed_number_of_times(
@@ -1199,25 +1204,28 @@ def test_each_entry_point_reads_the_archive_a_fixed_number_of_times(
         assert all(reader.handed <= len(raw) for reader in passes)
 
 
-def test_accessors_take_the_last_member_of_a_repeated_name(tmp_path: Path) -> None:
+def test_accessors_take_the_last_member_of_a_repeated_name(tmp_path: Path, passes: list) -> None:
     """All platforms: when a name repeats, the accessors read the last
     member of that name, as ``TarFile.getmember`` finds it (a directory
     last means no signatures), while unpack refuses the archive."""
     from aphelion.unpacker import extract_signatures_jsonl, extract_signer_manifests
 
     archive = tmp_path / "a.tar"
-    archive.write_bytes(
+    raw = (
         _file(b"signatures.jsonl", b"first")
         + _file(b"signers/s.json", b"one")
         + _file(b"signatures.jsonl", b"last")
         + _file(b"signers/s.json", b"two")
         + END
     )
+    archive.write_bytes(raw)
     assert extract_signatures_jsonl(archive) == b"last"
     assert dict(extract_signer_manifests(archive)) == {"s": b"two"}
     with pytest.raises(SecurityError) as exc:
         unpack(archive, tmp_path / "dest")
     assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+    assert len(passes) == 3
+    assert all(reader.handed <= len(raw) for reader in passes)
 
     archive.write_bytes(
         _file(b"signatures.jsonl", b"first") + _raw_header(b"signatures.jsonl", 0, b"5") + END
@@ -1265,7 +1273,9 @@ def test_ordinary_archives_are_read_in_full(
     assert all(reader.handed <= len(raw.getvalue()) for reader in passes)
 
 
-def test_global_and_local_pax_headers_and_a_gnu_long_name_together(tmp_path: Path) -> None:
+def test_global_and_local_pax_headers_and_a_gnu_long_name_together(
+    tmp_path: Path, passes: list
+) -> None:
     """All platforms: a global pax header, a member with its own pax header
     and one with a GNU long name in one archive unpack in full."""
     long_name = b"d/" + b"n" * 110
@@ -1283,15 +1293,20 @@ def test_global_and_local_pax_headers_and_a_gnu_long_name_together(tmp_path: Pat
     dest = unpack(archive, tmp_path / "dest")
     assert (dest / "p" / ("é" * 60)).read_bytes() == b"one"
     assert (dest / long_name.decode()).read_bytes() == b"two"
+    assert len(passes) == 2
+    assert all(reader.handed <= len(raw) for reader in passes)
 
 
-def test_a_member_of_max_file_bytes_unpacks(tmp_path: Path) -> None:
+def test_a_member_of_max_file_bytes_unpacks(tmp_path: Path, passes: list) -> None:
     """All platforms: a 25 MiB member, the most the default policy allows,
     in a compressed archive unpacks."""
     data = random.Random(8).randbytes(25 * MIB)
+    raw = _tar_bytes([("big.bin", data)])
     archive = tmp_path / "a.tar.gz"
-    archive.write_bytes(gzip.compress(_tar_bytes([("big.bin", data)]), compresslevel=1, mtime=0))
+    archive.write_bytes(gzip.compress(raw, compresslevel=1, mtime=0))
     assert unpack(archive, tmp_path / "dest").joinpath("big.bin").read_bytes() == data
+    assert len(passes) == 2
+    assert all(reader.handed <= len(raw) for reader in passes)
 
 
 def test_max_files_members_pass_the_header_checks_in_bounded_memory(
@@ -1322,18 +1337,22 @@ def test_max_files_members_pass_the_header_checks_in_bounded_memory(
     assert exc.value.code == ErrorCode.FILE_COUNT_EXCEEDED
 
 
-def test_long_numeric_pax_records_in_every_member(tmp_path: Path) -> None:
+def test_long_numeric_pax_records_in_every_member(tmp_path: Path, passes: list) -> None:
     """All platforms: members whose pax headers hold 3 KiB numeric records,
     which older tarfile releases parse slowly, are read; at most 4,096
     bytes of header per member reach tarfile (scaled to 300 members)."""
     from aphelion.unpacker import check_member_names
 
+    member = _pax({"comment": "7" * 3000}) + _raw_header(b"m", 1)
+    assert len(member) == HEADER_BYTES
     raw = b"".join(
         _pax({"comment": "7" * 3000}) + _file(b"m%03d" % i, b"x") for i in range(300)
     )
     archive = tmp_path / "a.tar"
     archive.write_bytes(raw + END)
     check_member_names(archive)
+    assert len(passes) == 1
+    assert passes[0].handed <= len(raw) + HEADER_BYTES
 
 
 def _flip(raw: bytes, rng: random.Random) -> bytes:
