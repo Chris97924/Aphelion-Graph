@@ -7,14 +7,16 @@ distinct PX_E_6NNN code (see :mod:`aphelion.error_codes`):
     filesystem would see them (leading ``./``, repeated or ``.`` separators,
     Unicode NFC, case folding, and on Windows trailing dots/spaces), or that
     reach one entry on disk under different names (8.3 short names)
-  * disallowed member types (symlink, hardlink, device, fifo)
-  * zip-bomb (enforced streaming, per-file and per-total budgets)
+  * disallowed member types (symlink, hardlink, device, fifo, sparse)
+  * zip-bomb (enforced streaming, per-file and per-total budgets, and a
+    limit on every byte read or decompressed, whatever the headers say)
   * too many files, overly long paths
 """
 
 from __future__ import annotations
 
 import errno
+import io
 import os
 import re
 import secrets
@@ -24,10 +26,11 @@ import sys
 import tarfile
 import unicodedata
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import BinaryIO, Callable, Mapping
+from typing import BinaryIO, Callable, Iterator, Mapping
 
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SecurityError
@@ -205,6 +208,169 @@ class MemberNames:
         return None
 
 
+_ARCHIVE_END_ALLOWANCE = 16 * 1024  # end blocks and the record padding after them
+_READ_CHUNK = 64 * 1024
+
+
+def _member_header_allowance(policy: ExtractPolicy) -> int:
+    """What one member takes besides its data: a pax header block and the
+    blocks of a ``path`` record for ``max_path_length`` characters of up to
+    four UTF-8 bytes each (or a GNU long name of that length), its ustar
+    header, and up to 511 bytes of padding after its data. 4095 bytes at the
+    default policy."""
+    record = 4 * policy.max_path_length + 32
+    return 512 + -(-record // 512) * 512 + 512 + 511
+
+
+def _read_limit(policy: ExtractPolicy) -> int:
+    """The most bytes one pass over an archive may produce: decompressed, or
+    read from an uncompressed file.
+
+    That is ``max_total_bytes`` of member data, the header allowance for
+    ``max_files`` members, the end of the archive, and the read-ahead
+    (``io.DEFAULT_BUFFER_SIZE``) a decompressing file object holds back.
+    """
+    return (
+        policy.max_total_bytes
+        + policy.max_files * _member_header_allowance(policy)
+        + _ARCHIVE_END_ALLOWANCE
+        + io.DEFAULT_BUFFER_SIZE
+    )
+
+
+class _BoundedArchive:
+    """The bytes tarfile reads from an archive file, decompressed if it is
+    compressed, each one counted against ``limit``.
+
+    tarfile skips member data, and can move backwards, by seeking. A
+    compressed stream is only ever read forwards here: a forward seek reads
+    what it skips, and a backward seek opens the file again and decompresses
+    from the start, all of it counted, as is the read-ahead the decompressing
+    file object may hold each time it is opened. Whatever the member headers
+    say, past ``limit`` (checked after every read of at most ``_READ_CHUNK``
+    bytes) reading fails with ARCHIVE_BOMB. An uncompressed file seeks
+    directly, and the bytes read are counted.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        open_file: Callable[[Path], BinaryIO],
+        compressed: bool,
+        limit: int,
+    ) -> None:
+        self._path = path
+        self._open_file = open_file
+        self._compressed = compressed
+        self._limit = limit
+        self._produced = 0
+        self._pos = 0
+        self._file = self._open()
+
+    def _open(self) -> BinaryIO:
+        if self._compressed:
+            self._count(io.DEFAULT_BUFFER_SIZE)
+        return self._open_file(self._path)
+
+    def _count(self, n: int) -> None:
+        self._produced += n
+        if self._produced > self._limit:
+            raise SecurityError(
+                code=ErrorCode.ARCHIVE_BOMB,
+                msg=(
+                    f"reading the archive goes past {self._limit} bytes, more than "
+                    f"max-total-bytes of member data and their headers can take"
+                ),
+            )
+
+    def read(self, size: int | None = -1) -> bytes:
+        remaining = -1 if size is None or size < 0 else size
+        chunks = []
+        while remaining:
+            data = self._file.read(_READ_CHUNK if remaining < 0 else min(remaining, _READ_CHUNK))
+            if not data:
+                break
+            self._pos += len(data)
+            self._count(len(data))
+            chunks.append(data)
+            if remaining > 0:
+                remaining -= len(data)
+        return b"".join(chunks)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_CUR:
+            offset += self._pos
+        elif whence != io.SEEK_SET:
+            raise io.UnsupportedOperation("an archive is only read from its start")
+        if not self._compressed:
+            self._pos = self._file.seek(offset)
+            return self._pos
+        if offset < self._pos:
+            self._file.close()
+            self._file = self._open()
+            self._pos = 0
+        while self._pos < offset and self.read(min(offset - self._pos, _READ_CHUNK)):
+            pass
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def close(self) -> None:
+        self._file.close()
+
+
+def _compression(head: bytes) -> tuple[str, Callable[[Path], BinaryIO], tuple[type[Exception], ...]]:
+    """The compression an archive's leading bytes name (the test tarfile's
+    stream mode uses), how to open such a file, and the errors that, while the
+    first header is read, mean it is not one (as in tarfile's ``gzopen``,
+    ``bz2open``, ``xzopen`` and ``zstopen``)."""
+    try:
+        if head.startswith(b"\x1f\x8b\x08"):
+            import gzip
+
+            return "gzip", gzip.GzipFile, (OSError,)
+        if head[:3] == b"BZh" and head[4:10] == b"1AY&SY":
+            import bz2
+
+            return "bzip2", bz2.BZ2File, (OSError, EOFError)
+        if head.startswith((b"\x5d\x00\x00\x80", b"\xfd7zXZ")):
+            import lzma
+
+            return "lzma", lzma.LZMAFile, (lzma.LZMAError, EOFError)
+        if head.startswith(b"\x28\xb5\x2f\xfd"):
+            from compression import zstd  # type: ignore[import-not-found]  # Python 3.14+
+
+            return "zstd", zstd.ZstdFile, (zstd.ZstdError, EOFError)
+    except ImportError as exc:
+        raise tarfile.ReadError(f"cannot read this compressed archive: {exc}") from None
+    return "tar", lambda path: open(path, "rb"), ()
+
+
+@contextmanager
+def _open_archive(
+    archive: Path, policy: ExtractPolicy, passes: int = 2
+) -> Iterator[tarfile.TarFile]:
+    """Open ``archive`` for reading as ``tarfile.open(archive, "r")`` would,
+    with every byte read, or decompressed, counted against ``passes`` times
+    :func:`_read_limit` (see :class:`_BoundedArchive`). A reader that checks
+    the headers and then reads member data makes two passes: once it has
+    seen the last header, reading a member's data seeks back."""
+    with open(archive, "rb") as fh:
+        head = fh.read(10)
+    kind, open_file, not_this_kind = _compression(head)
+    stream = _BoundedArchive(archive, open_file, kind != "tar", passes * _read_limit(policy))
+    try:
+        try:
+            tar = tarfile.open(fileobj=stream, mode="r:")
+        except not_this_kind as exc:
+            raise tarfile.ReadError(f"not a {kind} file") from exc
+        with tar:
+            yield tar
+    finally:
+        stream.close()
+
+
 def _scan_members(
     tar: tarfile.TarFile, policy: ExtractPolicy, archive_size: int
 ) -> list[tuple[tarfile.TarInfo, str]]:
@@ -217,7 +383,12 @@ def _scan_members(
     Moving on to the next header reads past a member's data, which in a
     compressed archive means decompressing it, so a regular member's
     declared size is checked against the per-file, total and ratio budgets
-    before the scan moves past it, as :func:`_extract` checks them.
+    before the scan moves past it, as :func:`_extract` checks them. A sparse
+    member, or one declaring a negative size, is refused first: tarfile
+    would skip a different extent than the size it reports, or move
+    backwards. Neither occurs in a canonical package. Whatever the headers
+    say, the bytes read stay within :func:`_read_limit` (see
+    :func:`_open_archive`).
     """
     scanned: list[tuple[tarfile.TarInfo, str]] = []
     names = MemberNames()
@@ -241,6 +412,18 @@ def _scan_members(
                     f"disallowed member type for {member.name!r}: "
                     f"type={member.type!r} (symlink/hardlink/device/fifo forbidden)"
                 ),
+                path=member.name,
+            )
+        if member.issparse() or any(k.startswith("GNU.sparse.") for k in member.pax_headers):
+            raise SecurityError(
+                code=ErrorCode.DISALLOWED_MEMBER_TYPE,
+                msg=f"sparse member {member.name!r} (sparse files are not part of the format)",
+                path=member.name,
+            )
+        if member.size < 0:
+            raise SecurityError(
+                code=ErrorCode.FILE_BYTES_EXCEEDED,
+                msg=f"member {member.name!r} declares a negative size {member.size}",
                 path=member.name,
             )
         parts = path_parts(_check_path(member.name, policy))
@@ -310,8 +493,9 @@ def check_member_names(
     a name lookup and an extraction can no longer see different files.
     """
     archive = Path(archive_path)
-    with tarfile.open(archive, mode="r") as tar:
-        _scan_members(tar, policy or ExtractPolicy.default(), archive.stat().st_size)
+    policy = policy or ExtractPolicy.default()
+    with _open_archive(archive, policy, passes=1) as tar:
+        _scan_members(tar, policy, archive.stat().st_size)
 
 
 def unpack(
@@ -323,6 +507,13 @@ def unpack(
 
     Uses a streaming tarfile.next() loop - NEVER tar.extractall(), because
     extractall won't catch zip-bomb-class expansion until it's already disk-bound.
+    Whatever the member headers say, the bytes read from the archive, or
+    decompressed from it (a seek backwards decompresses again from the
+    start), stay within two passes (the header checks, then the member data)
+    of ``max_total_bytes`` plus, per ``max_files`` member, room for headers
+    and padding (4 KiB at the default policy), 16 KiB for the end of the
+    archive and the decompressor's read-ahead; past that the unpack fails
+    with ARCHIVE_BOMB.
 
     All-or-nothing: members are extracted into a staging directory and moved
     into place only once every member has passed every check. For an existing
@@ -1075,7 +1266,7 @@ def _extract(
     archive_size = archive.stat().st_size
     made: set[str] = set()  # directories this call created in staging
 
-    with tarfile.open(archive, mode="r") as tar:
+    with _open_archive(archive, policy) as tar:
         # Every header is checked before the first byte is written, so a
         # colliding or forbidden member late in the archive cannot ride on
         # members that were already extracted.
@@ -1220,9 +1411,11 @@ def extract_signatures_jsonl(tar_path: Path | str) -> bytes | None:
     Spec §5: presence of signatures.jsonl opts the package into v0.5 verification.
     This is a read-only accessor that does NOT run security checks — it is only
     used after a package has already been trust-verified at the tar level.
+    It reads no more of the archive than :func:`unpack` may at the default
+    limits.
     """
     archive = Path(tar_path)
-    with tarfile.open(archive, mode="r") as tar:
+    with _open_archive(archive, ExtractPolicy.default()) as tar:
         try:
             member = tar.getmember("signatures.jsonl")
         except KeyError:
@@ -1242,10 +1435,12 @@ def extract_signer_manifests(tar_path: Path | str) -> Mapping[str, bytes]:
 
     Returns an empty ``MappingProxyType`` if no ``signers/`` directory exists.
     Spec §5: used during signature verification to locate signer manifests.
+    It reads no more of the archive than :func:`unpack` may at the default
+    limits.
     """
     archive = Path(tar_path)
     result: dict[str, bytes] = {}
-    with tarfile.open(archive, mode="r") as tar:
+    with _open_archive(archive, ExtractPolicy.default()) as tar:
         for member in tar.getmembers():
             name = member.name
             if name.startswith("signers/") and name.endswith(".json") and member.isreg():

@@ -140,12 +140,12 @@ All raise sites import the `ErrorCode` enum — no string literals.
 | PX_E_6005  | PATH_TOO_LONG               | Member path exceeds `max_path_length`.                |
 | PX_E_6006  | EMPTY_MEMBER_NAME           | Member has empty name.                                |
 | PX_E_6007  | DUPLICATE_MEMBER_PATH       | Two members normalise to same path.                   |
-| PX_E_6008  | DISALLOWED_MEMBER_TYPE      | Symlink / hardlink / device / fifo rejected.          |
+| PX_E_6008  | DISALLOWED_MEMBER_TYPE      | Symlink / hardlink / device / fifo / sparse member rejected. |
 | PX_E_6009  | FILE_COUNT_EXCEEDED         | Archive exceeds `max_files` budget.                   |
-| PX_E_6010  | FILE_BYTES_EXCEEDED         | Member declares size > `max_file_bytes`.              |
+| PX_E_6010  | FILE_BYTES_EXCEEDED         | Member declares size > `max_file_bytes`, or a negative size. |
 | PX_E_6011  | TOTAL_BYTES_EXCEEDED        | Aggregate size > `max_total_bytes`.                   |
 | PX_E_6012  | COMPRESSION_RATIO_EXCEEDED  | Uncompressed bytes / archive size > ratio budget.     |
-| PX_E_6013  | ARCHIVE_BOMB                | Stream overran a budget mid-extraction.               |
+| PX_E_6013  | ARCHIVE_BOMB                | Stream overran a budget mid-extraction, or reading the archive (decompressing it, again after any seek back) went past its read limit (up to two passes over `max_total_bytes` plus a header allowance). |
 
 ## 9NN — GENERIC
 

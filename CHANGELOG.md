@@ -117,6 +117,21 @@ the record of what a bump would carry.
   member over the per-file limit (`PX_E_6010`), or a running total over the
   total limit (`PX_E_6011`) or over the compression-ratio limit
   (`PX_E_6012`), each at `unpack`'s defaults.
+- **Reading an archive stops at a limit, whatever its headers declare**
+  (`PX_E_6013`). `unpack`, signature validation (`validate_signatures`),
+  `verify_package`, `extract_signatures_jsonl` and
+  `extract_signer_manifests` read, or decompress, at most two passes over
+  `max_total_bytes` of member data plus, per `max_files` member, room for
+  headers and padding (4 KiB at the default policy), 16 KiB for the end of
+  the archive and the decompressor's read-ahead; `check_member_names` one
+  pass. What a
+  compressed archive decompresses again after a seek back counts too. The
+  accessors and `validate_signatures` use the default policy.
+- **Sparse members (`PX_E_6008`) and members declaring a negative size
+  (`PX_E_6010`) are refused** by `unpack`, `check_member_names`, signature
+  validation and `verify_package`; a package never has either. Where
+  Python's `tarfile` itself stops at a negative size, the archive ends
+  there.
 - **`pack` refuses the member paths `unpack` refuses**: empty (`PX_E_6006`),
   absolute (`PX_E_6002`), containing a backslash (`PX_E_6004`),
   drive-prefixed such as `a:b.md` (`PX_E_6003`, on every platform), or with

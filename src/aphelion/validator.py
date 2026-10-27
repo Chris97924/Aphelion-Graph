@@ -360,10 +360,10 @@ def _validate_signatures_full(
     signer_manifests_raw = extract_signer_manifests(tar_path)
 
     # Load package canonical hash from manifest inside the tar
-    import tarfile
     from aphelion.errors import SecurityError
+    from aphelion.unpacker import ExtractPolicy, _open_archive
     archive = Path(tar_path)
-    with tarfile.open(archive, mode="r") as tar:
+    with _open_archive(archive, ExtractPolicy.default()) as tar:
         try:
             manifest_info = tar.getmember("manifest.json")
         except KeyError as exc:
