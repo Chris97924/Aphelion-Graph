@@ -834,3 +834,76 @@ def test_sign_rejects_signer_id_that_is_not_a_single_path_component(
     assert payload is not None
     assert payload["code"] == ErrorCode.PATH_TRAVERSAL.value
     assert not out.exists()
+
+
+# ---------- verify: signatures are required only where they can be checked ----------
+
+
+def _signed_tar(tmp_path: Path) -> Path:
+    """A package signed by ``aphe sign`` with a fresh Ed25519 key (local only,
+    no notary)."""
+    pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key_file = tmp_path / "ed.key"
+    key_file.write_bytes(Ed25519PrivateKey.generate().private_bytes_raw())
+    out = tmp_path / "signed.tar"
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(_packed_tar(tmp_path)),
+            "--signer-id", "ed-signer",
+            "--algorithm", "ed25519",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+    assert code == 0, err
+    return out
+
+
+@pytest.mark.parametrize("flag", ["--require-signed", "--require-notary"])
+def test_verify_refuses_a_directory_when_a_signature_is_required(
+    tmp_path: Path, flag: str
+) -> None:
+    """All platforms: an unpacked directory carries no signature verify can
+    check, so with --require-signed or --require-notary it fails with
+    E_SIGNER_REQUIRED instead of passing on the semantic checks alone."""
+    src = _minimal_source(tmp_path / "pkg")
+
+    code, out, err = _run(["verify", str(src), flag])
+
+    assert code == EXIT_VALIDATION, (out, err)
+    payload = _error_payload(err)
+    assert payload is not None, err
+    assert payload["code"] == "E_SIGNER_REQUIRED"
+    assert "package file" in payload["msg"]
+    assert "OK" not in out
+
+
+def test_verify_of_a_directory_without_signature_flags_is_unchanged(tmp_path: Path) -> None:
+    """All platforms: without the flags, an unpacked directory still gets the
+    semantic cross-reference check and passes."""
+    src = _minimal_source(tmp_path / "pkg")
+
+    code, out, err = _run(["verify", str(src)])
+
+    assert code == 0, err
+    assert "semantic cross-reference OK" in out
+
+
+def test_verify_of_a_signed_package_with_signature_flags_is_unchanged(tmp_path: Path) -> None:
+    """All platforms (with the cryptography extra): a signed package file still
+    passes --require-signed, and --require-notary still refuses a signature
+    attested only locally (E_SIGNER_NOTARY_REQUIRED)."""
+    signed = _signed_tar(tmp_path)
+
+    code, out, err = _run(["verify", str(signed), "--require-signed"])
+    assert code == 0, err
+    assert "semantic + signature OK (1 envelope(s))" in out
+
+    code, out, err = _run(["verify", str(signed), "--require-notary"])
+    assert code == EXIT_VALIDATION, (out, err)
+    payload = _error_payload(err)
+    assert payload is not None, err
+    assert payload["code"] == "E_SIGNER_NOTARY_REQUIRED"

@@ -128,6 +128,11 @@ the record of what a bump would carry.
   emitted (`PX_E_5004`); a manifest path other than `claims/<claim_id>.md`
   (`PX_E_5002`). `spec/error-codes.md` gains `PX_E_4011`, `PX_E_4012` and
   `PX_E_5005`. Every sample and valid fixture in the repository passes.
+- **`aphe verify --require-signed` and `--require-notary` need the package
+  file.** Given an unpacked directory, or any path that is not a file, they
+  fail with `E_SIGNER_REQUIRED` (exit 3) instead of passing on the semantic
+  checks alone: signatures can only be checked on the `.aphelion.tar`.
+  Verifying a directory without these flags is unchanged.
 - **Malformed signer input is refused with typed errors, and base64 is
   decoded strictly.** A signer manifest is checked against spec v0.5 §2.3
   before it is used (a JSON object with a string `signer_id` equal to the

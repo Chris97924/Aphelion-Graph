@@ -244,6 +244,19 @@ def _cmd_verify(args: argparse.Namespace, writer: Writer) -> int:
             summary=f"{target}: semantic + signature OK ({len(result.envelopes)} envelope(s))",
             data=data,
         )
+    elif require_signed:
+        # The directory check below verifies no signature, so it must not pass
+        # for one: only the package file carries signatures verify can check.
+        from aphelion.errors import EXIT_VALIDATION
+        import sys
+        import json
+        exc = SignerVerificationError(
+            "E_SIGNER_REQUIRED",
+            f"signatures can only be checked on the package file (.aphelion.tar), not on {target}",
+        )
+        sys.stderr.write(json.dumps({"code": exc.code, "severity": "error", "msg": str(exc)}, sort_keys=True) + "\n")
+        sys.stderr.flush()
+        return EXIT_VALIDATION
     else:
         do_verify(args.dir)
         writer.success(
