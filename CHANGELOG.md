@@ -135,7 +135,11 @@ the record of what a bump would carry.
   more for global pax headers in front of it. A member whose header blocks
   take more is refused (`PX_E_6013`), so at the default policy so is a
   member whose pax header holds larger records, such as an extended
-  attribute of about 3 KB or more (`tar --xattrs`). Asking for more, or
+  attribute of about 3 KB or more (`tar --xattrs`). `max_path_length`
+  counts characters after NFC normalisation, so a name stored decomposed
+  (NFD, as macOS stores names) can need more than four bytes per counted
+  character, and a member whose header blocks then take more than H is
+  refused (`PX_E_6013`) too. Asking for more, or
   reading on after reaching the end of the archive 8 times, fails before
   another byte is handed out. So one pass hands `tarfile` at most
   `max_total_bytes` plus H + 511 bytes per `max_files` member plus H +
@@ -167,20 +171,30 @@ the record of what a bump would carry.
   or in a pax record, and a size given in a local or global pax header
   (`PX_E_6010`); header blocks that do not lead, size by size, from where
   the member before ends to the member's own header (`PX_E_6013`). These
-  header blocks are read again from the bytes handed to `tarfile`, so the
-  outcome is the same on every Python release, whether its `tarfile`
-  reports a member with a negative size, skips it, stops there or reads
-  on. A package never has any of these. A directory's size field is
-  ignored, as `tar` and `tarfile` ignore it: no data follows a directory.
+  header blocks, pax records included, are read again from the bytes
+  handed to `tarfile`, so for the member headers the outcome (refused or
+  not, and the code) is the same on every Python release, whether its
+  `tarfile` reports a member with a negative size, skips it, stops there
+  or reads on. A package never has any of these. A directory's size field
+  is ignored, as `tar` and `tarfile` ignore it: no data follows a
+  directory.
 - **What `tarfile` or the decompressor raises for a damaged archive is
   `tarfile.ReadError`**: anything `tarfile` raises while it parses a member
-  header other than an operating-system error (for example `ValueError`
-  for a `GNU.sparse.*` value it cannot read), and what the decompressor
-  raises for a compressed archive that is damaged or cut short
-  (`EOFError`, `lzma.LZMAError`, `OSError`, `zlib.error`, zstd's
-  `ZstdError`). The refusals above keep their codes. The command line
-  reports `tarfile.ReadError`, like any error without a code of its own,
-  as `PX_E_9001`.
+  header other than an operating-system or out-of-memory error (for
+  example `ValueError` for a `GNU.sparse.*` value it cannot read), and
+  what the decompressor raises for a compressed archive that is damaged or
+  cut short (`EOFError`, gzip's `BadGzipFile`, `zlib.error`,
+  `lzma.LZMAError`, zstd's `ZstdError`, and the `OSError` without an
+  errno that the bz2 module raises for invalid data). An operating-system
+  error reading the archive file (an `OSError` with an errno) is raised
+  unchanged, whatever the compression. The refusals above keep their
+  codes. The command line reports `tarfile.ReadError`, like any error
+  without a code of its own, as `PX_E_9001`. Known limit: a compressed
+  archive's own integrity checks (the gzip CRC and length, a bzip2 block's
+  CRC) run only when a read reaches them. A reader stops H bytes after the
+  last member, and how far the decompressor reads ahead depends on the
+  Python release (above), so whether damage that only these checks find
+  is reported can differ by release.
 - **Bytes after the end of the archive**: the H bytes (4,096 at the
   default policy) after the end of the last member, or after the start of
   an archive with no members, must be zeros, else every reader fails with

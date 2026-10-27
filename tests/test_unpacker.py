@@ -1147,6 +1147,104 @@ def test_a_negative_size_in_a_pax_record_is_refused_on_every_release(
     )
 
 
+def _pax_declaring(body: bytes, size: int, typeflag: bytes = b"x") -> bytes:
+    """A pax header declaring ``size`` bytes of records and holding
+    ``body``, padded to whole blocks: what lies past ``size`` is in the
+    padding, which tarfile reads as records too."""
+    assert -(-size // 512) == -(-len(body) // 512)
+    return _raw_header(b"././@PaxHeader", size, typeflag) + _padded(body)
+
+
+def _pax_record_cases() -> list:
+    a = _file(b"a.md", b"a" * 10)
+    b = _file(b"b.md", b"b")
+    path = _pax_record("path", "c.md")
+    size = _pax_record("size", "-1")
+    comment = _pax_record("comment", "x" * 20)
+    one = _pax_record("size", "1")
+    first = _pax_record("comment", "g")
+    cases = {
+        "size-in-the-padding-first": _pax_declaring(path + size, len(path)) + b,
+        "size-in-the-padding": a + _pax_declaring(path + size, len(path)) + b,
+        "record-across-the-declared-size": a + _pax_declaring(comment + size, len(comment) + 6) + b,
+        "realsize-in-the-padding": (
+            a + _pax_declaring(one + _pax_record("GNU.sparse.realsize", "-1"), len(one)) + b
+        ),
+        "global-size-in-the-padding": (
+            _pax_declaring(first + size, len(first), b"g") + _pax({"comment": "c"}) + b
+        ),
+        "arabic-indic-digit": a + _pax({"size": "-١"}) + b,
+        "fullwidth-digit": a + _pax({"size": "-１"}) + b,
+        "unicode-space": a + _pax({"size": " -1"}) + b,
+        "realsize-after-a-size": a + _pax({"size": "1", "GNU.sparse.realsize": "-١"}) + b,
+    }
+    return [pytest.param(raw + END, id=name) for name, raw in cases.items()]
+
+
+@pytest.mark.parametrize("fmt", ["tar", "gz"])
+@pytest.mark.parametrize("raw", _pax_record_cases())
+def test_pax_records_are_read_as_tarfile_reads_them(
+    tmp_path: Path, raw: bytes, fmt: str
+) -> None:
+    """All platforms and Python versions: pax records are read as tarfile
+    reads them, from the header's data padded to whole blocks (up to the
+    first NUL byte), with each value decoded as UTF-8 and read with int(),
+    which takes any Unicode decimal digit and space. A negative size found
+    so is refused (PX_E_6010) by every entry point, whether this release's
+    tarfile reports the member, skips it or stops there."""
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compress(raw, fmt))
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
+        calls, str(ErrorCode.FILE_BYTES_EXCEEDED)
+    )
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
+def _xz_needing_too_much_memory(raw: bytes) -> bytes:
+    """An xz stream of ``raw`` that declares the largest dictionary the
+    format can, which the decoder limit refuses."""
+    import struct
+    import zlib
+
+    stream = bytearray(lzma.compress(raw, filters=[{"id": lzma.FILTER_LZMA2, "preset": 0}]))
+    header = stream[12 : 12 + (stream[12] + 1) * 4]
+    assert header[2:4] == b"\x21\x01"  # one LZMA2 filter, one property byte
+    header[4] = 40
+    header[-4:] = struct.pack("<I", zlib.crc32(bytes(header[:-4])))
+    stream[12 : 12 + len(header)] = header
+    return bytes(stream)
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        _raw_header(b"././@PaxHeader", -512, b"x"),
+        _raw_header(b"././@LongLink", -512, b"L"),
+        _pax({"size": "-1"}) + _raw_header(b"b.md", 1),
+    ],
+    ids=["pax-header", "long-name", "pax-record"],
+)
+def test_a_negative_size_before_a_failing_read_after_the_last_member_is_refused(
+    tmp_path: Path, tail: bytes
+) -> None:
+    """All platforms and Python versions: when reading the bytes after the
+    last member fails (here, the next xz stream needs more decoder memory
+    than the limit), a negative size in the header blocks read there is
+    still refused (PX_E_6010) by every entry point, whether this release's
+    tarfile reported a member there or stopped."""
+    archive = tmp_path / "a.tar.xz"
+    archive.write_bytes(
+        lzma.compress(_file(b"a.md", b"a" * 10) + tail)
+        + _xz_needing_too_much_memory(b"b" + bytes(511) + END)
+    )
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
+        calls, str(ErrorCode.FILE_BYTES_EXCEEDED)
+    )
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
 @pytest.mark.parametrize(
     "max_path_length, path",
     [(4000, "a" * 3500), (1000, "\U0001d11e" * 1000)],
@@ -1301,28 +1399,95 @@ def test_a_pass_keeps_no_member_it_has_moved_past(tmp_path: Path) -> None:
 
 
 def _damaged(fmt: str, how: str) -> bytes:
+    if how == "checksum":
+        # A small archive, read to its end, with a bit of the stream's own
+        # checksum flipped (gzip: its CRC-32; bzip2: the stream CRC).
+        data = bytearray(_compressed(_file(b"a.md", b"a") + END, fmt))
+        data[-8 if fmt == "gz" else -2] ^= 1
+        return bytes(data)
     raw = _tar_bytes([("a.md", random.Random(9).randbytes(20_000)), ("b.md", b"b")])
     data = bytearray(_compressed(raw, fmt))
     if how == "cut":
         return bytes(data[: len(data) // 2])
+    if how == "block":
+        data[10] |= 0x06  # the first deflate block is of the reserved type
+        return bytes(data)
     data[len(data) // 2] ^= 0x55
     return bytes(data)
 
 
 @pytest.mark.parametrize(
     "fmt, how",
-    [("gz", "cut"), ("xz", "flip"), ("xz", "cut"), ("bz2", "cut"), ("zst", "cut")],
+    [
+        ("gz", "cut"), ("gz", "block"), ("gz", "checksum"), ("xz", "flip"), ("xz", "cut"),
+        ("bz2", "cut"), ("bz2", "checksum"), ("zst", "cut"),
+    ],
 )
 def test_damaged_compressed_archive_is_a_read_error(tmp_path: Path, fmt: str, how: str) -> None:
     """All platforms: whatever the decompressor raises for a compressed
-    archive that is damaged or cut short (EOFError, LZMAError, OSError,
-    ZstdError) every entry point reports as tarfile.ReadError."""
+    archive that is damaged or cut short (EOFError, gzip's BadGzipFile,
+    zlib.error, LZMAError, bz2's OSError without an errno, ZstdError) every
+    entry point reports as tarfile.ReadError."""
     archive = tmp_path / f"a.tar.{fmt}"
     archive.write_bytes(_damaged(fmt, how))
     calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
     assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
         calls, "ReadError"
     )
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
+class _FailingFile:
+    """An archive file whose reads fail with EIO once ``at`` bytes of it
+    have been read (``at`` 0: from the first read after the one that tells
+    the compression). Each read hands out at most 4,096 bytes."""
+
+    def __init__(self, path: Path, at: int) -> None:
+        self._file = open(path, "rb")
+        self._at = at
+        self._reads = 0
+
+    def read(self, size: int | None = -1) -> bytes:
+        self._reads += 1
+        if self._reads > 1 and self._file.tell() >= self._at:
+            raise OSError(errno.EIO, "Input/output error")
+        return self._file.read(4096 if size is None or size < 0 else min(size, 4096))
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._file, name)
+
+    def __enter__(self) -> _FailingFile:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._file.close()
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("where", ["first-read", "half-way"])
+def test_an_error_reading_the_archive_file_is_raised_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fmt: str, where: str
+) -> None:
+    """All platforms and Python versions: an operating-system error reading
+    the archive file (here EIO, on the first read of its data or half-way
+    through it) reaches the caller of every entry point unchanged, whatever
+    the compression; it is not reported as a damaged archive."""
+    import aphelion.unpacker as unpacker
+
+    raw = _file(b"a.md", random.Random(5).randbytes(40_000)) + END
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compressed(raw, fmt))
+    at = 0 if where == "first-read" else archive.stat().st_size // 2
+
+    def failing_open(path: Path, mode: str = "r") -> object:
+        assert mode == "rb"
+        return _FailingFile(path, at)
+
+    monkeypatch.setattr(unpacker, "open", failing_open, raising=False)
+    for entry, call in _entries(archive, tmp_path / "dest", ExtractPolicy.default()).items():
+        with pytest.raises(OSError) as exc:
+            call()
+        assert exc.value.errno == errno.EIO, entry
     assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
 
 

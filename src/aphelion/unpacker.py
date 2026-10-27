@@ -21,6 +21,7 @@ import re
 import secrets
 import shutil
 import stat
+import struct
 import sys
 import tarfile
 import unicodedata
@@ -213,8 +214,9 @@ class MemberNames:
 _HEADER_BYTES = 4096
 # ... and the first one this many more, for a global pax header before it.
 _GLOBAL_HEADER_BYTES = 1024
-# Header types tarfile reads as extensions of the member header after them.
-_EXTENSION_TYPES = (b"x", b"g", b"X", b"L", b"K")
+# Header types (typeflag bytes) tarfile reads as extensions of the member
+# header after them.
+_EXTENSION_TYPES = b"xgXLK"
 # A pax record's length prefix, and the keys tarfile takes as a member's size.
 _PAX_LENGTH = re.compile(rb"([0-9]{1,20}) ")
 _PAX_SIZE_KEYS = (b"size", b"GNU.sparse.size", b"GNU.sparse.realsize")
@@ -251,8 +253,9 @@ class _ForwardReader:
     of the archive. ``handed`` counts the bytes handed out. ``kept`` holds
     those from ``mark`` on, at most ``window`` of them: the header blocks
     after the member before, which the checks read again themselves. An
-    error of the decompressor (one of ``errors``) fails with
-    ``tarfile.ReadError``.
+    error of the decompressor for damaged or cut-short data (one of
+    ``errors``, other than an operating-system error with an errno) fails
+    with ``tarfile.ReadError``.
     """
 
     def __init__(
@@ -296,6 +299,8 @@ class _ForwardReader:
         try:
             data = self._source.read(min(want, _READ_CHUNK))
         except self._errors as exc:
+            if isinstance(exc, OSError) and exc.errno is not None:
+                raise  # reading the file failed, not the data
             if not self.handed:
                 raise tarfile.ReadError(f"not a {self._kind} file") from exc
             raise tarfile.ReadError(
@@ -400,11 +405,13 @@ def _compression(
             return (
                 "gzip",
                 lambda raw: gzip.GzipFile(fileobj=raw, mode="rb"),
-                (OSError, EOFError, zlib.error),
+                (gzip.BadGzipFile, EOFError, zlib.error),
             )
         if head[:3] == b"BZh" and head[4:10] == b"1AY&SY":
             import bz2
 
+            # The bz2 module reports damaged data as an OSError without an
+            # errno; one with an errno comes from reading the file.
             return "bzip2", bz2.BZ2File, (OSError, EOFError)
         if head.startswith((b"\x5d\x00\x00\x80", b"\xfd7zXZ")):
             import lzma
@@ -471,8 +478,10 @@ def _members(
     last member (or from the start, if there is none), the ``H`` bytes
     past its end must be zeros, else ``tarfile.ReadError`` is raised;
     nothing further on is looked at. Anything else tarfile raises while it
-    parses a header (other than an operating-system error), and any error
-    of the decompressor, is ``tarfile.ReadError`` too; a refusal of these
+    parses a header (other than an operating-system or out-of-memory
+    error), and the decompressor's errors for data that is damaged or cut
+    short, are ``tarfile.ReadError`` too; an operating-system error reading
+    the archive file passes through unchanged, and a refusal of these
     checks raised while tarfile reads keeps its code.
 
     The archive must be a seekable file: its first bytes are read to tell
@@ -509,20 +518,25 @@ def _members(
                         raise
                     end = 0
             stop = end + header_bytes
-            while reader.handed < stop and reader.read(stop - reader.handed):
-                pass
+
+            def drain() -> None:
+                while reader.handed < stop and reader.read(stop - reader.handed):
+                    pass
+
+            _parsing(reader, drain)
             if reader.kept[:header_bytes].rstrip(b"\0"):
                 _refuse_negative_size(reader)
                 raise tarfile.ReadError("data after the end of the archive")
 
 
 def _parsing(reader: _ForwardReader, call: Callable[[], Any]) -> Any:
-    """Run a tarfile call that reads member headers. A refusal of ours
-    passes through, and anything else tarfile raises while it parses a
-    header (other than an operating-system error) is ``tarfile.ReadError``.
-    If the header blocks after the last member declare a negative size,
-    which tarfile, depending on the release, stops at, reads wrongly or
-    reports, the refusal is FILE_BYTES_EXCEEDED on every release."""
+    """Run a call that reads member headers (a tarfile call, or the read of
+    the bytes after the last member). A refusal of ours passes through, and
+    anything else tarfile raises while it parses a header (other than an
+    operating-system or out-of-memory error) is ``tarfile.ReadError``. If
+    the header blocks after the last member declare a negative size, which
+    tarfile, depending on the release, stops at, reads wrongly or reports,
+    the refusal is FILE_BYTES_EXCEEDED on every release."""
     try:
         return call()
     except SecurityError as exc:
@@ -554,10 +568,12 @@ def _number(field: bytes) -> int | None:
 
 
 def _size_field(block: bytes) -> int | None:
-    """A header block's size, if its checksum is right, as tarfile reads them."""
+    """A header block's size, if its checksum is right, as tarfile reads them
+    (the sum of the block's bytes with the checksum field as spaces, taken
+    as unsigned or, failing that, signed bytes)."""
     stored = _number(block[148:156])
-    rest = block[:148] + b" " * 8 + block[156:512]
-    if stored not in (sum(rest), sum(b - 256 if b > 127 else b for b in rest)):
+    unsigned = 256 + sum(block) - sum(block[148:156])
+    if stored != unsigned and stored != 256 + sum(struct.unpack_from("148b8x356b", block)):
         return None
     return _number(block[124:136])
 
@@ -565,7 +581,10 @@ def _size_field(block: bytes) -> int | None:
 def _pax_sizes(data: bytes) -> Iterator[int]:
     """The sizes a pax header's records give (``size``, ``GNU.sparse.size``
     and ``GNU.sparse.realsize``, which tarfile takes as the member's size),
-    read as tarfile reads its records; up to the first it cannot read."""
+    read as tarfile reads its records: ``data`` is the header's data padded
+    to whole blocks, read up to the first NUL byte, and each value is
+    decoded as UTF-8 and read with ``int``; up to the first record tarfile
+    cannot read."""
     if b"size=" not in data:
         return
     pos = 0
@@ -574,47 +593,65 @@ def _pax_sizes(data: bytes) -> Iterator[int]:
         if match is None:
             return
         length = int(match.group(1))
-        record = data[pos : pos + length]
-        if length < len(match.group(0)) or len(record) < length or record[-1:] != b"\n":
+        last = pos + length - 1
+        if length < 5 or last >= len(data) or data[last] != 0x0A:
             return
-        key, _, value = record[len(match.group(0)) : -1].partition(b"=")
+        key, equals, value = data[match.end(1) + 1 : last].partition(b"=")
+        if not key or not equals:
+            return
         if key in _PAX_SIZE_KEYS:
             try:
-                yield int(value)
+                yield int(value.decode("utf-8", "surrogateescape"))
             except ValueError:
                 pass
         pos += length
 
 
-def _header_chain(blocks: bytes, start: int, *, records: bool = False) -> tuple[int, int]:
+def _header_chain(
+    blocks: bytes | bytearray,
+    start: int,
+    *,
+    stop: int | None = None,
+    records: bool = False,
+    first: int | None = None,
+    own: int | None = None,
+) -> tuple[int, int]:
     """Walk the pax and GNU long-name headers at the start of ``blocks``
-    (bytes read from archive offset ``start``), each followed by its data as
-    its size says, up to the first block that is not such a header. Returns
-    where that block starts and how many bytes the global pax headers on the
-    way take. A negative size on the way, in a header (the last block
-    included) or, with ``records``, in a pax record, is refused
-    (FILE_BYTES_EXCEEDED): tarfile, depending on the release, stops at it,
-    skips the member, reads past it wrongly, or reports it. (Where tarfile
-    reports the member after them, a pax record's size is its size.)"""
+    (bytes read from archive offset ``start``; only the first ``stop`` of
+    them, if given), each followed by its data as its size says, up to the
+    first block that is not such a header. Returns where that block starts
+    and how many bytes the global pax headers on the way take. A negative
+    size on the way, in a header (the last block included) or, with
+    ``records``, in a pax record, is refused (FILE_BYTES_EXCEEDED):
+    tarfile, depending on the release, stops at it, skips the member, reads
+    past it wrongly, or reports it. (Where tarfile reports the member after
+    them, a pax record's size is its size.) ``first`` is the offset of a
+    block tarfile has read as a header, so its checksum is right and is not
+    summed again; ``own`` that of the member's own header, which tarfile
+    has read with a size that is not negative, so the walk ends there."""
+    end = len(blocks) if stop is None else min(stop, len(blocks))
     pos = 0
     global_bytes = 0
-    while pos + 512 <= len(blocks):
-        block = blocks[pos : pos + 512]
-        size = _size_field(block)
+    while pos + 512 <= end and pos != own:
+        if pos == first:
+            size = _number(blocks[pos + 124 : pos + 136])
+        else:
+            size = _size_field(blocks[pos : pos + 512])
         if size is None:
             break
+        typeflag = blocks[pos + 156]
+        step = 512 + -(-size // 512) * 512
         declared = size
-        if records and size >= 0 and block[156:157] in (b"x", b"X", b"g"):
-            declared = min([size, *_pax_sizes(blocks[pos + 512 : pos + 512 + size])])
+        if records and size >= 0 and typeflag in b"xXg":
+            declared = min([size, *_pax_sizes(blocks[pos + 512 : min(pos + step, end)])])
         if declared < 0:
             raise SecurityError(
                 code=ErrorCode.FILE_BYTES_EXCEEDED,
                 msg=f"a header at byte {start + pos} declares a negative size {declared}",
             )
-        if block[156:157] not in _EXTENSION_TYPES:
+        if typeflag not in _EXTENSION_TYPES:
             break
-        step = 512 + -(-size // 512) * 512
-        if block[156:157] == b"g":
+        if typeflag == ord("g"):
             global_bytes += step
         pos += step
     return pos, global_bytes
@@ -724,15 +761,28 @@ def _check_extent(
             path=member.name,
         )
     headers = member.offset_data - end
-    chain = bytes(kept[: max(headers, 0)])
-    own, global_bytes = _header_chain(chain, end)
+    stop = max(headers, 0)
+    # tarfile read the member's first header at its offset and, unless the
+    # member is sparse, its own header just before its data. If no pax key
+    # gives the member's size, that header's size is member.size, which is
+    # not negative (see above).
+    pax = member.pax_headers
+    own = None
+    if not (
+        member.issparse()
+        or "size" in pax
+        or "GNU.sparse.size" in pax
+        or "GNU.sparse.realsize" in pax
+    ):
+        own = headers - 512
+    found, global_bytes = _header_chain(kept, end, stop=stop, first=member.offset - end, own=own)
     # The header blocks from ``end`` must lead, size by size, to the member's
     # own header, so every release reads them as they are. If they do not,
     # tarfile may have skipped a member whose pax records give it a
     # negative size.
-    leads = member.offset >= end and headers <= len(kept) and own == headers - 512
+    leads = member.offset >= end and headers <= len(kept) and found == headers - 512
     if not leads:
-        _header_chain(chain, end, records=True)
+        _header_chain(kept, end, stop=stop, records=True)
     # Reject disallowed member types BEFORE path checks to catch hardlinks
     # whose link target points outside dest (member.isfile() would NOT catch these).
     if not (member.isreg() or member.isdir()):
