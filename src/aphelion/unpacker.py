@@ -305,7 +305,8 @@ def unpack(
     so a wrong "not found" fails the unpack instead of replacing a file
     nothing backed up.
     Two members that reach one entry already in ``dest_dir`` (by its 8.3
-    short name, say) are refused before anything moves; an alias the merge
+    short name, say) are refused before anything moves; two hard links of
+    one file are two entries, each replaced on its own. An alias the merge
     itself creates (Windows gives a new file or directory a short name
     another member spells) is found during the merge, which is then undone.
     Where the filesystem reports no file identity (inode number 0) that
@@ -797,7 +798,7 @@ def _merge(staging: Path, dest: Path, replacement: _Replacement) -> None:
     """
     entries = _staged(staging, replacement.backup)
     # Check every target first so a conflict cannot leave a half-moved tree.
-    existing: dict[tuple[int, int], Path] = {}
+    existing: dict[tuple[int, int, str | None], Path] = {}
     for rel, is_dir in entries:
         target = dest / rel
         # Staging sits inside dest. Compared by identity, not by name: on
@@ -810,7 +811,8 @@ def _merge(staging: Path, dest: Path, replacement: _Replacement) -> None:
             _check_replaceable(st, target, is_dir=is_dir)
             # Two members distinct in staging can name one entry already in
             # dest (the 8.3 short name of a file or directory there).
-            other = existing.setdefault(_identity(st, target), target)
+            entry = (*_identity(st, target), _entry_name(st, target, is_dir=is_dir))
+            other = existing.setdefault(entry, target)
             if other != target:
                 raise SecurityError(
                     code=ErrorCode.DUPLICATE_MEMBER_PATH,
@@ -882,6 +884,20 @@ def _identity(st: os.stat_result, target: Path) -> tuple[int, int]:
             path=str(target),
         )
     return st.st_dev, st.st_ino
+
+
+def _entry_name(st: os.stat_result, target: Path, *, is_dir: bool) -> str | None:
+    """Which directory entry ``target`` is, where its identity cannot tell.
+
+    None where the entry is the only one (a directory, or a file with one
+    link), so every name that reaches it is an alias. A file with hard links
+    has several entries: the name the filesystem stores (``realpath`` spells
+    an 8.3 short name or a case variant out) tells them apart, so two hard
+    links are two entries, each replaced on its own.
+    """
+    if is_dir or st.st_nlink <= 1:
+        return None
+    return os.path.normcase(os.path.realpath(target, strict=True))
 
 
 def _check_replaceable(st: os.stat_result, target: Path, *, is_dir: bool) -> None:

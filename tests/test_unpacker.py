@@ -1452,6 +1452,57 @@ def test_members_reaching_one_directory_in_dest_are_refused_before_anything_move
     assert _tree(dest) == before
 
 
+def _hard_link(existing: Path, new: Path) -> None:
+    try:
+        os.link(existing, new)
+    except OSError as exc:  # a filesystem without hard links
+        pytest.skip(f"cannot make a hard link here: {exc}")
+
+
+def test_hard_links_in_dest_are_each_replaced(tmp_path: Path) -> None:
+    """All platforms: two names in dest that are hard links of one file are two
+    directory entries, not one entry reached twice: an archive with both
+    names replaces each, as it would two separate files."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "a.md").write_bytes(b"old")
+    _hard_link(dest / "a.md", dest / "b.md")
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("a.md"), b"new a"), (_reg("b.md"), b"new b")])
+
+    assert unpack(archive, dest) == dest
+
+    assert _tree(dest) == {"a.md": b"new a", "b.md": b"new b"}
+
+
+@WINDOWS_83
+def test_short_name_of_a_hard_linked_file_in_dest_is_refused_before_anything_moves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows only (8.3 short names): a file in dest that has a second hard
+    link, reached by two members (its long name and its short name), is one
+    entry reached twice, not two hard links: refused before anything in dest
+    changes."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "longfilename.txt").write_bytes(b"old")
+    _hard_link(dest / "longfilename.txt", dest / "other.txt")
+    short = _short_name(dest / "longfilename.txt")
+    if short is None:
+        pytest.skip("this volume does not generate 8.3 short names")
+    archive = _write_tar(
+        tmp_path / "a.tar", [(_reg(short), b"other"), (_reg("longfilename.txt"), b"new")]
+    )
+    before = _tree(dest)
+
+    steps, exc, _ = _run_steps(monkeypatch, functools.partial(unpack, archive, dest), {})
+
+    assert isinstance(exc, SecurityError)
+    assert exc.code == ErrorCode.DUPLICATE_MEMBER_PATH
+    assert "filesystem alias" in str(exc)
+    assert [s for s in steps if ".unpacking-" not in s] == []  # nothing outside staging
+    assert _tree(dest) == before
+
+
 def test_existing_entries_are_refused_where_the_filesystem_reports_no_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
