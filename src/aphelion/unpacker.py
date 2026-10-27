@@ -26,7 +26,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import BinaryIO, Callable, Mapping
 
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SecurityError
@@ -337,9 +337,10 @@ def unpack(
     if st is not None and not stat.S_ISDIR(st.st_mode):
         raise FileExistsError(f"unpack destination is not a directory: {dest}")
     dest_resolved = dest.resolve()
-    made = _make_parents(dest_resolved.parent)
+    made: list[Path] = []  # parents this call created, each on record before its mkdir
     staging = backup = None
     try:
+        _make_parents(dest_resolved.parent, made)
         staging = _make_staging_dir(dest_resolved)
         if staging.parent == dest_resolved:
             backup = _make_unique_dir(staging, ".backup-")
@@ -372,32 +373,28 @@ def _same_entry(a: Path, b: Path) -> bool:
         return False
 
 
-def _make_parents(path: Path) -> list[Path]:
-    """Create ``path`` and its missing parents; return the ones this call made.
+def _make_parents(path: Path, made: list[Path]) -> None:
+    """Create ``path`` and its missing parents, adding each to ``made``.
 
-    Each level is created on its own, so a directory another process creates
-    meanwhile is not counted as ours and is never removed on failure.
+    Each level is created on its own and put on record before its mkdir, so
+    an interrupt right after the mkdir returns still finds it. A directory
+    another process creates meanwhile is taken off the record again, so it
+    is never removed on failure.
     """
     missing = []
     for candidate in (path, *path.parents):
         if _lstat(candidate) is not None:
             break
         missing.append(candidate)
-    made: list[Path] = []
-    try:
-        for directory in reversed(missing):
-            try:
-                directory.mkdir()
-            except FileExistsError:
-                st = _lstat(directory, follow_symlinks=True)
-                if st is None or not stat.S_ISDIR(st.st_mode):
-                    raise
-                continue
-            made.append(directory)
-    except BaseException:
-        _remove_made(made)
-        raise
-    return made
+    for directory in reversed(missing):
+        made.append(directory)
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            made.pop()
+            st = _lstat(directory, follow_symlinks=True)
+            if st is None or not stat.S_ISDIR(st.st_mode):
+                raise
 
 
 def _remove_made(made: list[Path]) -> None:
@@ -906,12 +903,13 @@ def _extract(
             chunk_size = 64 * 1024
             # Authoritative budget enforcement happens inside the read loop.
             # A failure here discards the whole staging tree (see unpack).
+            out = None
             try:
-                try:
-                    out = open(target, "xb")  # exclusive, as above
-                except FileExistsError:
-                    raise _aliased(normalized, normalized) from None
-                with out:
+                # Created by the with statement itself, so no interrupt can
+                # land between the two and leave the file open (Windows could
+                # not delete it); closed again below for one landing just as
+                # the with statement exits.
+                with _create_exclusive(target, normalized) as out:
                     while True:
                         chunk = src.read(chunk_size)
                         if not chunk:
@@ -938,6 +936,8 @@ def _extract(
                         out.write(chunk)
             finally:
                 src.close()
+                if out is not None:
+                    out.close()
             total_bytes += written
             # compression-ratio enforcement (uncompressed total / archive size)
             if (
@@ -952,6 +952,15 @@ def _extract(
                         f"{policy.max_compression_ratio}"
                     ),
                 )
+
+
+def _create_exclusive(target: Path, member: str) -> BinaryIO:
+    # Exclusive, as staging starts empty: a file already there was made by an
+    # earlier member under another name.
+    try:
+        return open(target, "xb")
+    except FileExistsError:
+        raise _aliased(member, member) from None
 
 
 def _aliased(member: str, rel: str) -> SecurityError:

@@ -2009,3 +2009,79 @@ def test_failed_staging_dir_removes_the_parents_this_call_made(
 
     assert exc.value.errno == errno.ENOSPC
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar"]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        pytest.param(KeyboardInterrupt, id="interrupt-after-step"),
+        pytest.param(OSError, id="oserror-after-step"),
+    ],
+)
+def test_parent_made_right_before_a_failure_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: type[BaseException]
+) -> None:
+    """All platforms: a parent of dest is on record before it is made, so a
+    failure or interrupt right after its creation returns still removes it
+    (and the ones made before it)."""
+    work = tmp_path / "clean"
+    archive = _write_tar(work / "a.tar", [(_reg("a.md"), b"a")])
+    call = functools.partial(unpack, archive, work / "p1" / "p2" / "dest")
+    steps, exc, _ = _run_steps(monkeypatch, call, {})
+    assert exc is None
+    parents = [
+        n
+        for n, line in enumerate(steps, 1)
+        if line.startswith("mkdir ") and Path(line[len("mkdir ") :]).name in ("p1", "p2")
+    ]
+    assert len(parents) == 2
+
+    for n in parents:
+        work = tmp_path / str(n)
+        archive = _write_tar(work / "a.tar", [(_reg("a.md"), b"a")])
+        error = _error(kind)
+        call = functools.partial(unpack, archive, work / "p1" / "p2" / "dest")
+        _, exc, _ = _run_steps(monkeypatch, call, {n: (error, True)})
+        assert exc is error, steps[n - 1]
+        assert sorted(os.listdir(work)) == ["a.tar"], steps[n - 1]
+
+
+def test_interrupt_at_any_line_of_the_extraction_leaves_nothing_behind(tmp_path: Path) -> None:
+    """All platforms (guards Windows, where a file left open cannot be
+    deleted): an interrupt at any line of the extraction into staging
+    leaves neither staging nor the parents made for dest behind. A file was
+    once opened on one line and taken into its with statement on the next,
+    and an interrupt between the two left it open and staging undeletable."""
+    import aphelion.unpacker as unpacker
+
+    def run(work: Path, stop_at: int | None) -> int:
+        archive = _write_tar(work / "a.tar", [(_reg("a.md"), b"a"), (_reg("sub/b.md"), b"b")])
+        lines = 0
+
+        def local(frame: object, event: str, arg: object) -> object:
+            nonlocal lines
+            if event == "line":
+                lines += 1
+                if lines == stop_at:
+                    raise KeyboardInterrupt
+            return local
+
+        def calls(frame: object, event: str, arg: object) -> object:
+            return local if frame.f_code is unpacker._extract.__code__ else None  # type: ignore[attr-defined]
+
+        previous = sys.gettrace()
+        sys.settrace(calls)
+        try:
+            unpack(archive, work / "p1" / "dest")
+        except KeyboardInterrupt:
+            assert stop_at is not None and lines >= stop_at
+        finally:
+            sys.settrace(previous)
+        return lines
+
+    total = run(tmp_path / "clean", None)
+    assert total > 20
+    for n in range(1, total + 1):
+        work = tmp_path / str(n)
+        run(work, n)
+        assert sorted(os.listdir(work)) == ["a.tar"], n
