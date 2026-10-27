@@ -43,6 +43,8 @@ import pytest
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SecurityError
 from aphelion.unpacker import ExtractPolicy, unpack
+from aphelion.unpacker import _GLOBAL_HEADER_BYTES as GLOBAL_HEADER_BYTES
+from aphelion.unpacker import _HEADER_BYTES as HEADER_BYTES
 
 
 def _write_tar(
@@ -417,19 +419,22 @@ def test_member_over_a_budget_is_refused_before_its_data_is_decompressed(
 # ---------- what is read stays bounded, whatever the headers say ----------
 
 
-def _raw_header(name: bytes, size: int) -> bytes:
-    """A ustar header for a regular file; a negative size goes in base-256."""
+def _raw_header(name: bytes, size: int, typeflag: bytes = b"0") -> bytes:
+    """A ustar header (a regular file by default); a negative size, or one
+    too large for 11 octal digits, goes in base-256."""
     block = bytearray(512)
     block[0 : len(name)] = name
     block[100:108] = b"0000644\0"
     block[108:116] = b"0000000\0"
     block[116:124] = b"0000000\0"
-    if size >= 0:
+    if 0 <= size < 8**11:
         block[124:136] = b"%011o\0" % size
+    elif size > 0:
+        block[124:136] = b"\x80" + size.to_bytes(11, "big")
     else:
         block[124:136] = b"\xff" + ((1 << 88) + size).to_bytes(11, "big")
     block[136:148] = b"00000000000\0"
-    block[156:157] = b"0"
+    block[156:157] = typeflag
     block[257:263] = b"ustar\0"
     block[263:265] = b"00"
     block[148:156] = b" " * 8
@@ -513,195 +518,6 @@ def test_sparse_member_is_refused_before_its_data_is_decompressed(
     assert "sparse" in str(exc.value)
     assert decompressed < 1024 * 1024, decompressed
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar.gz"]
-
-
-@pytest.mark.parametrize("via", ["unpack", "check_member_names"])
-def test_negative_member_size_is_refused_before_tarfile_moves_back(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, via: str
-) -> None:
-    """All platforms: a negative size makes a tarfile without its own check
-    for it move backwards, and in a compressed archive every move back
-    decompresses it again from the start. Where tarfile reports such a
-    member it is refused (PX_E_6010) before tarfile moves; where tarfile
-    stops at its header, the archive ends there. Either way what is
-    decompressed stays under 1 MiB for a 0.3 MB archive."""
-    from aphelion.unpacker import check_member_names
-
-    archive = tmp_path / "a.tar.gz"
-    archive.write_bytes(gzip.compress(_negative_size_chain(50, 256 * 1024), mtime=0))
-    count = _count_decompressed(monkeypatch)
-
-    refused = None
-    try:
-        if via == "unpack":
-            unpack(archive, tmp_path / "dest")
-        else:
-            check_member_names(archive)
-    except SecurityError as exc:
-        refused = exc.code
-    decompressed = count[0]
-    monkeypatch.undo()
-
-    assert decompressed < 1024 * 1024, decompressed
-    if _tarfile_reports_negative_sizes():
-        assert refused == ErrorCode.FILE_BYTES_EXCEEDED
-
-
-@pytest.mark.parametrize("via", ["unpack", "check_member_names"])
-@pytest.mark.parametrize("header", ["pax-record", "long-name"])
-def test_reading_an_archive_stays_within_its_read_limit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, header: str, via: str
-) -> None:
-    """All platforms: tarfile reads a pax record or a GNU long name in full
-    before any check sees the member. With a 64 KiB budget for 16 members a
-    16 MiB one is refused (PX_E_6013) once the bytes read pass the limit
-    the policy gives one pass, or two for unpack, which reads the members
-    again after the header checks."""
-    from aphelion.unpacker import _READ_CHUNK, _read_limit, check_member_names
-
-    big = 16 * 1024 * 1024
-    raw = io.BytesIO()
-    if header == "pax-record":
-        with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
-            info = tarfile.TarInfo("a.md")
-            info.size = 1
-            info.pax_headers = {"comment": "x" * big}
-            tar.addfile(info, io.BytesIO(b"a"))
-    else:
-        with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as tar:
-            info = tarfile.TarInfo("d/" + "n" * big)
-            info.size = 1
-            tar.addfile(info, io.BytesIO(b"a"))
-    archive = tmp_path / "a.tar.gz"
-    archive.write_bytes(gzip.compress(raw.getvalue(), compresslevel=1, mtime=0))
-    policy = ExtractPolicy(max_files=16, max_total_bytes=64 * 1024, max_file_bytes=64 * 1024)
-    count = _count_decompressed(monkeypatch)
-
-    with pytest.raises(SecurityError) as exc:
-        if via == "unpack":
-            unpack(archive, tmp_path / "dest", policy=policy)
-        else:
-            check_member_names(archive, policy)
-    decompressed = count[0]
-    monkeypatch.undo()
-
-    assert exc.value.code == ErrorCode.ARCHIVE_BOMB
-    passes = 2 if via == "unpack" else 1
-    assert decompressed <= passes * _read_limit(policy) + _READ_CHUNK, decompressed
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar.gz"]
-
-
-def test_seeking_back_in_a_compressed_archive_counts_what_is_decompressed_again(
-    tmp_path: Path,
-) -> None:
-    """All platforms: a seek back past the bytes just read reopens a
-    compressed archive and decompresses it again from the start, reading the
-    right bytes; those bytes count, so going back and forth fails
-    (PX_E_6013) once the total passes the limit."""
-    from aphelion.unpacker import _BoundedArchive
-
-    data = random.Random(2).randbytes(512 * 1024)
-    path = tmp_path / "a.gz"
-    path.write_bytes(gzip.compress(data, mtime=0))
-    stream = _BoundedArchive(path, gzip.GzipFile, compressed=True, limit=4 * 1024 * 1024)
-    try:
-        assert stream.seek(400 * 1024) == 400 * 1024
-        assert stream.read(10) == data[400 * 1024 : 400 * 1024 + 10]
-        assert stream.seek(5) == 5
-        assert stream.read(10) == data[5:15]
-        assert stream.tell() == 15
-        with pytest.raises(SecurityError) as exc:
-            for _ in range(100):
-                stream.seek(len(data) - 1)
-                stream.seek(0)
-        assert exc.value.code == ErrorCode.ARCHIVE_BOMB
-    finally:
-        stream.close()
-
-
-def test_seeking_back_within_the_bytes_just_read_does_not_decompress_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """All platforms: a seek back that lands within the last
-    max(64 KiB, io.DEFAULT_BUFFER_SIZE) bytes read is served from them: the
-    right bytes, the file not opened again, nothing decompressed twice, and
-    the count still exactly what was decompressed."""
-    from aphelion.unpacker import _READ_CHUNK, _BoundedArchive
-
-    held = max(_READ_CHUNK, io.DEFAULT_BUFFER_SIZE)
-    data = random.Random(4).randbytes(4 * held)
-    path = tmp_path / "a.gz"
-    path.write_bytes(gzip.compress(data, mtime=0))
-    opened: list[Path] = []
-
-    def open_file(p: Path) -> gzip.GzipFile:
-        opened.append(p)
-        return gzip.GzipFile(p)
-
-    count = _count_decompressed(monkeypatch)
-    stream = _BoundedArchive(path, open_file, compressed=True, limit=len(data) * 16)
-    try:
-        end = 2 * held + 1000
-        assert stream.seek(end - 1000) == end - 1000
-        assert stream.read(1000) == data[end - 1000 : end]
-        for back in (1, 512, held // 2, held):
-            assert stream.seek(end - back) == end - back
-            assert stream.read(back) == data[end - back : end]
-        assert stream.seek(-held, io.SEEK_CUR) == end - held
-        assert stream.read(held + 10) == data[end - held : end + 10]
-        end += 10
-        assert stream.tell() == end
-        assert stream._produced == io.DEFAULT_BUFFER_SIZE + end
-    finally:
-        stream.close()
-    monkeypatch.undo()
-
-    assert opened == [path]
-    assert count[0] <= end + io.DEFAULT_BUFFER_SIZE, count[0]
-
-
-def test_accessors_read_a_compressed_archive_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """All platforms: signatures.jsonl and the signer manifests at the end
-    of a compressed archive, after 1 MiB of other member data, are read
-    back from the bytes just read: each accessor opens the archive once and
-    decompresses it once."""
-    from aphelion.unpacker import (
-        _BoundedArchive,
-        extract_signatures_jsonl,
-        extract_signer_manifests,
-    )
-
-    raw = _tar_bytes(
-        [
-            ("data/big.bin", random.Random(5).randbytes(1024 * 1024)),
-            ("signatures.jsonl", b"{}\n"),
-            ("signers/s.json", b"{}"),
-        ]
-    )
-    archive = tmp_path / "a.tar.gz"
-    archive.write_bytes(gzip.compress(raw, compresslevel=1, mtime=0))
-    opens = [0]
-    real_open = _BoundedArchive._open
-
-    def counting_open(self: _BoundedArchive) -> object:
-        opens[0] += 1
-        return real_open(self)
-
-    monkeypatch.setattr(_BoundedArchive, "_open", counting_open)
-    count = _count_decompressed(monkeypatch)
-
-    results = []
-    for accessor in (extract_signatures_jsonl, extract_signer_manifests):
-        opens[0] = count[0] = 0
-        results.append(accessor(archive))
-        assert opens[0] == 1, accessor.__name__
-        assert count[0] <= len(raw) + io.DEFAULT_BUFFER_SIZE, (accessor.__name__, count[0])
-    monkeypatch.undo()
-
-    assert results[0] == b"{}\n"
-    assert dict(results[1]) == {"s": b"{}"}
 
 
 _FORMATS = ["tar", "gz", "bz2", "xz", "zst"]
@@ -797,6 +613,770 @@ def test_a_file_that_only_starts_like_a_compressed_archive_is_not_a_tar_archive(
     with pytest.raises(tarfile.ReadError):
         unpack(path, tmp_path / "dest")
     assert not (tmp_path / "dest").exists()
+
+
+# ---------- one pass over an archive hands tarfile a bounded number of bytes ----------
+
+
+@pytest.fixture
+def passes(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Every reader tarfile reads an archive through from now on: one per
+    pass over the archive, each counting the bytes it handed tarfile."""
+    import aphelion.unpacker as unpacker
+
+    made: list = []
+    real_init = unpacker._ForwardReader.__init__
+
+    def init(self: object, *args: object, **kwargs: object) -> None:
+        real_init(self, *args, **kwargs)
+        made.append(self)
+
+    monkeypatch.setattr(unpacker._ForwardReader, "__init__", init)
+    return made
+
+
+def _pass_limit(policy: ExtractPolicy) -> int:
+    """The most one pass may hand tarfile under ``policy``."""
+    return (
+        policy.max_total_bytes
+        + policy.max_files * (HEADER_BYTES + 511)
+        + HEADER_BYTES
+        + GLOBAL_HEADER_BYTES
+    )
+
+
+FIRST_LIMIT = HEADER_BYTES + GLOBAL_HEADER_BYTES  # what tarfile may read before the first member
+END = bytes(1024)
+
+
+def _padded(data: bytes) -> bytes:
+    return data + bytes(-len(data) % 512)
+
+
+def _file(name: bytes, data: bytes) -> bytes:
+    return _raw_header(name, len(data)) + _padded(data)
+
+
+def _pax_record(key: str, value: str) -> bytes:
+    body = f" {key}={value}\n".encode()
+    length = len(body)
+    while length != len(body) + len(str(length)):
+        length = len(body) + len(str(length))
+    return str(length).encode() + body
+
+
+def _pax(records: dict[str, str], typeflag: bytes = b"x") -> bytes:
+    """A pax header (``g``: a global one) holding ``records``."""
+    body = b"".join(_pax_record(k, v) for k, v in records.items())
+    return _raw_header(b"././@PaxHeader", len(body), typeflag) + _padded(body)
+
+
+def _pax_blocks(blocks: int, typeflag: bytes = b"x") -> bytes:
+    """A pax header whose records fill exactly ``blocks`` blocks."""
+    size = 512 * blocks
+    body = _pax_record("comment", "x" * (size - len(str(size)) - len(" comment=\n")))
+    assert len(body) == size
+    return _raw_header(b"././@PaxHeader", size, typeflag) + body
+
+
+def _zero_member(name: bytes, size: int, before: bytes = b"") -> bytes:
+    return before + _raw_header(name, size) + bytes(size + (-size % 512)) + END
+
+
+def _compress(raw: bytes, fmt: str) -> bytes:
+    if fmt == "gz":
+        return gzip.compress(raw, compresslevel=1, mtime=0)
+    return _compressed(raw, fmt)
+
+
+def _outcome(call: Callable[[], object]) -> str:
+    try:
+        call()
+    except SecurityError as exc:
+        return str(exc.code)
+    except tarfile.ReadError:
+        return "ReadError"
+    return "ok"
+
+
+def _entries(archive: Path, dest: Path, policy: ExtractPolicy) -> dict[str, Callable[[], object]]:
+    from aphelion.unpacker import (
+        check_member_names,
+        extract_signatures_jsonl,
+        extract_signer_manifests,
+    )
+
+    return {
+        "unpack": lambda: unpack(archive, dest, policy=policy),
+        "check_member_names": lambda: check_member_names(archive, policy),
+        "extract_signatures_jsonl": lambda: extract_signatures_jsonl(archive),
+        "extract_signer_manifests": lambda: extract_signer_manifests(archive),
+    }
+
+
+MIB = 1024 * 1024
+NEGATIVE = "negative"  # PX_E_6010 where tarfile reports the size, else ReadError
+
+
+def _bounded_cases() -> list:
+    """(build, format, policy, outcome, per-pass limit, entries) per case."""
+    small = ExtractPolicy(max_file_bytes=1024)
+    lax = ExtractPolicy(max_compression_ratio=10_000)
+    every = ("unpack", "check_member_names", "extract_signatures_jsonl", "extract_signer_manifests")
+    policy_bound = ("unpack", "check_member_names")
+    return [
+        pytest.param(
+            lambda: _zero_member(b"zero.bin", 64 * MIB), "gz", small,
+            ErrorCode.FILE_BYTES_EXCEEDED, FIRST_LIMIT, every, id="T1-honest-64MiB-member",
+        ),
+        pytest.param(
+            lambda: _zero_member(b"big.bin", 16 * MIB, _pax({"GNU.sparse.size": "16"})),
+            "gz", None, ErrorCode.DISALLOWED_MEMBER_TYPE, FIRST_LIMIT, every,
+            id="T2-sparse-size-below-the-data",
+        ),
+        pytest.param(
+            lambda: _zero_member(b"big.bin", 16 * MIB, _pax({"GNU.sparse.realsize": "16"})),
+            "gz", None, ErrorCode.DISALLOWED_MEMBER_TYPE, FIRST_LIMIT, every,
+            id="T3-sparse-realsize-only",
+        ),
+        pytest.param(
+            lambda: _zero_member(b"big.bin", 64 * MIB, _pax({"size": "0"}, b"g")),
+            "gz", None, ErrorCode.FILE_BYTES_EXCEEDED, FIRST_LIMIT, every,
+            id="T4-global-size-over-the-data",
+        ),
+        pytest.param(
+            lambda: _file(b"a.md", b"a" * 5) + _raw_header(b"n.md", -512) + bytes(10240),
+            "gz", None, NEGATIVE, 1024 + HEADER_BYTES, every,
+            id="T5-negative-size-back-to-its-own-header",
+        ),
+        pytest.param(
+            lambda: _negative_size_chain(50, 256 * 1024), "gz", None, NEGATIVE,
+            512 * 51 + 256 * 1024 + HEADER_BYTES, every,
+            id="T6-negative-size-hides-members",
+        ),
+        pytest.param(
+            lambda: _raw_header(b"huge.bin", 1 << 64), "tar", None,
+            ErrorCode.FILE_BYTES_EXCEEDED, 512, every, id="T7-size-2-64-and-no-data",
+        ),
+        pytest.param(
+            lambda: _pax({"size": "0"}, b"g") + _raw_header(b"huge.bin", 1 << 64), "tar", None,
+            ErrorCode.FILE_BYTES_EXCEEDED, 1536, every, id="T8-global-size-over-2-64",
+        ),
+        pytest.param(
+            lambda: _pax({"comment": "x" * (16 * MIB)}) + _file(b"a.md", b"a") + END,
+            "gz", ExtractPolicy(max_file_bytes=4096), ErrorCode.ARCHIVE_BOMB, FIRST_LIMIT,
+            every, id="T9-16MiB-pax-record",
+        ),
+        pytest.param(
+            lambda: _raw_header(b"././@LongLink", 16 * MIB, b"L") + _padded(b"n" * (16 * MIB))
+            + _file(b"a.md", b"a") + END,
+            "gz", None, ErrorCode.ARCHIVE_BOMB, FIRST_LIMIT, every, id="T10-16MiB-long-name",
+        ),
+        pytest.param(
+            lambda: _file(b"a.md", b"a") + b"\x01" * 512 + _file(b"b.md", b"b") + END,
+            "tar", None, "ReadError", 1024 + HEADER_BYTES, every,
+            id="T13-damaged-header-between-members",
+        ),
+        pytest.param(
+            lambda: _raw_header(b"d", 1024, b"5") + bytes(1024) + END, "tar", None,
+            ErrorCode.FILE_BYTES_EXCEEDED, 2560, every, id="T14-directory-with-a-size",
+        ),
+        *[
+            pytest.param(
+                lambda flag=flag: _raw_header(b"x", 0, flag) + END, "tar", None,
+                ErrorCode.DISALLOWED_MEMBER_TYPE, 1536, every, id=f"T14-type-{name}",
+            )
+            for flag, name in [
+                (b"1", "hardlink"), (b"2", "symlink"), (b"3", "char"), (b"4", "block"),
+                (b"6", "fifo"), (b"S", "gnu-sparse"),
+            ]
+        ],
+        pytest.param(
+            lambda: _pax({"size": "2048"}) + _file(b"a.md", b"a" * 1024) + bytes(1024) + END,
+            "tar", None, ErrorCode.FILE_BYTES_EXCEEDED, FIRST_LIMIT, every,
+            id="T15-pax-size-over-the-header",
+        ),
+        pytest.param(
+            lambda: _pax({"size": "0"}) + _file(b"a.md", b"a" * 1024) + END,
+            "tar", None, ErrorCode.FILE_BYTES_EXCEEDED, FIRST_LIMIT, every,
+            id="T15-pax-size-under-the-header",
+        ),
+        pytest.param(
+            lambda: _raw_header(b"cut.bin", MIB) + bytes(4096), "tar", lax,
+            ErrorCode.ARCHIVE_BOMB, 512 + 4096, policy_bound, id="T16-cut-short-in-the-data",
+        ),
+        pytest.param(
+            lambda: _raw_header(b"a.bin", 25 * MIB) + bytes(512), "tar", None,
+            ErrorCode.COMPRESSION_RATIO_EXCEEDED, 1024, policy_bound,
+            id="ratio-1KB-archive-declaring-25MiB",
+        ),
+        pytest.param(
+            lambda: _file(b"a.md", b"a") + END + b"\x01" * 512, "tar", None, "ReadError",
+            1024 + HEADER_BYTES, every, id="data-after-the-end",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("build, fmt, policy, expected, limit, entries", _bounded_cases())
+def test_a_pass_over_an_archive_hands_tarfile_a_bounded_number_of_bytes(
+    tmp_path: Path,
+    passes: list,
+    build: Callable[[], bytes],
+    fmt: str,
+    policy: ExtractPolicy | None,
+    expected: str,
+    limit: int,
+    entries: tuple[str, ...],
+) -> None:
+    """All platforms and Python versions: each archive is refused the same
+    way, with tarfile handed at most ``limit`` bytes in every pass, whatever
+    the headers declare. A negative size is refused with PX_E_6010 where
+    tarfile reports it, and where tarfile stops at that header the data
+    after the end of the archive fails with tarfile.ReadError. Nothing is
+    left in the destination."""
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compress(build(), fmt))
+    policy = policy or ExtractPolicy.default()
+    if expected == NEGATIVE:
+        expected = (
+            str(ErrorCode.FILE_BYTES_EXCEEDED)
+            if _tarfile_reports_negative_sizes()
+            else "ReadError"
+        )
+    calls = _entries(archive, tmp_path / "dest", policy)
+    for entry in entries:
+        passes.clear()
+        assert _outcome(calls[entry]) == str(expected), entry
+        assert passes, entry
+        for reader in passes:
+            assert reader.handed <= limit, (entry, reader.handed)
+            assert reader._eof_reads <= 9, (entry, reader._eof_reads)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
+def test_xz_archive_needing_more_decoder_memory_than_the_limit_is_refused(
+    tmp_path: Path,
+) -> None:
+    """All platforms: an xz archive of a few bytes can declare a 4 GiB
+    dictionary, which the decoder would allocate. It is refused (PX_E_6013)
+    while the memory traced stays under the decoder limit; an archive
+    compressed with xz -9e, the largest preset, unpacks."""
+    import struct
+    import tracemalloc
+    import zlib
+
+    from aphelion.unpacker import _XZ_MEMLIMIT, check_member_names
+
+    stream = bytearray(lzma.compress(bytes(1024), filters=[{"id": lzma.FILTER_LZMA2, "preset": 1}]))
+    header = stream[12 : 12 + (stream[12] + 1) * 4]
+    assert header[2:4] == b"\x21\x01"  # one LZMA2 filter, one property byte
+    header[4] = 40  # the largest dictionary the format can declare
+    header[-4:] = struct.pack("<I", zlib.crc32(bytes(header[:-4])))
+    stream[12 : 12 + len(header)] = header
+    archive = tmp_path / "a.tar.xz"
+    archive.write_bytes(bytes(stream))
+    assert len(stream) < 100
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(SecurityError) as exc:
+            check_member_names(archive)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert exc.value.code == ErrorCode.ARCHIVE_BOMB
+    assert peak < _XZ_MEMLIMIT, peak
+
+    members = [("a.md", b"a" * 4096), ("b/c.md", b"c")]
+    archive.write_bytes(lzma.compress(_tar_bytes(members), preset=9 | lzma.PRESET_EXTREME))
+    dest = unpack(archive, tmp_path / "dest")
+    assert (dest / "a.md").read_bytes() == b"a" * 4096
+    assert (dest / "b" / "c.md").read_bytes() == b"c"
+
+
+def test_xz_and_lzma_archives_read_concatenated_streams_and_ignore_what_follows(
+    tmp_path: Path,
+) -> None:
+    """All platforms: as lzma.LZMAFile reads them, an archive split over
+    concatenated xz streams is read in full, and bytes after the last
+    stream that are not a stream are ignored; an LZMA-alone archive is
+    read too."""
+    data = random.Random(6).randbytes(40_000)
+    raw = _file(b"a.md", data) + _file(b"b.md", b"b") + END
+    archive = tmp_path / "a.tar.xz"
+    archive.write_bytes(lzma.compress(raw[:20_000]) + lzma.compress(raw[20_000:]) + b"\x01" * 32)
+    dest = unpack(archive, tmp_path / "dest")
+    assert {p.name: p.read_bytes() for p in dest.iterdir()} == {"a.md": data, "b.md": b"b"}
+    alone = tmp_path / "a.tar.lzma"
+    alone.write_bytes(lzma.compress(raw, format=lzma.FORMAT_ALONE))
+    assert unpack(alone, tmp_path / "dest2").joinpath("b.md").read_bytes() == b"b"
+
+
+def test_zstd_frames_outside_the_supported_form_are_not_tar_archives(tmp_path: Path) -> None:
+    """Python 3.14+: a zstd frame that needs a 2 GiB window is refused by
+    the decoder, and an archive starting with a skippable frame is not read
+    as zstd; both are tarfile.ReadError."""
+    pytest.importorskip("compression.zstd", reason="zstd needs Python 3.14+")
+    from aphelion.unpacker import check_member_names
+
+    raw = _tar_bytes([("a.md", b"a")])
+    # frame header: no single segment, window descriptor 2**31; one raw last block
+    frame = b"\x28\xb5\x2f\xfd\x00\xa8" + ((len(raw) << 3) | 1).to_bytes(3, "little") + raw
+    skippable = b"\x50\x2a\x4d\x18" + (4).to_bytes(4, "little") + b"skip"
+    for body in (frame, skippable + frame):
+        archive = tmp_path / "a.tar.zst"
+        archive.write_bytes(body)
+        with pytest.raises(tarfile.ReadError):
+            check_member_names(archive)
+
+
+@pytest.mark.parametrize("body", [bytes(1024), bytes(10240), bytes(512), b""],
+                         ids=["two-zero-blocks", "zero-record", "one-zero-block", "empty-file"])
+def test_archive_of_zero_blocks_only_is_empty(tmp_path: Path, passes: list, body: bytes) -> None:
+    """All platforms and Python versions: an archive of zero blocks only has
+    no members (Python 3.10's tarfile reads past it by seeking back, which
+    stream mode cannot do); an empty file is not an archive."""
+    from aphelion.unpacker import check_member_names
+
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(body)
+    if not body:
+        with pytest.raises(tarfile.ReadError):
+            check_member_names(archive)
+        return
+    check_member_names(archive)
+    assert list(unpack(archive, tmp_path / "dest").iterdir()) == []
+    assert all(reader.handed <= len(body) for reader in passes)
+
+
+# Header blocks: a pax header of n blocks is 512 * (n + 1) bytes, and a member's
+# own ustar header 512 more.
+@pytest.mark.parametrize(
+    "build, ok",
+    [
+        pytest.param(lambda: _pax_blocks(6) + _file(b"a.md", b"a") + END, True,
+                     id="first-member-4096"),
+        pytest.param(lambda: _pax_blocks(7) + _file(b"a.md", b"a") + END, False,
+                     id="first-member-4608"),
+        pytest.param(lambda: _file(b"a.md", b"a") + _pax_blocks(6) + _file(b"b.md", b"b") + END,
+                     True, id="later-member-4096"),
+        pytest.param(lambda: _file(b"a.md", b"a") + _pax_blocks(7) + _file(b"b.md", b"b") + END,
+                     False, id="later-member-4608"),
+        pytest.param(lambda: _pax_blocks(1, b"g") + _pax_blocks(6) + _file(b"a.md", b"a") + END,
+                     True, id="global-and-first-member-5120"),
+        pytest.param(lambda: _pax_blocks(2, b"g") + _pax_blocks(6) + _file(b"a.md", b"a") + END,
+                     False, id="global-and-first-member-5632"),
+        pytest.param(lambda: _pax_blocks(1, b"g") + _pax_blocks(7) + _file(b"a.md", b"a") + END,
+                     False, id="global-and-first-member-5632-local"),
+        pytest.param(lambda: _pax_blocks(1, b"g") + _pax_blocks(5) + _file(b"a.md", b"a") + END,
+                     True, id="global-and-first-member-4608"),
+        pytest.param(lambda: _file(b"a.md", b"a") + _pax_blocks(1, b"g") + _pax_blocks(5)
+                     + _file(b"b.md", b"b") + END, False, id="global-and-later-member-4608"),
+        pytest.param(lambda: _file(b"a.md", b"a") + _pax_blocks(1, b"g") + _pax_blocks(4)
+                     + _file(b"b.md", b"b") + END, True, id="global-and-later-member-4096"),
+    ],
+)
+def test_header_blocks_of_a_member_stay_within_their_allowance(
+    tmp_path: Path, passes: list, build: Callable[[], bytes], ok: bool
+) -> None:
+    """All platforms and Python versions: a member's header blocks may take
+    4,096 bytes, and the first member's 1,024 more for a global pax header
+    before it; a later global header gets no more. One block over is
+    refused (PX_E_6013), and tarfile is never handed a byte past the
+    allowance: header blocks come in 512 bytes, so the next block is the
+    one that would need the first byte over."""
+    from aphelion.unpacker import check_member_names
+
+    raw = build()
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(gzip.compress(raw, mtime=0))
+    first_end = 1024 if raw.startswith(b"a.md") else 0
+    if ok:
+        check_member_names(archive)
+        assert unpack(archive, tmp_path / "dest").joinpath("a.md").read_bytes() == b"a"
+        return
+    for call in (lambda: check_member_names(archive), lambda: unpack(archive, tmp_path / "dest")):
+        passes.clear()
+        with pytest.raises(SecurityError) as exc:
+            call()
+        assert exc.value.code == ErrorCode.ARCHIVE_BOMB
+        limit = first_end + HEADER_BYTES if first_end else FIRST_LIMIT
+        assert all(reader.handed <= limit for reader in passes), [r.handed for r in passes]
+    assert not (tmp_path / "dest").exists()
+
+
+def test_data_after_the_end_of_the_archive_is_not_ignored(tmp_path: Path) -> None:
+    """All platforms: non-zero bytes within 4,096 bytes after the end of the
+    last member make every reader fail with tarfile.ReadError, none of them
+    returning as if the archive ended there; past that they are not read,
+    as tar reads the first of two archives written one after the other."""
+    from aphelion.unpacker import (
+        check_member_names,
+        extract_signatures_jsonl,
+        extract_signer_manifests,
+    )
+
+    first = _tar_bytes([("signatures.jsonl", b"{}\n"), ("signers/s.json", b"{}")])
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(first[:2048] + bytes(1024) + b"\x01" + bytes(511) + END)
+    for call in (
+        lambda: unpack(archive, tmp_path / "dest"),
+        lambda: check_member_names(archive),
+        lambda: extract_signatures_jsonl(archive),
+        lambda: extract_signer_manifests(archive),
+    ):
+        with pytest.raises(tarfile.ReadError, match="after the end"):
+            call()
+    assert not (tmp_path / "dest").exists()
+
+    archive.write_bytes(first + _tar_bytes([("other.md", b"x")]))
+    assert extract_signatures_jsonl(archive) == b"{}\n"
+    assert sorted(p.name for p in unpack(archive, tmp_path / "dest").iterdir()) == [
+        "signatures.jsonl",
+        "signers",
+    ]
+
+
+@pytest.mark.parametrize("via", ["unpack", "check_member_names"])
+def test_negative_member_size_is_refused_before_tarfile_moves_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, via: str
+) -> None:
+    """All platforms and Python versions: a negative size would make tarfile
+    move backwards, which its stream mode cannot. Where tarfile reports such
+    a member it is refused (PX_E_6010) before tarfile moves; where tarfile
+    stops at its header, the members it would have hidden are data after
+    the end of the archive (tarfile.ReadError). Either way what is
+    decompressed stays under 1 MiB for a 0.3 MB archive."""
+    from aphelion.unpacker import check_member_names
+
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(gzip.compress(_negative_size_chain(50, 256 * 1024), mtime=0))
+    count = _count_decompressed(monkeypatch)
+
+    outcome = _outcome(
+        (lambda: unpack(archive, tmp_path / "dest"))
+        if via == "unpack"
+        else (lambda: check_member_names(archive))
+    )
+    decompressed = count[0]
+    monkeypatch.undo()
+
+    assert decompressed < 1024 * 1024, decompressed
+    if _tarfile_reports_negative_sizes():
+        assert outcome == str(ErrorCode.FILE_BYTES_EXCEEDED)
+    else:
+        assert outcome == "ReadError"
+
+
+@pytest.mark.parametrize("fmt", ["gz", "bz2", "xz"])
+@pytest.mark.parametrize("accessor", ["extract_signatures_jsonl", "extract_signer_manifests"])
+def test_accessors_refuse_a_member_whose_size_leads_back_to_its_own_header(
+    tmp_path: Path, passes: list, fmt: str, accessor: str
+) -> None:
+    """All platforms and Python versions: a member whose negative size would
+    send tarfile back to its own header is refused by the accessors as by
+    unpack, in one pass that reads no more than the archive holds, in
+    little memory."""
+    import tracemalloc
+
+    import aphelion.unpacker as unpacker
+
+    raw = _file(b"a.md", b"x" * 5) + _raw_header(b"n.md", -512) + bytes(10240)
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compressed(raw, fmt))
+    tracemalloc.start()
+    try:
+        outcome = _outcome(lambda: getattr(unpacker, accessor)(archive))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 16 * MIB, peak
+    if _tarfile_reports_negative_sizes():
+        assert outcome == str(ErrorCode.FILE_BYTES_EXCEEDED)
+    else:
+        assert outcome == "ReadError"
+    assert len(passes) == 1
+    assert passes[0].handed <= len(raw)
+
+
+def test_reading_on_stops_at_the_ratio_limit_before_member_data(
+    tmp_path: Path, passes: list
+) -> None:
+    """All platforms: 10,000 members with 3 KiB pax headers of repeated
+    text come to 40 MB that compress to a few kilobytes. Before a member's
+    data is read, the bytes handed to tarfile plus that data may not pass
+    max-compression-ratio times the archive size plus 1 MiB: the archive is
+    refused (PX_E_6012) once they would."""
+    from aphelion.unpacker import check_member_names
+
+    members = b"".join(
+        _pax({"comment": "y" * 2900}) + _file(b"m%05d" % i, b"") for i in range(10_000)
+    )
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(gzip.compress(members + END, mtime=0))
+    size = archive.stat().st_size
+
+    with pytest.raises(SecurityError) as exc:
+        check_member_names(archive)
+
+    assert exc.value.code == ErrorCode.COMPRESSION_RATIO_EXCEEDED
+    assert len(passes) == 1
+    assert passes[0].handed <= 100 * size + MIB + HEADER_BYTES, (passes[0].handed, size)
+
+
+def test_unpack_refuses_an_archive_that_changes_between_its_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: unpack checks every header, then reads the archive
+    again to write the members. If the second pass sees a member the first
+    did not (another name, type, size or place, one more or one less), the
+    unpack is refused (PX_E_6013) before that member is written, and
+    nothing is left in the destination."""
+    import aphelion.unpacker as unpacker
+
+    first = _tar_bytes([("a.md", b"a"), ("b.md", b"b")])
+    archive = tmp_path / "a.tar"
+    real_scan = unpacker._scan
+    for second in (
+        _tar_bytes([("a.md", b"a"), ("b.md", b"bb")]),
+        _tar_bytes([("a.md", b"a"), ("c.md", b"b")]),
+        _tar_bytes([("a.md", b"a"), ("b.md", b"b"), ("c.md", b"c")]),
+        _tar_bytes([("a.md", b"a")]),
+    ):
+        archive.write_bytes(first)
+
+        def scan_then_change(*args: object, second: bytes = second, **kwargs: object) -> object:
+            seen = real_scan(*args, **kwargs)
+            archive.write_bytes(second)
+            return seen
+
+        monkeypatch.setattr(unpacker, "_scan", scan_then_change)
+        with pytest.raises(SecurityError) as exc:
+            unpack(archive, tmp_path / "dest")
+        assert exc.value.code == ErrorCode.ARCHIVE_BOMB
+        assert "changed" in str(exc.value)
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar"]
+
+
+def test_each_entry_point_reads_the_archive_a_fixed_number_of_times(
+    tmp_path: Path, passes: list
+) -> None:
+    """All platforms: check_member_names and each accessor read an archive
+    once, unpack twice, whatever it holds, and no pass hands tarfile more
+    than the archive holds."""
+    from aphelion.unpacker import (
+        check_member_names,
+        extract_signatures_jsonl,
+        extract_signer_manifests,
+    )
+
+    raw = _tar_bytes(
+        [
+            ("data/big.bin", random.Random(5).randbytes(MIB)),
+            ("signatures.jsonl", b"{}\n"),
+            ("signers/s.json", b"{}"),
+        ]
+    )
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(gzip.compress(raw, compresslevel=1, mtime=0))
+    for call, count in (
+        (lambda: check_member_names(archive), 1),
+        (lambda: extract_signatures_jsonl(archive), 1),
+        (lambda: extract_signer_manifests(archive), 1),
+        (lambda: unpack(archive, tmp_path / "dest"), 2),
+    ):
+        passes.clear()
+        call()
+        assert len(passes) == count
+        assert all(reader.handed <= len(raw) for reader in passes)
+
+
+def test_accessors_take_the_last_member_of_a_repeated_name(tmp_path: Path) -> None:
+    """All platforms: when a name repeats, the accessors read the last
+    member of that name, as ``TarFile.getmember`` finds it (a directory
+    last means no signatures), while unpack refuses the archive."""
+    from aphelion.unpacker import extract_signatures_jsonl, extract_signer_manifests
+
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(
+        _file(b"signatures.jsonl", b"first")
+        + _file(b"signers/s.json", b"one")
+        + _file(b"signatures.jsonl", b"last")
+        + _file(b"signers/s.json", b"two")
+        + END
+    )
+    assert extract_signatures_jsonl(archive) == b"last"
+    assert dict(extract_signer_manifests(archive)) == {"s": b"two"}
+    with pytest.raises(SecurityError) as exc:
+        unpack(archive, tmp_path / "dest")
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+
+    archive.write_bytes(
+        _file(b"signatures.jsonl", b"first") + _raw_header(b"signatures.jsonl", 0, b"5") + END
+    )
+    assert extract_signatures_jsonl(archive) is None
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("tar_format", ["pax", "gnu", "ustar"])
+def test_ordinary_archives_are_read_in_full(
+    tmp_path: Path, passes: list, fmt: str, tar_format: str
+) -> None:
+    """All platforms: archives tarfile writes in each format and compression,
+    with directories, an empty file, nested and non-ASCII names, long names
+    (pax and GNU) and a global pax header such as git archive writes (pax),
+    unpack in full; every pass hands tarfile at most the archive's bytes."""
+    from aphelion.unpacker import check_member_names, extract_signatures_jsonl
+
+    files = {
+        "signatures.jsonl": b"{}\n",
+        "claims/中文.md": "中文".encode() * 100,
+        "claims/empty.md": b"",
+        "a/b/c/d.bin": random.Random(7).randbytes(70_000),
+    }
+    if tar_format != "ustar":
+        files["long/" + "é" * 120 + ".md"] = b"long"
+    form = {"pax": tarfile.PAX_FORMAT, "gnu": tarfile.GNU_FORMAT, "ustar": tarfile.USTAR_FORMAT}
+    raw = io.BytesIO()
+    extra = {"pax_headers": {"comment": "0123abcd" * 5}} if tar_format == "pax" else {}
+    with tarfile.open(fileobj=raw, mode="w", format=form[tar_format], **extra) as tar:
+        for directory in ("claims", "a"):
+            tar.addfile(_dir(directory))
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compressed(raw.getvalue(), fmt))
+
+    check_member_names(archive)
+    assert extract_signatures_jsonl(archive) == b"{}\n"
+    dest = unpack(archive, tmp_path / "dest")
+    for name, data in files.items():
+        assert (dest / name).read_bytes() == data
+    assert all(reader.handed <= len(raw.getvalue()) for reader in passes)
+
+
+def test_global_and_local_pax_headers_and_a_gnu_long_name_together(tmp_path: Path) -> None:
+    """All platforms: a global pax header, a member with its own pax header
+    and one with a GNU long name in one archive unpack in full."""
+    long_name = b"d/" + b"n" * 110
+    raw = (
+        _pax({"comment": "abc123"}, b"g")
+        + _pax({"path": "p/" + "é" * 60})
+        + _file(b"short", b"one")
+        + _raw_header(b"././@LongLink", len(long_name) + 1, b"L")
+        + _padded(long_name + b"\0")
+        + _file(b"short2", b"two")
+        + END
+    )
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(raw)
+    dest = unpack(archive, tmp_path / "dest")
+    assert (dest / "p" / ("é" * 60)).read_bytes() == b"one"
+    assert (dest / long_name.decode()).read_bytes() == b"two"
+
+
+def test_a_member_of_max_file_bytes_unpacks(tmp_path: Path) -> None:
+    """All platforms: a 25 MiB member, the most the default policy allows,
+    in a compressed archive unpacks."""
+    data = random.Random(8).randbytes(25 * MIB)
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(gzip.compress(_tar_bytes([("big.bin", data)]), compresslevel=1, mtime=0))
+    assert unpack(archive, tmp_path / "dest").joinpath("big.bin").read_bytes() == data
+
+
+def test_max_files_members_pass_the_header_checks_in_bounded_memory(
+    tmp_path: Path, passes: list
+) -> None:
+    """All platforms: 10,000 members, the most the default policy allows,
+    pass the header checks in one pass, holding under 64 MiB; one more is
+    refused (PX_E_6009)."""
+    import tracemalloc
+
+    from aphelion.unpacker import check_member_names
+
+    def archive_of(count: int) -> Path:
+        path = tmp_path / f"{count}.tar"
+        path.write_bytes(b"".join(_file(b"m%05d" % i, b"x") for i in range(count)) + END)
+        return path
+
+    tracemalloc.start()
+    try:
+        check_member_names(archive_of(10_000))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 64 * MIB, peak
+    assert passes[0].handed <= _pass_limit(ExtractPolicy.default())
+    with pytest.raises(SecurityError) as exc:
+        check_member_names(archive_of(10_001))
+    assert exc.value.code == ErrorCode.FILE_COUNT_EXCEEDED
+
+
+def test_long_numeric_pax_records_in_every_member(tmp_path: Path) -> None:
+    """All platforms: members whose pax headers hold 3 KiB numeric records,
+    which older tarfile releases parse slowly, are read; at most 4,096
+    bytes of header per member reach tarfile (scaled to 300 members)."""
+    from aphelion.unpacker import check_member_names
+
+    raw = b"".join(
+        _pax({"comment": "7" * 3000}) + _file(b"m%03d" % i, b"x") for i in range(300)
+    )
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(raw + END)
+    check_member_names(archive)
+
+
+def _flip(raw: bytes, rng: random.Random) -> bytes:
+    """``raw`` with one byte of one header changed and its checksum redone."""
+    data = bytearray(raw)
+    headers = [i for i in range(0, len(data) - 511, 512) if data[i + 257 : i + 262] == b"ustar"]
+    start = rng.choice(headers)
+    field = rng.choice([(0, 100), (124, 136), (156, 157), (345, 500)])
+    data[start + rng.randrange(*field)] = rng.randrange(256)
+    data[start + 148 : start + 156] = b" " * 8
+    data[start + 148 : start + 156] = b"%06o\0 " % sum(data[start : start + 512])
+    return bytes(data)
+
+
+def test_changed_headers_are_refused_or_read_within_the_limit(
+    tmp_path: Path, passes: list
+) -> None:
+    """All platforms and Python versions: changing one header byte (name,
+    size, type, prefix) and adding random pax keys never makes a pass hand
+    tarfile more than the per-pass limit, and every result is the archive
+    read or refused with an Aphelion or tarfile error (scaled to 300
+    archives)."""
+    from aphelion.unpacker import check_member_names, extract_signer_manifests
+
+    rng = random.Random(24)
+    keys = ["size", "path", "GNU.sparse.size", "comment", "linkpath", "mtime", "uid"]
+    base = (
+        _pax({"comment": "abc"}, b"g")
+        + _pax({"path": "p.md"})
+        + _file(b"a.md", b"a" * 700)
+        + _file(b"signers/s.json", b"{}")
+        + _raw_header(b"dir", 0, b"5")
+        + END
+    )
+    limit = _pass_limit(ExtractPolicy.default())
+    archive = tmp_path / "a.tar"
+    outcomes = set()
+    for _ in range(300):
+        raw = _flip(base, rng)
+        if rng.random() < 0.3:
+            raw = _pax({rng.choice(keys): str(rng.randrange(-2, 1 << 20))}) + raw
+        archive.write_bytes(raw)
+        for call in (lambda: check_member_names(archive), lambda: extract_signer_manifests(archive)):
+            passes.clear()
+            try:
+                call()
+                outcomes.add("ok")
+            except (SecurityError, tarfile.TarError) as exc:
+                outcomes.add(type(exc).__name__)
+            assert all(reader.handed <= min(limit, len(raw) + 512) for reader in passes)
+    assert "ok" in outcomes and "SecurityError" in outcomes
 
 
 # ---------- A1: collisions after normalisation ----------

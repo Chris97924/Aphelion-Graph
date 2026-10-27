@@ -1570,3 +1570,68 @@ def test_ed25519_public_key_of_wrong_length_raises_signer_malformed(
     with pytest.raises(SignerVerificationError) as exc:
         verify_package(tar_path, require_signed=True)
     assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+# ---------------------------------------------------------------------------
+# Each call reads the package a fixed number of times.
+# ---------------------------------------------------------------------------
+
+
+def _count_passes(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Every reader tarfile reads a package through from now on, one per pass."""
+    import aphelion.unpacker as unpacker
+
+    made: list = []
+    real_init = unpacker._ForwardReader.__init__
+
+    def init(self: object, *args: object, **kwargs: object) -> None:
+        real_init(self, *args, **kwargs)
+        made.append(self)
+
+    monkeypatch.setattr(unpacker._ForwardReader, "__init__", init)
+    return made
+
+
+@pytest.mark.integration
+def test_signature_checks_read_the_package_a_fixed_number_of_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """validate_signatures reads a signed package once and verify_package
+    twice (the unpack's two passes, the second also collecting what the
+    signature checks read), each pass handing tarfile no more than the
+    package holds."""
+    from aphelion.validator import validate_signatures
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    size = tar_path.stat().st_size
+    passes = _count_passes(monkeypatch)
+
+    assert len(validate_signatures(tar_path)) == 1
+    assert len(passes) == 1
+    passes.clear()
+    assert len(verify_package(tar_path, require_signed=True).envelopes) == 1
+    assert len(passes) == 2
+    assert all(reader.handed <= size for reader in passes)
+
+
+@pytest.mark.integration
+def test_data_after_the_end_of_a_package_fails_the_signature_checks(tmp_path: Path) -> None:
+    """Non-zero bytes right after the end of the last member make
+    validate_signatures and verify_package fail with tarfile.ReadError
+    rather than check the package as if it ended there."""
+    import tarfile
+
+    from aphelion.validator import validate_signatures
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    raw = tar_path.read_bytes()
+    with tarfile.open(tar_path) as tar:
+        last = tar.getmembers()[-1]
+    end = last.offset_data + -(-last.size // 512) * 512
+    tar_path.write_bytes(raw[:end] + bytes(512) + b"\x01" * 512 + bytes(1024))
+
+    for call in (lambda: validate_signatures(tar_path), lambda: verify_package(tar_path)):
+        with pytest.raises(tarfile.ReadError, match="after the end"):
+            call()

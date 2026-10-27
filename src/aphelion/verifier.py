@@ -392,21 +392,24 @@ def verify_package(
     """
     from aphelion.signer import SignerVerificationError
     from aphelion.trust import resolve_notary, attestation_is_acceptable
-    from aphelion.validator import _validate_signatures_full
+    from aphelion.validator import _check_signatures
 
     tar_path = Path(tar_path)
 
     # Step 1: v0.4 checks via unpack + verify
+    # The unpack reads the archive twice; the pass that writes the members
+    # also collects the ones the signature checks read, so this call reads
+    # the archive twice in all.
     with tempfile.TemporaryDirectory() as tmp_dir:
-        from aphelion.unpacker import unpack
-        unpacked = unpack(tar_path, tmp_dir)
+        from aphelion.unpacker import _unpack_reading_signature_members
+        unpacked, members = _unpack_reading_signature_members(tar_path, tmp_dir)
         verify(unpacked)
 
     # Step 2: v0.5 signature validation. This extracts and parses each signer
-    # manifest exactly once (with typed-error guards); reuse the parsed
-    # SignerManifest objects below instead of re-reading the whole tar and
-    # re-parsing per envelope.
-    envelopes, signer_manifests_by_id = _validate_signatures_full(tar_path)
+    # manifest exactly once (with typed-error guards), from the members the
+    # unpack collected; reuse the parsed SignerManifest objects below instead
+    # of re-parsing per envelope.
+    envelopes, signer_manifests_by_id = _check_signatures(members)
 
     # Step 3: require_signed check; require_notary implies it, as in the CLI
     if (require_signed or require_notary) and len(envelopes) == 0:

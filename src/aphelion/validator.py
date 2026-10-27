@@ -326,12 +326,25 @@ def _validate_signatures_full(
     keyed by ``signer_id``. The verifier reuses this mapping for notary
     resolution so signer manifests are neither re-extracted from the tar nor
     re-parsed once per envelope.
+
+    Reads the archive once: the header checks of
+    :func:`aphelion.unpacker.check_member_names`, collecting
+    ``signatures.jsonl``, the signer manifests and ``manifest.json`` on the
+    way. Everything below looks members up by name, and archives whose
+    member names collide after normalization are refused first, so the
+    manifest read here is the one an extraction of the same archive would
+    produce.
     """
-    from aphelion.unpacker import (
-        check_member_names,
-        extract_signatures_jsonl,
-        extract_signer_manifests,
-    )
+    from aphelion.unpacker import _read_signature_members
+
+    return _check_signatures(_read_signature_members(tar_path))
+
+
+def _check_signatures(
+    members: Any,
+) -> "tuple[tuple[Any, ...], dict[str, Any]]":
+    """The §5 checks of :func:`_validate_signatures_full`, on the members
+    collected from a package (``aphelion.unpacker._SignatureMembers``)."""
     from aphelion.sig_pack import read_signatures_jsonl
     from aphelion.signer import (
         HMACVerifier,
@@ -344,50 +357,38 @@ def _validate_signatures_full(
         parse_signer_manifest,
     )
 
-    # Everything below looks members up by name. Reject archives whose member
-    # names collide after normalization first, so the manifest read here is
-    # the one an extraction of the same archive would produce.
-    check_member_names(tar_path)
-
     # §5 rule 2 (implicit): read signatures.jsonl; if absent → unsigned-valid
-    sig_content = extract_signatures_jsonl(tar_path)
+    sig_content = members.signatures
     if sig_content is None:
         return (), {}
 
     # Parse and validate sort order (raises E_SIGNATURE_MALFORMED / E_SIGNATURE_ORDER)
     envelopes = read_signatures_jsonl(sig_content)
 
-    signer_manifests_raw = extract_signer_manifests(tar_path)
+    signer_manifests_raw = members.signers
 
     # Load package canonical hash from manifest inside the tar
     from aphelion.errors import SecurityError
-    from aphelion.unpacker import ExtractPolicy, _open_archive
-    archive = Path(tar_path)
-    with _open_archive(archive, ExtractPolicy.default()) as tar:
-        try:
-            manifest_info = tar.getmember("manifest.json")
-        except KeyError as exc:
-            raise SchemaError(
-                code=ErrorCode.MISSING_FILE,
-                msg="manifest.json is missing from the archive",
-                path="manifest.json",
-            ) from exc
-        # A directory/symlink/non-regular member named manifest.json makes
-        # extractfile() return None. Guard explicitly rather than relying on
-        # ``assert`` (stripped under ``python -O``) so a crafted archive yields
-        # a typed validation error instead of a raw AttributeError.
-        manifest_member = tar.extractfile(manifest_info)
-        if manifest_member is None:
-            raise SecurityError(
-                code=ErrorCode.DISALLOWED_MEMBER_TYPE,
-                msg=(
-                    "manifest.json is not a regular file member "
-                    f"(type {manifest_info.type!r})"
-                ),
-                path="manifest.json",
-            )
-        manifest_bytes = manifest_member.read()
-        manifest_member.close()
+    if members.manifest is None:
+        raise SchemaError(
+            code=ErrorCode.MISSING_FILE,
+            msg="manifest.json is missing from the archive",
+            path="manifest.json",
+        )
+    # A directory member named manifest.json has no content. Guard
+    # explicitly rather than relying on ``assert`` (stripped under
+    # ``python -O``) so a crafted archive yields a typed validation error
+    # instead of a raw AttributeError.
+    manifest_type, manifest_bytes = members.manifest
+    if manifest_bytes is None:
+        raise SecurityError(
+            code=ErrorCode.DISALLOWED_MEMBER_TYPE,
+            msg=(
+                "manifest.json is not a regular file member "
+                f"(type {manifest_type!r})"
+            ),
+            path="manifest.json",
+        )
 
     from aphelion.canonical_json import loads as cj_loads, normalize
     manifest_obj = normalize(cj_loads(manifest_bytes))
