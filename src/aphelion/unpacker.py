@@ -14,6 +14,7 @@ distinct PX_E_6NNN code (see :mod:`aphelion.error_codes`):
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import secrets
@@ -408,8 +409,10 @@ def _same_entry(a: Path, b: Path) -> bool:
     # call, since an identity check that cannot run must not pass.
     try:
         return os.path.samefile(a, b)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
+    except (FileNotFoundError, NotADirectoryError) as err:
+        if _absent(err):
+            return False
+        raise
 
 
 def _make_parents(path: Path, made: list[Path]) -> None:
@@ -660,14 +663,30 @@ def _lstat(path: Path, *, follow_symlinks: bool = False) -> os.stat_result | Non
     pathlib or os.path predicates, which return False on errors. Path
     resolution (``Path.resolve``) and ``Path.mkdir(exist_ok=True)`` keep their
     standard-library behaviour; the strict checks of the entries that are
-    moved are their backstop. A "not found" can still be wrong (on Windows
-    a network error is reported as one), so what is found absent is placed
-    by a step that fails if anything is there.
+    moved are their backstop. Only the OS saying there is no such entry
+    counts as absent (see :func:`_absent`); as even that can be wrong, what
+    is found absent is placed by a step that fails if anything is there.
     """
     try:
         return os.stat(path) if follow_symlinks else os.lstat(path)
-    except (FileNotFoundError, NotADirectoryError):
-        return None
+    except (FileNotFoundError, NotADirectoryError) as err:
+        if _absent(err):
+            return None
+        raise
+
+
+def _absent(err: OSError) -> bool:
+    """Whether ``err`` is the OS saying that there is no such entry.
+
+    Windows also raises FileNotFoundError for some network errors (a
+    network path or share that cannot be reached: winerror 53 and 67), and
+    an entry behind those may well be there, so on Windows only
+    ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND count; elsewhere ENOENT
+    and ENOTDIR. Every place that takes an error to mean "absent" asks this.
+    """
+    if sys.platform == "win32":
+        return getattr(err, "winerror", None) in (2, 3)
+    return err.errno in (errno.ENOENT, errno.ENOTDIR)
 
 
 def _is_dir(st: os.stat_result) -> bool:
@@ -710,9 +729,9 @@ def _discard_backup(backup: Path, exc: BaseException) -> bool:
     """
     try:
         os.rmdir(backup)  # refuses a directory that is not empty
-    except FileNotFoundError:
-        pass
-    except OSError:
+    except OSError as err:
+        if _absent(err):
+            return True
         if not any(str(backup) in text for text in (str(exc), *getattr(exc, "__notes__", ()))):
             _report(
                 f"kept {backup}: it may hold entries this call moved aside and could "

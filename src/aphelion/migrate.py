@@ -30,6 +30,7 @@ from aphelion.canonical_json import normalize
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
 from aphelion.unpacker import (
+    _absent,
     _discard_backup,
     _lstat,
     _maybe_present,
@@ -212,8 +213,10 @@ def _same_entry(a: Path, b: Path) -> bool:
         return True
     try:
         return os.path.samefile(a, b)
-    except (FileNotFoundError, NotADirectoryError):  # any other error fails the check
-        return False
+    except (FileNotFoundError, NotADirectoryError) as err:
+        if _absent(err):
+            return False
+        raise  # any other error fails the check
 
 
 def _refuse_overlap(src: Path, dst: Path) -> None:

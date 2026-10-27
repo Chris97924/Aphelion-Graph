@@ -2010,16 +2010,32 @@ def test_merge_moves_only_what_is_a_regular_file_right_before_the_move(
         assert _tree(dest) == before
 
 
+WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="winerror exists only on Windows")
+
+
+def _not_found(path: object, winerror: int | None = 2) -> OSError:
+    """The error an os call raises for ``path`` when it finds nothing there:
+    ENOENT. On Windows ``winerror`` says what the call reported (2: no such
+    file; 53 and 67: a network path or share that cannot be reached, which
+    Windows also raises as FileNotFoundError), and sets type and errno as it
+    does for a real one; None leaves it out. Elsewhere it is ignored."""
+    if winerror is None:
+        return OSError(errno.ENOENT, "simulated: not found", os.fspath(path))
+    return OSError(errno.ENOENT, "simulated: not found", os.fspath(path), winerror)
+
+
+@pytest.mark.parametrize("winerror", [2, pytest.param(53, marks=WINDOWS_ONLY)])
 @pytest.mark.parametrize("found_absent", ["file", "directory", "new-dest-over-a-file"])
 def test_entry_wrongly_found_absent_is_never_replaced(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, found_absent: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, found_absent: str, winerror: int
 ) -> None:
-    """All platforms: the lstat that finds an entry absent can be wrong (on
-    Windows a network error is reported as "not found"). What it found
-    absent is put in place by a step that fails if anything is there (an
-    exclusive create, an exclusive mkdir, a rename that replaces no file),
-    so the unpack fails and dest keeps what it had, instead of a rename
-    replacing a file nothing backed up."""
+    """All platforms: the lstat that finds an entry absent can be wrong
+    (another process at work, say). What it found absent is put in place by
+    a step that fails if anything is there (an exclusive create, an
+    exclusive mkdir, a rename that replaces no file), so the unpack fails
+    and dest keeps what it had, instead of a rename replacing a file nothing
+    backed up. Windows also: a network error Windows reports as "not found"
+    (winerror 53) is no "not found" at all, and fails the call."""
     archive, dest, _ = _merge_archive(tmp_path)
     if found_absent == "file":
         victim = dest / "z.md"  # after a.md was replaced, so that is undone too
@@ -2038,7 +2054,7 @@ def test_entry_wrongly_found_absent_is_never_replaced(
     def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
         name = os.path.normcase(os.path.abspath(os.fspath(path)))
         if not kwargs.get("dir_fd") and name == want and _from_aphelion():
-            raise FileNotFoundError(errno.ENOENT, "simulated: network path not found", path)
+            raise _not_found(path, winerror)
         return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "lstat", lstat)
@@ -2048,6 +2064,75 @@ def test_entry_wrongly_found_absent_is_never_replaced(
 
     assert (dest.read_bytes() if dest.is_file() else _tree(dest)) == before
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.tar", "dest"]
+
+
+# Every place unpack and migrate take an error to mean "there is no such entry".
+ABSENT_SITES = ["lstat", "stat", "samefile", "rmdir-backup", "migrate-samefile"]
+
+
+def _taken_as_absent(
+    site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, err: OSError
+) -> bool:
+    """Run one of ``ABSENT_SITES`` with ``err`` raised by the os call it makes,
+    on an entry that is there all along; whether it took ``err`` to mean that
+    there is no such entry, or raised it on (the backup: kept, not gone)."""
+    from aphelion import migrate, unpacker
+
+    entry = tmp_path / "entry"
+    entry.mkdir()
+
+    def fail(*args: object, **kwargs: object) -> object:
+        raise err
+
+    with monkeypatch.context() as patch:
+        try:
+            if site in ("lstat", "stat"):
+                patch.setattr(os, site, fail)
+                return unpacker._lstat(entry, follow_symlinks=site == "stat") is None
+            if site == "rmdir-backup":
+                patch.setattr(os, "rmdir", fail)
+                # Its error already names the backup, so nothing more is reported.
+                return unpacker._discard_backup(entry, OSError(f"kept {entry}"))
+            patch.setattr(os.path, "samefile", fail)
+            same_entry = migrate._same_entry if site.startswith("migrate") else unpacker._same_entry
+            return same_entry(entry, tmp_path / "other") is False
+        except OSError as raised:
+            assert raised is err
+            return False
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize(
+    "winerror, absent",
+    [(2, True), (3, True), (53, False), (67, False), (267, False), (None, False)],
+)
+@pytest.mark.parametrize("site", ABSENT_SITES)
+def test_on_windows_only_no_such_file_or_path_means_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+    winerror: int | None,
+    absent: bool,
+) -> None:
+    """Windows only: an entry counts as absent only where Windows reported
+    ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3). A network path or
+    share that cannot be reached (53, 67) is raised as FileNotFoundError
+    too, ERROR_DIRECTORY (267) as NotADirectoryError, and Windows' own calls
+    never raise one without a winerror: the entry may be there, so the
+    error is raised on (or the backup kept) and fails the call."""
+    err = _not_found(tmp_path / "entry", winerror)
+    assert _taken_as_absent(site, tmp_path, monkeypatch, err) is absent
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows tells them apart by winerror")
+@pytest.mark.parametrize("code", [errno.ENOENT, errno.ENOTDIR])
+@pytest.mark.parametrize("site", ABSENT_SITES)
+def test_elsewhere_enoent_and_enotdir_still_mean_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, code: int
+) -> None:
+    """POSIX: ENOENT and ENOTDIR still mean that there is no such entry."""
+    err = OSError(code, os.strerror(code), str(tmp_path / "entry"))
+    assert _taken_as_absent(site, tmp_path, monkeypatch, err) is True
 
 
 # ---------- the destination itself must not be a link ----------

@@ -27,7 +27,17 @@ from aphelion.migrate import (
     migrate_v03_to_v04,
 )
 from aphelion.validator import validate_manifest
-from test_unpacker import MOVES, STOPS, WARNING_FILTERS, _error, _named, _run_steps, run_python
+from test_unpacker import (
+    MOVES,
+    STOPS,
+    WARNING_FILTERS,
+    WINDOWS_ONLY,
+    _error,
+    _named,
+    _not_found,
+    _run_steps,
+    run_python,
+)
 
 
 UUID_PKG = "0191aaaa-0000-7000-8000-000000000001"
@@ -606,21 +616,30 @@ def test_force_keeps_destination_when_source_is_not_migratable(tmp_path: Path) -
     assert _snapshot(dst) == {"keep.txt": b"keep"}
 
 
+@pytest.mark.parametrize(
+    "winerror", [None, pytest.param(53, marks=WINDOWS_ONLY), pytest.param(67, marks=WINDOWS_ONLY)]
+)
 def test_migrate_stops_when_the_destination_cannot_be_looked_at(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int | None
 ) -> None:
     """All platforms: an error other than "no such file" while checking
     whether the destination exists (a transient I/O error, say) fails the
-    migration before anything is written; it is not taken as "absent"."""
+    migration before anything is written; it is not taken as "absent".
+    Windows also: nor is a network path or share that cannot be reached
+    (winerror 53, 67), which Windows raises as FileNotFoundError."""
     import errno
     import os
 
     src, dst, before = _force_setup(tmp_path)
     real_lstat = os.lstat
+    if winerror is None:
+        err = OSError(errno.EIO, "simulated I/O error", str(dst))
+    else:
+        err = _not_found(dst, winerror)
 
     def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
         if os.path.abspath(os.fspath(path)) == str(dst):
-            raise OSError(errno.EIO, "simulated I/O error", os.fspath(path))
+            raise err
         return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "lstat", lstat)
@@ -629,7 +648,7 @@ def test_migrate_stops_when_the_destination_cannot_be_looked_at(
         migrate(MigrateOptions(src=src, dst=dst))
     monkeypatch.undo()
 
-    assert exc.value.errno == errno.EIO
+    assert exc.value is err
     assert _snapshot(dst) == before
     assert sorted(p.name for p in tmp_path.iterdir()) == ["v03", "v04"]
 
