@@ -492,9 +492,10 @@ def _members(
     total over ``max_compression_ratio`` times the archive size (for an
     archive that is a regular file; for another kind of file the size is
     not known and the ratio is not checked). Reading past what tarfile may
-    read (ARCHIVE_BOMB) comes before any of these checks of the member it
-    reads towards (as ``tarfile.ReadError`` after a pax header there that a
-    release stops at). A member past ``max_files`` is refused as a release
+    read (ARCHIVE_BOMB) comes after a negative size in the header blocks
+    read up to there, and is ``tarfile.ReadError`` after a pax header there
+    that a release stops at; it comes before the other checks of the member
+    it reads towards. A member past ``max_files`` is refused as a release
     that stops at its headers reports it (a negative size, then such a pax
     header), else as one too many. The ratio counts declared member data
     only; header bytes are bounded by the per-member allowance above. A
@@ -792,16 +793,20 @@ def _reads_on_past_broken_records() -> bool:
     """Whether this release's tarfile reads on past a pax record that is
     not whole (see :func:`_pax_records`), as tarfile before Python 3.10.15,
     3.11.10 and 3.12.6 does, rather than failing there: found by reading a
-    pax header whose one record has no newline at its end."""
-    info = tarfile.TarInfo("a")
-    info.pax_headers = {"comment": "c"}
-    raw = info.tobuf(tarfile.PAX_FORMAT, "utf-8", "surrogateescape")
-    raw = raw.replace(b"13 comment=c\n", b"13 comment=cc") + bytes(1024)
+    pax header whose one record has no newline at its end. If that fails
+    other than with ``tarfile.ReadError``, True: every pax header's
+    records are then read."""
     try:
+        info = tarfile.TarInfo("a")
+        info.pax_headers = {"comment": "c"}
+        raw = info.tobuf(tarfile.PAX_FORMAT, "utf-8", "surrogateescape")
+        raw = raw.replace(b"13 comment=c\n", b"13 comment=cc") + bytes(1024)
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tar:
             tar.next()
     except tarfile.ReadError:
         return False
+    except Exception:  # another tarfile error, ValueError, ...: read every record
+        return True
     return True
 
 

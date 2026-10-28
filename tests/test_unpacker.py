@@ -1528,6 +1528,43 @@ def test_records_that_are_not_whole_are_found_where_tarfile_reads_on(
             tarfile.open(fileobj=io.BytesIO(raw), mode="r|").next()
 
 
+PROBE_FAILS = """
+import sys, tarfile
+
+error = {
+    "tar-error": tarfile.HeaderError("header"),
+    "value-error": ValueError("value"),
+    "other": EOFError("other"),
+}[sys.argv[1]]
+
+
+def fail(self, *args, **kwargs):
+    raise error
+
+
+tarfile.TarFile.next = fail
+import aphelion.unpacker as unpacker
+
+info = tarfile.TarInfo("a")
+info.pax_headers = {"comment": "c"}
+raw = info.tobuf(tarfile.PAX_FORMAT, "utf-8", "surrogateescape")
+raw = raw.replace(b"13 comment=c\\n", b"13 comment=cc") + bytes(1024)
+print(unpacker._PAX_READ_ON, unpacker._header_chain(raw, 0)[4])
+"""
+
+
+@pytest.mark.parametrize("kind", ["tar-error", "value-error", "other"])
+def test_a_failing_look_at_how_tarfile_reads_pax_records_reads_them_all(kind: str) -> None:
+    """All platforms and Python versions: if reading the pax header that
+    shows whether this release's tarfile reads on past a record that is
+    not whole fails other than with tarfile.ReadError, the module still
+    imports and every pax header's records are read, so such a record is
+    found even in a header with no size, GNU.sparse. or hdrcharset key."""
+    result = run_python(PROBE_FAILS, [kind], None)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["True", "(0,", "True)"]
+
+
 def _read_alike_cases() -> list:
     """Pax headers whose records are whole but which Python releases read
     differently: the encoding of the names in a header (``hdrcharset``),
