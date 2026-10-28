@@ -718,61 +718,61 @@ def _bounded_cases() -> list:
     return [
         pytest.param(
             lambda: _zero_member(b"zero.bin", 64 * MIB), "gz", small,
-            ErrorCode.FILE_BYTES_EXCEEDED, FIRST_LIMIT, every, id="T1-honest-64MiB-member",
+            ErrorCode.FILE_BYTES_EXCEEDED, FIRST_LIMIT, every, id="honest-64MiB-member",
         ),
         pytest.param(
             lambda: _zero_member(b"big.bin", 16 * MIB, _pax({"GNU.sparse.size": "16"})),
             "gz", None, ErrorCode.DISALLOWED_MEMBER_TYPE, FIRST_LIMIT, every,
-            id="T2-sparse-size-below-the-data",
+            id="sparse-size-below-the-data",
         ),
         pytest.param(
             lambda: _zero_member(b"big.bin", 16 * MIB, _pax({"GNU.sparse.realsize": "16"})),
             "gz", None, ErrorCode.DISALLOWED_MEMBER_TYPE, FIRST_LIMIT, every,
-            id="T3-sparse-realsize-only",
+            id="sparse-realsize-only",
         ),
         pytest.param(
             lambda: _zero_member(b"big.bin", 64 * MIB, _pax({"size": "0"}, b"g")),
             "gz", None, ErrorCode.FILE_BYTES_EXCEEDED, FIRST_LIMIT, every,
-            id="T4-global-size-over-the-data",
+            id="global-size-over-the-data",
         ),
         pytest.param(
             lambda: _file(b"a.md", b"a" * 5) + _raw_header(b"n.md", -512) + bytes(10240),
             "gz", None, ErrorCode.FILE_BYTES_EXCEEDED, 1024 + HEADER_BYTES, every,
-            id="T5-negative-size-back-to-its-own-header",
+            id="negative-size-back-to-its-own-header",
         ),
         pytest.param(
             lambda: _negative_size_chain(50, 256 * 1024), "gz", None,
             ErrorCode.FILE_BYTES_EXCEEDED,
             512 * 51 + 256 * 1024 + HEADER_BYTES, every,
-            id="T6-negative-size-hides-members",
+            id="negative-size-hides-members",
         ),
         pytest.param(
             lambda: _raw_header(b"huge.bin", 1 << 64), "tar", None,
-            ErrorCode.FILE_BYTES_EXCEEDED, 512, every, id="T7-size-2-64-and-no-data",
+            ErrorCode.FILE_BYTES_EXCEEDED, 512, every, id="size-2-64-and-no-data",
         ),
         pytest.param(
             lambda: _pax({"size": "0"}, b"g") + _raw_header(b"huge.bin", 1 << 64), "tar", None,
-            ErrorCode.FILE_BYTES_EXCEEDED, 1536, every, id="T8-global-size-over-2-64",
+            ErrorCode.FILE_BYTES_EXCEEDED, 1536, every, id="global-size-over-2-64",
         ),
         pytest.param(
             lambda: _pax({"comment": "x" * (16 * MIB)}) + _file(b"a.md", b"a") + END,
             "gz", ExtractPolicy(max_file_bytes=4096), ErrorCode.ARCHIVE_BOMB, FIRST_LIMIT,
-            every, id="T9-16MiB-pax-record",
+            every, id="16MiB-pax-record",
         ),
         pytest.param(
             lambda: _raw_header(b"././@LongLink", 16 * MIB, b"L") + _padded(b"n" * (16 * MIB))
             + _file(b"a.md", b"a") + END,
-            "gz", None, ErrorCode.ARCHIVE_BOMB, FIRST_LIMIT, every, id="T10-16MiB-long-name",
+            "gz", None, ErrorCode.ARCHIVE_BOMB, FIRST_LIMIT, every, id="16MiB-long-name",
         ),
         pytest.param(
             lambda: _file(b"a.md", b"a") + b"\x01" * 512 + _file(b"b.md", b"b") + END,
             "tar", None, "ReadError", 1024 + HEADER_BYTES, every,
-            id="T13-damaged-header-between-members",
+            id="damaged-header-between-members",
         ),
         *[
             pytest.param(
                 lambda flag=flag: _raw_header(b"x", 0, flag) + END, "tar", None,
-                ErrorCode.DISALLOWED_MEMBER_TYPE, 1536, every, id=f"T14-type-{name}",
+                ErrorCode.DISALLOWED_MEMBER_TYPE, 1536, every, id=f"type-{name}",
             )
             for flag, name in [
                 (b"1", "hardlink"), (b"2", "symlink"), (b"3", "char"), (b"4", "block"),
@@ -782,16 +782,16 @@ def _bounded_cases() -> list:
         pytest.param(
             lambda: _pax({"size": "2048"}) + _file(b"a.md", b"a" * 1024) + bytes(1024) + END,
             "tar", None, ErrorCode.FILE_BYTES_EXCEEDED, FIRST_LIMIT, every,
-            id="T15-pax-size-over-the-header",
+            id="pax-size-over-the-header",
         ),
         pytest.param(
             lambda: _pax({"size": "0"}) + _file(b"a.md", b"a" * 1024) + END,
             "tar", None, ErrorCode.FILE_BYTES_EXCEEDED, FIRST_LIMIT, every,
-            id="T15-pax-size-under-the-header",
+            id="pax-size-under-the-header",
         ),
         pytest.param(
             lambda: _raw_header(b"cut.bin", MIB) + bytes(4096), "tar", lax,
-            ErrorCode.ARCHIVE_BOMB, 512 + 4096, policy_bound, id="T16-cut-short-in-the-data",
+            ErrorCode.ARCHIVE_BOMB, 512 + 4096, policy_bound, id="cut-short-in-the-data",
         ),
         pytest.param(
             lambda: _raw_header(b"a.bin", 25 * MIB) + bytes(512), "tar", None,
