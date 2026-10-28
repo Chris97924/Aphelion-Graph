@@ -93,7 +93,7 @@ def test_roundtrip_preserves_bytes() -> None:
     assert b1 == b2
 
 
-# ---------- A7: member paths may not escape the archive root ----------
+# ---------- member paths may not escape the archive root ----------
 
 
 @pytest.mark.parametrize(

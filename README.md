@@ -123,7 +123,8 @@ Budget flags (conservative defaults):
 
 Post-unpack semantic cross-reference:
 
-1. Every `claim_instance_id` and every `event_id` is used once
+1. No two manifest entries share a `claim_instance_id`, no two events
+   emit one, and no `event_id` repeats
    (`PX_E_4011` / `DUPLICATE_CLAIM_INSTANCE_ID`,
    `PX_E_4012` / `DUPLICATE_EVENT_ID`).
 2. Each claim's file is `claims/<claim_id>.md`
@@ -139,8 +140,9 @@ Post-unpack semantic cross-reference:
 7. Each event's `target_claim_instance_id` is the instance in force at
    that event, and each manifest `claim_instance_id` was emitted by its
    claim's provenance (`PX_E_5004` / `DANGLING_REFERENCE`).
-8. Each manifest state matches the claim's last provenance event
-   (`PX_E_5005` / `MANIFEST_STATE_MISMATCH`).
+8. A claim's manifest state is `superseded` or `withdrawn` exactly when
+   its last provenance event is a `supersede` or `withdraw`, and then
+   the matching one (`PX_E_5005` / `MANIFEST_STATE_MISMATCH`).
 
 ```bash
 aphelion verify UNPACKED_DIR/

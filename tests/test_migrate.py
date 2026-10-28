@@ -382,7 +382,7 @@ def test_cli_migrate_directory_end_to_end(tmp_path: Path) -> None:
     assert new_manifest["aphelion_spec_version"] == "0.4.0"
 
 
-# ---------- A9: --force checks the destination before removing anything ----------
+# ---------- --force checks the destination before removing anything ----------
 
 
 def _snapshot(root: Path) -> dict[str, bytes | None]:

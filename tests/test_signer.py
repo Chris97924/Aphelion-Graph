@@ -972,7 +972,7 @@ def test_ed25519_verifier_rejects_malformed_signature_b64() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A5: verifiers raise typed errors on malformed manifests / envelopes
+# Verifiers raise typed errors on malformed manifests / envelopes
 # ---------------------------------------------------------------------------
 
 

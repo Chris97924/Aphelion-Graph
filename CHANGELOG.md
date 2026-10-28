@@ -226,8 +226,9 @@ the record of what a bump would carry.
   `/` and the `PX_E_6010` refusals of a negative size in the header blocks
   give the header's place in the archive (and the name field), not the
   member's name, so their message is the same on every release, unless a
-  negative pax `size` has more digits than `int()` reads: its member is
-  then refused for having its size in a pax header. A GNU
+  negative pax `size` has more digits than `int()` reads (which also needs
+  a `max_path_length` above the default): its member is then refused for
+  having its size in a pax header. A GNU
   sparse member in the old form (type `S`) whose real size is negative is
   refused with its name. The text of a `tarfile.ReadError` depends on the
   release. A package never has any of these. A directory's size, if not
@@ -316,10 +317,10 @@ the record of what a bump would carry.
   a `..` segment (`PX_E_6001`). It no longer writes member paths that
   `unpack` on the same platform refuses, but for one case: on platforms
   other than Windows, a library caller can still give `pack` names that
-  contain NUL. Readers take such a name only up to the NUL, so `unpack`
-  writes it under that shorter name, and refuses two that become one
-  (`PX_E_6007`). File names cannot contain NUL, so `aphe pack` never
-  writes one.
+  contain NUL. Readers cut each name field at the NUL, so `unpack` writes
+  such a member under another name, refuses it if nothing is left
+  (`PX_E_6006`), and refuses two that become one (`PX_E_6007`). File
+  names cannot contain NUL, so `aphe pack` never writes one.
 - **`aphe sign --signer-id` must be a single path component.** An empty id,
   `.`, `..`, or an id containing `/`, `\` or NUL is refused (`PX_E_6001`)
   before any file is read or written; the id names
@@ -440,13 +441,13 @@ the record of what a bump would carry.
   - `unpack` into an existing destination, even an empty one, with
     `FileExistsError` (`PX_E_9001` at the command line): "cannot unpack
     over the backup directory" when two members share a top-level entry
-    (a package with two or more claims, or a directory and a file in it),
-    and "cannot unpack over the staging directory" when the archive would
-    replace an entry the destination has or add into one of its
-    directories;
-  - `verify_package` (`aphe verify` on a package file) of a package with
-    two or more claims, the same way, when the temporary directory is on
-    such a filesystem;
+    (as in a package with two or more claims or signers, or an archive
+    with a directory entry and a file in it), and "cannot unpack over the
+    staging directory" when the archive would replace an entry the
+    destination has or add into one of its directories;
+  - `verify_package` (`aphe verify` on a package file), the same way, when
+    the temporary directory is on such a filesystem and two members of the
+    package share a top-level entry;
   - `migrate`, with `PX_E_2006`, when the source and the destination are
     both on it.
 
@@ -454,13 +455,34 @@ the record of what a bump would carry.
   existing one when the archive only adds new top-level entries of one
   member each; `check_member_names`, `validate_signatures` and `pack`;
   and `migrate` from or to another filesystem.
-- **On Windows without long-path support, a final path within 28
-  characters of the 260-character limit (232 to 259 characters) no longer
-  unpacks** (`FileNotFoundError`, `PX_E_2005` at the command line):
-  `unpack` first writes each member in a staging directory whose path is
-  28 characters longer. Migrating a directory, with or without `--force`,
-  loses the same 28 characters, as it builds the new tree beside the
-  destination under a longer name.
+- **On Windows without long-path support, `unpack` and `migrate` build
+  under paths up to 53 characters longer than the final ones**, while
+  Windows creates a file only up to 259 characters and a directory only
+  up to 247 (a member is staged 28 characters deeper, and an existing
+  destination's backup directory is 53 characters longer than its path).
+  So these fail where they worked before:
+  - `unpack` of a member whose final path is a file of 232 to 259
+    characters, or a directory of 220 to 247 characters (with any file in
+    it), and of any archive into a new destination of 220 characters or
+    more or into an existing one of 195 or more, with `FileNotFoundError`
+    (`PX_E_2005` at the command line);
+  - migrating a directory whose new tree would hold such a file or
+    directory path, with `shutil.Error`, which the command line reports
+    as `PX_E_9001` (exit 1) with a message listing each file it could not
+    copy, and migrating one to a new destination of 220 characters or
+    more, with `FileNotFoundError` (`PX_E_2005`);
+  - `migrate --force` over a destination that holds a file or directory
+    path of 231 characters or more puts the new tree in place, but leaves
+    the old one in `.<dst>.replaced-*`, with a warning naming it.
+- **A destination whose name (its last path component) is within 28
+  characters of the filesystem's 255-character name limit (255 bytes on
+  Linux) cannot be staged**, on every platform: `unpack` into a new
+  destination of such a name, and migrating a directory to one, with or
+  without `--force`, fail with `OSError` (`PX_E_9001` at the command
+  line; on Windows without long-path support such a path already fails
+  as above), and `migrate` also warns that it could not remove a staging
+  directory it never created. This limit does not apply to `unpack` into
+  an existing destination.
 
 ### Tests
 

@@ -1312,7 +1312,7 @@ def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A1: member names that collide after normalisation are rejected before
+# Member names that collide after normalisation are rejected before
 # verification and before extraction.
 # ---------------------------------------------------------------------------
 
@@ -1405,7 +1405,7 @@ def test_validate_signatures_rejects_colliding_member_names(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# A5: malformed signer input yields typed errors, never raw TypeError /
+# Malformed signer input yields typed errors, never raw TypeError /
 # ValueError, and base64 is decoded strictly.
 # ---------------------------------------------------------------------------
 

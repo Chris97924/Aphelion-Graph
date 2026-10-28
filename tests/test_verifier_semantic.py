@@ -1,6 +1,6 @@
 """Semantic checks in ``aphelion.verifier.verify`` required by spec/validator.md.
 
-Covers the ERR-SEM rules that verify() did not implement before A6:
+Covers the ERR-SEM rules that verify() did not implement before 0.7.0:
 
   * ERR-SEM-005 duplicate ``claim_instance_id`` (manifest; identity I-2 for events)
   * ERR-SEM-006 duplicate ``event_id`` in provenance.jsonl (identity I-3)

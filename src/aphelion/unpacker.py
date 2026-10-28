@@ -3,10 +3,11 @@
 Every known tar-extraction attack is rejected with a SecurityError and a
 distinct PX_E_6NNN code (see :mod:`aphelion.error_codes`):
   * path traversal ('..' / absolute / Windows drive / backslash)
-  * member names that collide once normalized the way any supported
-    filesystem would see them (leading ``./``, repeated or ``.`` separators,
-    Unicode NFC, case folding, and on Windows trailing dots/spaces), or that
-    reach one entry on disk under different names (8.3 short names)
+  * member names that collide once normalized (leading ``./``, repeated or
+    ``.`` separators, Unicode NFC and full Unicode case folding, which also
+    folds pairs such as ``ß`` and ``ss`` that filesystems keep apart, and on
+    Windows trailing dots/spaces), or that reach one entry on disk under
+    different names (8.3 short names)
   * disallowed member types (symlink, hardlink, device, fifo, sparse)
   * zip-bomb (enforced streaming, per-file and per-total budgets, and a
     limit on every byte read or decompressed, whatever the headers say)
@@ -145,7 +146,7 @@ def path_parts(normalized: str) -> list[str]:
 
 
 def member_path_key(parts: list[str]) -> str:
-    """Collision key for a member path, as a case-insensitive filesystem sees it.
+    """Collision key for a member path: NFC and full Unicode case folding.
 
     Names are compared after NFC normalisation and full Unicode case folding
     (``str.casefold``), as NTFS and APFS compare names case-insensitively and
@@ -2147,7 +2148,7 @@ def extract_signer_manifests(tar_path: Path | str) -> Mapping[str, bytes]:
     ``signers/<signer_id>.json`` file present in the archive.
 
     Returns an empty ``MappingProxyType`` if no ``signers/`` directory exists.
-    Spec §5: used during signature verification to locate signer manifests.
+    A read-only accessor for the signer manifests (spec §5).
     It makes one pass over the archive with the header checks of
     :func:`unpack` other than the name checks, at the default policy (see
     :func:`_members`). When several regular files have the name, the last one

@@ -2364,7 +2364,7 @@ def test_changed_headers_are_refused_or_read_within_the_limit(
     assert "ok" in outcomes and "SecurityError" in outcomes
 
 
-# ---------- A1: collisions after normalisation ----------
+# ---------- collisions after normalisation ----------
 
 WIN32_STRIPS_TRAILING = pytest.mark.skipif(
     sys.platform != "win32", reason="only Win32 drops trailing dots and spaces from names"
@@ -2447,7 +2447,7 @@ def test_explicit_directory_entries_do_not_count_as_collisions(tmp_path: Path) -
     assert (dest / "manifest.json").read_bytes() == b"{}"
 
 
-# ---------- A8: a failed unpack leaves the destination as it was ----------
+# ---------- a failed unpack leaves the destination as it was ----------
 
 
 def _tree(root: Path) -> dict[str, bytes | None]:

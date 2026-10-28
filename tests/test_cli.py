@@ -683,7 +683,7 @@ def test_sign_ed25519_round_trip_produces_verifiable_tar(tmp_path: Path) -> None
     assert result.envelopes[0].package_canonical_hash == _pkg_canonical_hash(pkg)
 
 
-# ---------- A2: signing never writes secret key material ----------
+# ---------- signing never writes secret key material ----------
 
 
 def _sign_algorithm_choices() -> list[str]:
@@ -768,7 +768,7 @@ def test_sign_cmd_refuses_hmac_even_when_called_directly(
     assert not out.exists()
 
 
-# ---------- A5: malformed signer key -> typed error ----------
+# ---------- malformed signer key -> typed error ----------
 
 
 @pytest.mark.parametrize("key", [b"x" * 31, b"x" * 33], ids=["short", "long"])
@@ -801,7 +801,7 @@ def test_sign_malformed_ed25519_key_emits_signer_malformed(
     assert not out.exists()
 
 
-# ---------- A7: --signer-id must name a file inside signers/ ----------
+# ---------- --signer-id must name a file inside signers/ ----------
 
 
 @pytest.mark.parametrize(
