@@ -839,6 +839,59 @@ def test_a_pass_over_an_archive_hands_tarfile_a_bounded_number_of_bytes(
     assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
 
 
+def _ends_at_the_end_cases() -> list:
+    """(build, format, reads that find the end of the archive per pass) per case."""
+    cases = [
+        ("member-ending-on-a-block-no-end-blocks", lambda: _file(b"a.md", b"a" * 512), 2),
+        ("padded-member-no-end-blocks", lambda: _file(b"a.md", b"a" * 1000), 2),
+        ("one-end-block-only", lambda: _file(b"a.md", b"a") + bytes(512), 1),
+    ]
+    return [
+        *[
+            pytest.param(build, fmt, eof_reads, id=f"{name}-{fmt}")
+            for fmt in ("tar", "gz")
+            for name, build, eof_reads in cases
+        ],
+        pytest.param(
+            lambda: _file(b"a.md", b"a") + _raw_header(b"b.md", 0), "tar", 2,
+            id="empty-last-member-no-end-blocks-tar",
+        ),
+        pytest.param(
+            lambda: _file(b"a.md", b"a") + _raw_header(b"d/", 0, b"5"), "tar", 2,
+            id="directory-last-no-end-blocks-tar",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("build, fmt, eof_reads", _ends_at_the_end_cases())
+def test_an_archive_whose_last_member_ends_where_the_archive_ends_is_read(
+    tmp_path: Path,
+    passes: list,
+    build: Callable[[], bytes],
+    fmt: str,
+    eof_reads: int,
+) -> None:
+    """All platforms and Python versions: an archive whose last member's
+    data, padded to a whole block, ends where the archive ends, with no
+    end-of-archive block or only one, is read by every entry point. Each
+    pass hands tarfile the whole archive and nothing more, and finds the
+    end of the archive ``eof_reads`` times: when tarfile looks for another
+    header (only with no end block), and when the bytes after the last
+    member are checked."""
+    raw = build()
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compress(raw, fmt))
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    for entry, call in calls.items():
+        passes.clear()
+        assert _outcome(call) == "ok", entry
+        assert passes, entry
+        for reader in passes:
+            assert reader.handed == len(raw), (entry, reader.handed)
+            assert reader._eof_reads == eof_reads, (entry, reader._eof_reads)
+    assert (tmp_path / "dest" / "a.md").read_bytes()[:1] == b"a"
+
+
 def test_xz_archive_needing_more_decoder_memory_than_the_limit_is_refused(
     tmp_path: Path, passes: list
 ) -> None:
