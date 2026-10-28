@@ -155,7 +155,10 @@ the record of what a bump would carry.
   character, and a member whose header blocks then take more than H is
   refused (`PX_E_6013`) too. Asking for more, or
   reading on after reaching the end of the archive 8 times, fails before
-  another byte is handed out. So one pass hands `tarfile` at most
+  another byte is handed out. An archive that ends before the end of the
+  data a member's header declares fails (`PX_E_6013`) at the first read
+  that finds its end, however much is missing, on every Python release.
+  So one pass hands `tarfile` at most
   `max_total_bytes` plus H + 511 bytes per `max_files` member plus H +
   1,024 bytes: 150,932,720 bytes at the default policy. A decompressing
   reader (gzip, bzip2, zstd) may decompress up to `io.DEFAULT_BUFFER_SIZE`

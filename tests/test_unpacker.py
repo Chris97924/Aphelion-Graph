@@ -794,6 +794,10 @@ def _bounded_cases() -> list:
             ErrorCode.ARCHIVE_BOMB, 512 + 4096, policy_bound, id="cut-short-in-the-data",
         ),
         pytest.param(
+            lambda: _raw_header(b"signatures.jsonl", 1000) + bytes(512), "tar", None,
+            ErrorCode.ARCHIVE_BOMB, 1024, every, id="cut-short-by-less-than-a-block",
+        ),
+        pytest.param(
             lambda: _raw_header(b"a.bin", 25 * MIB) + bytes(512), "tar", None,
             ErrorCode.COMPRESSION_RATIO_EXCEEDED, 1024, policy_bound,
             id="ratio-1KB-archive-declaring-25MiB",

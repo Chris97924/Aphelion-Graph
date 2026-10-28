@@ -264,8 +264,10 @@ class _ForwardReader:
     It has ``read`` only, no ``seek`` or ``tell``: tarfile's stream mode
     (``r|``) never seeks the file it reads. ``limit`` is how far tarfile may
     read; a read at ``limit`` fails with ARCHIVE_BOMB without handing out
-    anything, and so does a read after ``_MAX_EOF_READS`` have found the end
-    of the archive. ``handed`` counts the bytes handed out. ``kept`` holds
+    anything, and so does a read that finds the end of the archive before
+    ``mark`` (where the data of the member before ends, as its header
+    declares) or after ``_MAX_EOF_READS`` have found it, on every Python
+    release. ``handed`` counts the bytes handed out. ``kept`` holds
     those from ``mark`` on, at most ``window`` of them: the header blocks
     after the member before, which the checks read again themselves. An
     error of the decompressor for damaged or cut-short data (one of
@@ -323,7 +325,7 @@ class _ForwardReader:
             ) from exc
         if not data:
             self._eof_reads += 1
-            if self._eof_reads > _MAX_EOF_READS:
+            if self.handed < self.mark or self._eof_reads > _MAX_EOF_READS:
                 raise _archive_bomb(
                     "the archive ends before the data its headers declare"
                 )
@@ -473,7 +475,10 @@ def _members(
     H + _GLOBAL_HEADER_BYTES`` bytes (150,932,720 at the default policy); a
     decompressing file object may decompress up to
     ``io.DEFAULT_BUFFER_SIZE`` more ahead of what it hands out. tarfile
-    keeps no list of the members it has read.
+    keeps no list of the members it has read. An archive that ends before
+    ``E_k`` fails with ARCHIVE_BOMB when the read of member k's data, or of
+    what follows it, finds its end, however much is missing and whichever
+    Python release reads it.
 
     Refused, before the scan moves past the member, in this order: a
     negative size (in the member's header, a header before it or a pax
