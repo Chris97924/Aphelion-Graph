@@ -1264,7 +1264,11 @@ def _header_chain_cases() -> list:
     }
     b = _file(b"b.md", b"b")
     return [
-        pytest.param(raw + b + END, outcome, id=name) for name, (raw, outcome) in cases.items()
+        pytest.param(
+            raw + b + END, outcome, FIRST_LIMIT if raw[:512] != a[:512] else len(a) + HEADER_BYTES,
+            id=name,
+        )
+        for name, (raw, outcome) in cases.items()
     ]
 
 
@@ -1302,42 +1306,94 @@ def _typed_by_release_cases() -> list:
         a + before["pax"] + _raw_header(b"d/", 1024, b"\0") + signatures, refused
     )
     # With no extension header before it, every release reads it as a
-    # directory, so the block after it is a header (here a symlink).
+    # directory with no data, and some tar programs as one followed by as
+    # much data as its size says, so a size other than 0 is refused.
     cases["no-extension-header-symlink"] = (a + slash + block["symlink"], refused)
+    cases["no-extension-header-size-1-first-member"] = (
+        _raw_header(b"d/", 1, b"\0") + _padded(b"x"), refused
+    )
+    cases["no-extension-header-signatures"] = (
+        a + _raw_header(b"d/", 1024, b"\0") + signatures, refused
+    )
     cases["no-extension-header-directory"] = (
         a + _raw_header(b"d/", 0, b"\0") + _file(b"d/c.md", b"c"), "ok"
     )
+    cases["no-extension-header-directory-first-member"] = (
+        _raw_header(b"d/", 0, b"\0") + _file(b"d/c.md", b"c"), "ok"
+    )
+    cases["directory-with-a-size"] = (a + _raw_header(b"d/", 512, b"5") + block["file"], "ok")
     cases["after-pax-old-form-file"] = (
         a + _pax({"path": "q.md"}) + _raw_header(b"q.md", 3, b"\0") + _padded(b"qqq"), "ok"
     )
     cases["after-pax-directory"] = (a + _pax({"path": "e"}) + _raw_header(b"e/", 0, b"5"), "ok")
     b = _file(b"b.md", b"b")
-    return [
-        pytest.param(raw + b + END, outcome, id=name) for name, (raw, outcome) in cases.items()
-    ]
+    params = []
+    for name, (raw, outcome) in cases.items():
+        full = raw + b + END
+        if outcome == "ok":
+            bound = len(full) - len(END) + HEADER_BYTES  # b.md is the last member
+        else:
+            bound = FIRST_LIMIT if raw[:512] != a[:512] else len(a) + HEADER_BYTES
+        params.append(pytest.param(full, outcome, bound, id=name))
+    return params
 
 
-@pytest.mark.parametrize("raw, expected", _typed_by_release_cases())
+@pytest.mark.parametrize("raw, expected, bound", _typed_by_release_cases())
 def test_a_header_whose_type_depends_on_the_release_is_refused(
-    tmp_path: Path, passes: list, raw: bytes, expected: str
+    tmp_path: Path, passes: list, raw: bytes, expected: str, bound: int
 ) -> None:
     """All platforms and Python versions: a member's type is read from its
     own header. A regular-file header in the old form (NUL typeflag) whose
     name field ends in '/' is a directory where it is the member's first
-    header, as every release reads it; after a pax (x, X or g) or GNU
-    long-name (L or K) header, releases differ (a directory on some, a
-    regular file followed by its data on others), so it is refused
-    (PX_E_6008) by every entry point, whatever the block after it holds.
-    Headers every release types alike are read as before."""
+    header, as every release reads it, and is refused (PX_E_6008) if its
+    size field is not 0, which tar programs read differently (as a
+    directory with no data, or followed by that many bytes); after a pax
+    (x, X or g) or GNU long-name (L or K) header, releases differ (a
+    directory on some, a regular file followed by its data on others), so
+    it is refused (PX_E_6008) by every entry point, whatever the block after
+    it holds. Headers every release types alike are read as before. tarfile
+    is handed no more than H bytes past the end of the last member read
+    (H + 1,024 from the start, before the first)."""
     archive = tmp_path / "a.tar"
     archive.write_bytes(raw)
     calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
     for entry, call in calls.items():
         passes.clear()
         assert _outcome(call) == expected, entry
-        assert all(reader.handed <= len(raw) for reader in passes), entry
+        assert all(reader.handed <= bound for reader in passes), entry
     left = {"a.tar"} | ({"dest"} if expected == "ok" else set())
     assert {p.name for p in tmp_path.iterdir()} == left
+
+
+def test_refusals_of_what_releases_type_or_size_differently_name_no_path(
+    tmp_path: Path,
+) -> None:
+    """All platforms and Python versions: the refusals of a header that
+    releases read as different types, and of a negative size, say where in
+    the archive the header is and give no member path, so their message is
+    the same on every release (the member's name, which these releases
+    give differently, is not used)."""
+    from aphelion.unpacker import check_member_names
+
+    a = _file(b"a.md", b"a")
+    slash = _raw_header(b"d/", 512, b"\0")
+    cases = {
+        "the header at byte 2048 has a NUL typeflag and a name field ending in '/' ('d/')": (
+            a + _pax({"comment": "c"}) + slash + _raw_header(b"c.md", 0)
+        ),
+        "the header at byte 1024 has a NUL typeflag, a name field ending in '/' ('d/') "
+        "and a size of 512": a + slash + _raw_header(b"c.md", 0),
+        "a header at byte 1024 declares a negative size -1": (
+            a + _pax({"size": "-1"}) + slash + _raw_header(b"c.md", 0)
+        ),
+    }
+    archive = tmp_path / "a.tar"
+    for message, raw in cases.items():
+        archive.write_bytes(raw + END)
+        with pytest.raises(SecurityError) as exc:
+            check_member_names(archive)
+        assert str(exc.value.msg).startswith(message), exc.value.msg
+        assert exc.value.path is None
 
 
 @pytest.mark.parametrize("change", ["type", "size"])
@@ -1370,9 +1426,9 @@ def test_a_member_tarfile_reports_otherwise_than_its_header_is_refused(
 
 
 @pytest.mark.parametrize("fmt", ["tar", "gz"])
-@pytest.mark.parametrize("raw, expected", _header_chain_cases())
+@pytest.mark.parametrize("raw, expected, bound", _header_chain_cases())
 def test_every_header_before_a_member_is_read_from_the_bytes(
-    tmp_path: Path, passes: list, raw: bytes, expected: str, fmt: str
+    tmp_path: Path, passes: list, raw: bytes, expected: str, bound: int, fmt: str
 ) -> None:
     """All platforms and Python versions: every header block before a
     member's data, the member's own header included, and the records of
@@ -1381,15 +1437,277 @@ def test_every_header_before_a_member_is_read_from_the_bytes(
     negative size in any of them is refused (PX_E_6010), as is a size
     given in any of those pax headers; a GNU.sparse.* key in any of them is
     refused as sparse (PX_E_6008). Every entry point gives the same
-    outcome on every release, within the pass bound."""
+    outcome on every release, with tarfile handed no more than H bytes past
+    the end of the last member read (H + 1,024 before the first)."""
     archive = tmp_path / f"a.tar.{fmt}"
     archive.write_bytes(_compress(raw, fmt))
     calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
     for entry, call in calls.items():
         passes.clear()
         assert _outcome(call) == expected, entry
-        assert all(reader.handed <= len(raw) for reader in passes), entry
+        assert all(reader.handed <= bound for reader in passes), entry
     assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
+def _whole_or_not() -> dict[str, tuple[bytes, bool]]:
+    """Pax header data, after a whole record, and whether every record in
+    it is whole: a length of 1 to 20 digits and a space, of at least 5
+    bytes and within the data, a key that is not empty followed by '=', and
+    a newline at its end. tarfile from Python 3.10.15, 3.11.10 and 3.12.6
+    on fails on one that is not; before, it stops reading the records
+    there, or reads them differently, and reads on."""
+    c = _pax_record("comment", "c")
+    return {
+        "no-digits": (c + b"x comment=c\n", False),
+        "leading-space": (c + b" 13 comment=c\n", False),
+        "plus-sign": (c + b"+13 comment=c\n", False),
+        "arabic-indic-digits": (c + "١٣".encode() + b" comment=c\n", False),
+        "21-digits": (c + b"%021d comment=c\n" % 32, False),
+        "no-space": (c + b"13comment=c\n", False),
+        "length-0": (c + b"0 comment=c\n", False),
+        "length-0-no-equals": (c + b"0 \n", False),
+        "length-1": (c + b"1 x=c\n", False),
+        "length-4": (c + b"4 a=\n" + c, False),
+        "past-the-data": (c + b"600 comment=c\n", False),
+        "one-byte-short": (c + b"12 comment=c\n", False),
+        "no-newline": (c + b"13 comment=cc", False),
+        "no-equals-then-a-record": (c + b"9 comment\n" + _pax_record("path", "p.md"), False),
+        "no-equals": (c + b"9 comment\n", False),
+        "empty-key": (c + b"5 =c\n", False),
+        "junk-after-the-records": (c + b"junk", False),
+        "size-after-a-short-record": (c + b"5 a=b9 size=1\n", False),
+        "negative-size-after-a-short-record": (c + b"5 a=b11 size=-1\n", False),
+        "20-digits": (c + b"%020d comment=c\n" % 31, True),
+        "two-spaces": (c + b"14  comment=c\n", True),
+        "nul-in-a-value": (c + _pax_record("comment", "c\0d"), True),
+        "nul-after-the-records": (c + b"\0junk", True),
+    }
+
+
+@pytest.mark.parametrize("fmt", ["tar", "gz"])
+@pytest.mark.parametrize("typeflag", [b"x", b"g"])
+@pytest.mark.parametrize("first", [True, False], ids=["first-member", "later-member"])
+@pytest.mark.parametrize("data, whole", _whole_or_not().values(), ids=_whole_or_not().keys())
+def test_a_pax_record_that_is_not_whole_is_a_read_error_on_every_release(
+    tmp_path: Path, passes: list, data: bytes, whole: bool, typeflag: bytes, first: bool, fmt: str
+) -> None:
+    """All platforms and Python versions: a pax header (local or global)
+    with a record that is not whole is a read error (tarfile.ReadError) for
+    every entry point, whether this release's tarfile fails on it or stops
+    reading its records there and reads on; one whose records are all
+    whole is read. tarfile is handed no more than H bytes past the end of
+    the last member read (H + 1,024 before the first)."""
+    a = _file(b"a.md", b"a")
+    raw = (b"" if first else a) + _pax_declaring(data, len(data), typeflag) + _file(b"b.md", b"b")
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compress(raw + END, fmt))
+    expected = "ok" if whole else "ReadError"
+    bound = len(raw) + HEADER_BYTES if whole else FIRST_LIMIT if first else len(a) + HEADER_BYTES
+    for entry, call in _entries(archive, tmp_path / "dest", ExtractPolicy.default()).items():
+        passes.clear()
+        assert _outcome(call) == expected, entry
+        assert all(reader.handed <= bound for reader in passes), entry
+
+
+@pytest.mark.parametrize("data, whole", _whole_or_not().values(), ids=_whole_or_not().keys())
+def test_records_that_are_not_whole_are_found_where_tarfile_reads_on(
+    monkeypatch: pytest.MonkeyPatch, data: bytes, whole: bool
+) -> None:
+    """All platforms and Python versions: the header walk finds a pax
+    record that is not whole where it is told this release's tarfile reads
+    on past one (as before Python 3.10.15, 3.11.10 and 3.12.6); where it is
+    not, this release's tarfile fails on the header itself."""
+    import aphelion.unpacker as unpacker
+
+    raw = _pax_declaring(data, len(data)) + _file(b"b.md", b"b") + END
+    monkeypatch.setattr(unpacker, "_PAX_READ_ON", True)
+    assert unpacker._header_chain(raw, 0)[4] == (None if whole else (0, True))
+    monkeypatch.undo()
+    if not unpacker._PAX_READ_ON and not whole:
+        with pytest.raises(tarfile.ReadError):
+            tarfile.open(fileobj=io.BytesIO(raw), mode="r|").next()
+
+
+def _read_alike_cases() -> list:
+    """Pax headers whose records are whole but which Python releases read
+    differently: the encoding of the names in a header (``hdrcharset``),
+    which tarfile from Python 3.10.15, 3.11.10 and 3.12.6 on takes from the
+    header's first hdrcharset record and before from the first match found
+    anywhere in its data (failing if that is not UTF-8), or from a global
+    header's for the headers after it; and GNU sparse 0.0 offsets and sizes,
+    which tarfile from those releases on reads with int() from the records
+    named so (failing if it cannot) and before as digits found anywhere in
+    the data."""
+    p = _pax_record("path", "p.md")
+    c = _pax_record("comment", "c")
+    error = "ReadError"
+    sparse = str(ErrorCode.DISALLOWED_MEMBER_TYPE)
+    sparse_size = _pax_record("GNU.sparse.size", "1")
+    shapes = {
+        "charset-binary-first": (_pax_record("hdrcharset", "BINARY") + p, "ok", error),
+        "charset-utf8": (_pax_record("hdrcharset", "ISO-IR 10646 2000 UTF-8") + p, "ok", error),
+        "charset-binary-second": (
+            _pax_record("hdrcharset", "UTF-8") + _pax_record("hdrcharset", "BINARY"), "ok", error
+        ),
+        "charset-not-utf8": (c + b"16 hdrcharset=\xff\n", error, error),
+        "charset-in-a-comment": (_pax_record("comment", "1 hdrcharset=BINARY\n") + p, error, error),
+        "charset-not-utf8-in-a-comment": (c + b"27 comment=1 hdrcharset=\xff\n\n", error, error),
+        "charset-after-the-nul": (c + b"\0" + _pax_record("hdrcharset", "BINARY"), error, error),
+        "charset-in-a-comment-without-a-length": (
+            _pax_record("comment", "hdrcharset=BINARY") + p, "ok", "ok"
+        ),
+        "sparse-offset-not-a-number": (
+            sparse_size + _pax_record("GNU.sparse.offset", "abc"), error, error
+        ),
+        "sparse-offset-not-utf8": (sparse_size + b"23 GNU.sparse.offset=\xff\n", error, error),
+        "sparse-numbytes-with-a-sign": (
+            sparse_size + _pax_record("GNU.sparse.numbytes", "+1"), sparse, sparse
+        ),
+        "sparse-offset-in-a-comment": (
+            sparse_size + _pax_record("comment", "1 GNU.sparse.offset=7\n"), sparse, sparse
+        ),
+        "sparse-map-and-a-bad-offset": (
+            _pax_record("GNU.sparse.map", "0,1") + sparse_size
+            + _pax_record("GNU.sparse.offset", "abc"), sparse, sparse
+        ),
+    }
+    a = _file(b"a.md", b"a")
+    b = _file(b"b.md", b"b")
+    params = []
+    for name, (data, local, global_) in shapes.items():
+        for typeflag, expected in ((b"x", local), (b"g", global_)):
+            for first in (True, False):
+                raw = (b"" if first else a) + _pax_declaring(data, len(data), typeflag) + b + END
+                where = "first-member" if first else "later-member"
+                params.append(pytest.param(raw, expected, id=f"{name}-{typeflag.decode()}-{where}"))
+    params.append(pytest.param(
+        a + _pax({"GNU.sparse.size": "1"}, b"g") + _pax({"GNU.sparse.offset": "abc"}) + b + END,
+        error, id="sparse-size-global-offset-local",
+    ))
+    params.append(pytest.param(
+        a + _pax({"GNU.sparse.size": "1"}) + _pax({"GNU.sparse.offset": "abc"}) + b + END,
+        sparse, id="sparse-size-and-offset-in-two-local-headers",
+    ))
+    return params
+
+
+@pytest.mark.parametrize("raw, expected", _read_alike_cases())
+def test_a_pax_header_releases_read_differently_is_refused_on_every_release(
+    tmp_path: Path, raw: bytes, expected: str
+) -> None:
+    """All platforms and Python versions: a pax header whose records are
+    whole but that Python releases read differently is a read error
+    (tarfile.ReadError) for every entry point, as on the releases that
+    fail on it: a hdrcharset other than a local header's first such record
+    (any in a global header, one found elsewhere in the data, or one that
+    is not UTF-8), and, for a GNU sparse 0.0 member, an offset or size that
+    int() cannot read. Other sparse headers are refused as sparse
+    (PX_E_6008), and the encoding a local header names in its first record
+    is read as before."""
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(raw)
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
+        calls, expected
+    )
+
+
+def _stopped_at_cases() -> list:
+    """What comes first where a release stops reading the archive at a pax
+    header: a negative size before or after it, a read past what may be
+    read, and the checks of the member after it."""
+    a = _file(b"a.md", b"a")
+    b = _file(b"b.md", b"b")
+    short = _pax_record("comment", "c") + b"12 comment=c\n"  # its last byte is not a newline
+    bad = _pax_declaring(short, len(short))
+    negative = _pax_record("size", "-1")
+    far = _pax({"comment": "x" * 4000})
+    error = "ReadError"
+    too_big = str(ErrorCode.FILE_BYTES_EXCEEDED)
+    bomb = str(ErrorCode.ARCHIVE_BOMB)
+    cases = {
+        "negative-size-record-before": (a + _pax_declaring(negative + short, 40) + b, too_big),
+        "negative-size-record-after": (a + _pax_declaring(short + negative, 40) + b, error),
+        "own-negative-size-after": (a + bad + _raw_header(b"q.md", -512) + b, too_big),
+        "negative-size-header-after": (
+            a + bad + _raw_header(b"././@PaxHeader", -512, b"x") + b, too_big
+        ),
+        "then-past-the-limit": (a + bad + far + b, error),
+        "then-past-the-limit-first-member": (bad + far + far + b, error),
+        "itself-past-the-limit": (
+            a + _pax_declaring(_pax_record("comment", "x" * 4500) + b"12 comment=c\n", 4520) + b,
+            bomb,
+        ),
+        "read-differently-then-past-the-limit": (
+            a + _pax({"comment": "1 hdrcharset=BINARY\n"}) + far + b, bomb
+        ),
+        "not-utf8-charset-then-past-the-limit": (
+            a + _pax_declaring(b"16 hdrcharset=\xff\n", 16) + far + b, error
+        ),
+        "then-a-name-field-ending-in-a-slash": (a + bad + _raw_header(b"d/", 512, b"\0") + b, error),
+        "then-a-symlink": (a + bad + _raw_header(b"s.md", 0, b"2") + b, error),
+        "then-a-size": (a + bad + _pax({"size": "1"}) + b, error),
+        "after-a-long-name": (
+            a + _raw_header(b"././@LongLink", 5, b"L") + _padded(b"e.md\0") + bad + b, error
+        ),
+        "in-the-padding": (a + _pax_declaring(short, 13) + b, error),
+        "after-the-last-member": (a + bad, error),
+    }
+    return [pytest.param(raw + END, expected, id=n) for n, (raw, expected) in cases.items()]
+
+
+@pytest.mark.parametrize("fmt", ["tar", "gz", "xz"])
+@pytest.mark.parametrize("raw, expected", _stopped_at_cases())
+def test_what_comes_first_where_a_release_stops_at_a_pax_header(
+    tmp_path: Path, raw: bytes, expected: str, fmt: str
+) -> None:
+    """All platforms and Python versions: where a release stops reading the
+    archive at a pax header, every entry point reports it as that release
+    does, whether this release's tarfile stopped there or read on: a
+    negative size in the header blocks from the end of the member before
+    is refused (PX_E_6010) first, then the header is a read error
+    (tarfile.ReadError), before any check of the member after it, and also
+    where reading on would go past what may be read. A header whose own
+    data goes past that is refused (PX_E_6013), as is a header that every
+    release reads on past and that is then followed by too much."""
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compress(raw, fmt))
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
+        calls, expected
+    )
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
+@pytest.mark.parametrize(
+    "after, expected",
+    [
+        (_pax_declaring(b"13 comment=cc", 13) + _file(b"b.md", b"b"), "ReadError"),
+        (_raw_header(b"b.md", -512), str(ErrorCode.FILE_BYTES_EXCEEDED)),
+        (_file(b"b.md", b"b"), str(ErrorCode.FILE_COUNT_EXCEEDED)),
+    ],
+    ids=["record-not-whole", "negative-size", "file"],
+)
+def test_a_member_past_max_files_that_a_release_stops_at_is_refused_as_there(
+    tmp_path: Path, after: bytes, expected: str
+) -> None:
+    """All platforms and Python versions: a member past ``max_files`` is
+    refused as a release that stops reading the archive at its headers
+    reports it (a pax record that is not whole, a negative size), whether
+    this release's tarfile stopped there or reported the member; any other
+    member past ``max_files`` is refused as one too many (PX_E_6009)."""
+    from aphelion.unpacker import check_member_names
+
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(_file(b"a.md", b"a") + after + END)
+    policy = ExtractPolicy(max_files=1)
+    calls = {
+        "unpack": lambda: unpack(archive, tmp_path / "dest", policy=policy),
+        "check_member_names": lambda: check_member_names(archive, policy),
+    }
+    assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
+        calls, expected
+    )
 
 
 def _xz_needing_too_much_memory(raw: bytes) -> bytes:

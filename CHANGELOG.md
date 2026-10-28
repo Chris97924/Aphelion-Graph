@@ -167,28 +167,60 @@ the record of what a bump would carry.
 - **A member that would take a reader further than its size says is
   refused before its data is read**: a sparse member, or one after a pax
   header with a `GNU.sparse.*` key `tarfile` can parse (`PX_E_6008`); a
-  regular-file header in the old form (typeflag NUL) whose name ends in
-  `/` after a pax or GNU long-name or long-link header, which Python
-  releases read as different types (a directory, or a regular file
-  followed by its data) (`PX_E_6008`); a negative size, in the member's
-  header, in a pax or GNU long-name header before it or in a pax record,
-  and a member after a pax header with a `size` key (`PX_E_6010`); header
-  blocks that do not lead, size by size, from where the member before
-  ends to the member's own header, and a member `tarfile` reports with
-  another type or size than its own header gives (`PX_E_6013`). A pax
-  header here is any before the member, local or global, the first or a
-  later one (`tarfile` may take a member's size from a later one). These
-  header blocks, every pax record and the member's own header, with the
-  member's type and size, are read again from the bytes handed to
-  `tarfile`; only where the member's data begins is taken from `tarfile`.
-  So for the member headers the outcome (refused or not, and the code) is
-  the same on every Python release, whether its `tarfile` reports a member
+  regular-file header in the old form (typeflag NUL) whose name field
+  ends in `/` after a pax or GNU long-name or long-link header, which
+  Python releases read as different types (a directory, or a regular file
+  followed by its data) (`PX_E_6008`); such a header with no such header
+  before it, which is a directory, if its size field is not 0, as `tar`
+  programs read it as a directory with or without that many bytes of data
+  after it (`PX_E_6008`); a negative size, in the member's header, in a
+  pax or GNU long-name header before it or in a pax record, and a member
+  after a pax header with a `size` key (`PX_E_6010`); header blocks that
+  do not lead, size by size, from where the member before ends to the
+  member's own header, and a member `tarfile` reports with another type or
+  size than its own header gives (`PX_E_6013`). A pax header here is any
+  before the member, local or global, the first or a later one (`tarfile`
+  may take a member's size from a later one). A negative size, and then a
+  pax header that Python releases read differently (below), come before
+  the member's other refusals, and reading past what the header
+  allowance lets `tarfile` read (`PX_E_6013`) comes before them all; a
+  member past `max_files` is refused as a release that stops at its
+  headers reports it (a negative size, then such a pax header), else as
+  one too many (`PX_E_6009`). These header blocks, every pax record and
+  the member's own header, with the member's type and size, are read
+  again from the bytes handed to `tarfile`. Taken from `tarfile` are where
+  the member's data and its headers begin, its name (with a pax path or
+  GNU long name applied) and whether it is sparse; its type and size must
+  be what its own header gives, and where its header blocks do not lead to
+  its own header (it is then refused) its type only picks the code. So for
+  the member headers the outcome (refused or not, and the code) is the
+  same on every Python release, whether its `tarfile` reports a member
   with a negative size, skips it, stops there or reads on, and whichever
-  type it gives such a header. A package never has any of these. A
-  directory's size, if not negative, is ignored, as `tar` and `tarfile`
-  ignore it (no data follows a directory); a negative size is refused for
-  every member type. A NUL-typeflag header whose name ends in `/` with no
-  such header before it is a directory, as every release reads it.
+  type it gives such a header; the refusals of such a header and of a
+  negative size give the header's place in the archive, not the member's
+  name, so their message is the same too. A package never has any of
+  these. A directory's size, if not negative, is ignored, as `tarfile`
+  ignores it (no data follows a directory); a negative size is refused
+  for every member type. A NUL-typeflag header whose name field ends in
+  `/` with no such header before it and a size of 0 is a directory, as
+  every release and `tar` program reads it.
+- **A pax header that Python releases read differently is a read error
+  on every release** (`tarfile.ReadError`, `PX_E_9001` at the command
+  line), as on the releases that fail on it, whether this release's
+  `tarfile` fails on it or reads on: one with a record that is not whole
+  (a length that is not 1 to 20 digits followed by a space, a length under
+  5 or past the header's data, an empty key, no `=`, or a last byte that
+  is not a newline), on which `tarfile` from Python 3.10.15, 3.11.10 and
+  3.12.6 on fails, while earlier releases stop reading its records there
+  or read them differently, and read on; a `hdrcharset` record or match
+  other than a local header's first `hdrcharset` record (any in a global
+  header, or one found elsewhere in the header's data, which earlier
+  releases take as the encoding of its names, and one that is not UTF-8,
+  on which they fail); and, for a GNU sparse 0.0 member, an `offset` or
+  `numbytes` value that `int()` cannot read, on which later releases
+  fail (other sparse headers stay refused as sparse, `PX_E_6008`). A
+  local pax header whose first `hdrcharset` record names the encoding of
+  its names is read as before.
 - **What `tarfile` or the decompressor raises for a damaged archive is
   `tarfile.ReadError`**: anything `tarfile` raises while it parses a member
   header other than an operating-system or out-of-memory error (for
