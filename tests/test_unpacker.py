@@ -1202,12 +1202,14 @@ def test_pax_records_are_read_as_tarfile_reads_them(
 
 
 def _header_chain_cases() -> list:
-    """Members after more than one extension header, where tarfile keeps
-    the first pax header's keys in pax_headers but may take the member's
-    size from a later one, and their one-header counterparts."""
+    """Members after more than one extension header (pax x, X or g, GNU L
+    or K), where tarfile keeps the first pax header's keys in pax_headers
+    but may take the member's size from a later one, and their one-header
+    counterparts."""
     a = _file(b"a.md", b"a" * 10)
     comment = _pax({"comment": "c"})
     long_name = _raw_header(b"././@LongLink", 6, b"L") + _padded(b"e.md" + bytes(2))
+    long_link = _raw_header(b"././@LongLink", 5, b"K") + _padded(b"t.md\0")
     size = _pax({"size": "10"})
     realsize = _pax({"GNU.sparse.realsize": "10"})
     negative = _raw_header(b"q.md", -512) + _padded(b"q" * 10)
@@ -1251,11 +1253,120 @@ def _header_chain_cases() -> list:
         "global-size-after-a-pax-header": (
             a + comment + _pax({"size": "1"}, b"g") + _file(b"q.md", b"q"), too_big
         ),
+        "own-negative-after-a-size-in-a-second-solaris-header": (
+            a + _pax({"comment": "c"}, b"X") + _pax({"size": "10"}, b"X") + negative, too_big
+        ),
+        "realsize-in-a-solaris-header-after-a-pax-header": (
+            a + comment + _pax({"GNU.sparse.realsize": "10"}, b"X") + q, sparse
+        ),
+        "own-negative-after-a-long-link-and-a-size": (a + long_link + size + negative, too_big),
+        "size-after-a-long-link": (a + long_link + comment + size + q, too_big),
     }
     b = _file(b"b.md", b"b")
     return [
         pytest.param(raw + b + END, outcome, id=name) for name, (raw, outcome) in cases.items()
     ]
+
+
+def _typed_by_release_cases() -> list:
+    """A regular-file header in the old form (NUL typeflag) whose name field
+    ends in '/', after each kind of extension header, followed by a block
+    that is a header where that header is read as a directory and data
+    where it is read as a regular file; then the same header with no
+    extension header before it, and headers that every release types
+    alike."""
+    a = _file(b"a.md", b"a" * 10)
+    before = {
+        "pax": _pax({"path": "dir.md"}),
+        "pax-comment": _pax({"comment": "c"}),
+        "solaris": _pax({"path": "dir.md"}, b"X"),
+        "global": _pax({"comment": "c"}, b"g"),
+        "long-name": _raw_header(b"././@LongLink", 7, b"L") + _padded(b"dir.md\0"),
+        "long-link": _raw_header(b"././@LongLink", 5, b"K") + _padded(b"t.md\0"),
+    }
+    block = {
+        "symlink": _raw_header(b"s.md", 0, b"2"),
+        "parent-path": _raw_header(b"../c.md", 0),
+        "file": _raw_header(b"c.md", 0),
+        "negative": _raw_header(b"n.md", -512),
+    }
+    slash = _raw_header(b"d/", 512, b"\0")
+    refused = str(ErrorCode.DISALLOWED_MEMBER_TYPE)
+    cases = {}
+    for kind, header in before.items():
+        for content, data in block.items():
+            cases[f"after-{kind}-{content}"] = (a + header + slash + data, refused)
+            cases[f"after-{kind}-{content}-first-member"] = (header + slash + data, refused)
+    signatures = _raw_header(b"signatures.jsonl", 2) + _padded(b"x\n")
+    cases["after-pax-signatures"] = (
+        a + before["pax"] + _raw_header(b"d/", 1024, b"\0") + signatures, refused
+    )
+    # With no extension header before it, every release reads it as a
+    # directory, so the block after it is a header (here a symlink).
+    cases["no-extension-header-symlink"] = (a + slash + block["symlink"], refused)
+    cases["no-extension-header-directory"] = (
+        a + _raw_header(b"d/", 0, b"\0") + _file(b"d/c.md", b"c"), "ok"
+    )
+    cases["after-pax-old-form-file"] = (
+        a + _pax({"path": "q.md"}) + _raw_header(b"q.md", 3, b"\0") + _padded(b"qqq"), "ok"
+    )
+    cases["after-pax-directory"] = (a + _pax({"path": "e"}) + _raw_header(b"e/", 0, b"5"), "ok")
+    b = _file(b"b.md", b"b")
+    return [
+        pytest.param(raw + b + END, outcome, id=name) for name, (raw, outcome) in cases.items()
+    ]
+
+
+@pytest.mark.parametrize("raw, expected", _typed_by_release_cases())
+def test_a_header_whose_type_depends_on_the_release_is_refused(
+    tmp_path: Path, passes: list, raw: bytes, expected: str
+) -> None:
+    """All platforms and Python versions: a member's type is read from its
+    own header. A regular-file header in the old form (NUL typeflag) whose
+    name field ends in '/' is a directory where it is the member's first
+    header, as every release reads it; after a pax (x, X or g) or GNU
+    long-name (L or K) header, releases differ (a directory on some, a
+    regular file followed by its data on others), so it is refused
+    (PX_E_6008) by every entry point, whatever the block after it holds.
+    Headers every release types alike are read as before."""
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(raw)
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    for entry, call in calls.items():
+        passes.clear()
+        assert _outcome(call) == expected, entry
+        assert all(reader.handed <= len(raw) for reader in passes), entry
+    left = {"a.tar"} | ({"dest"} if expected == "ok" else set())
+    assert {p.name for p in tmp_path.iterdir()} == left
+
+
+@pytest.mark.parametrize("change", ["type", "size"])
+def test_a_member_tarfile_reports_otherwise_than_its_header_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """All platforms and Python versions: a member that tarfile reports
+    with another type or size than its own header gives (here tarfile is
+    made to report a regular file as a directory, or one byte longer) is
+    refused (PX_E_6013) by every entry point."""
+    real = tarfile.TarInfo._proc_member
+
+    def proc_member(self: tarfile.TarInfo, tar: tarfile.TarFile) -> tarfile.TarInfo:
+        member = real(self, tar)
+        if member.name == "q.md":
+            if change == "type":
+                member.type = tarfile.DIRTYPE
+            else:
+                member.size += 1
+        return member
+
+    monkeypatch.setattr(tarfile.TarInfo, "_proc_member", proc_member)
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(_file(b"a.md", b"a") + _file(b"q.md", b"q" * 10) + END)
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    assert {entry: _outcome(call) for entry, call in calls.items()} == dict.fromkeys(
+        calls, str(ErrorCode.ARCHIVE_BOMB)
+    )
+    assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
 
 
 @pytest.mark.parametrize("fmt", ["tar", "gz"])
