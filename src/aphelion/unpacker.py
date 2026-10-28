@@ -146,7 +146,8 @@ def path_parts(normalized: str) -> list[str]:
 
 
 def member_path_key(parts: list[str]) -> str:
-    """Collision key for a member path: NFC and full Unicode case folding.
+    """Collision key for a member path: NFC and full Unicode case folding
+    (and, on Windows, no trailing dots or spaces).
 
     Names are compared after NFC normalisation and full Unicode case folding
     (``str.casefold``), as NTFS and APFS compare names case-insensitively and
@@ -2148,7 +2149,8 @@ def extract_signer_manifests(tar_path: Path | str) -> Mapping[str, bytes]:
     ``signers/<signer_id>.json`` file present in the archive.
 
     Returns an empty ``MappingProxyType`` if no ``signers/`` directory exists.
-    A read-only accessor for the signer manifests (spec §5).
+    A read-only accessor for the signer manifests
+    (spec/v0.5-signer-trust.md §2.3).
     It makes one pass over the archive with the header checks of
     :func:`unpack` other than the name checks, at the default policy (see
     :func:`_members`). When several regular files have the name, the last one

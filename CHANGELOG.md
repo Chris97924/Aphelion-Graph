@@ -226,8 +226,9 @@ the record of what a bump would carry.
   `/` and the `PX_E_6010` refusals of a negative size in the header blocks
   give the header's place in the archive (and the name field), not the
   member's name, so their message is the same on every release, unless a
-  negative pax `size` has more digits than `int()` reads (which also needs
-  a `max_path_length` above the default): its member is then refused for
+  negative pax `size` has more digits than `int()` reads (which, at the
+  default limit of 4,300, also needs a `max_path_length` above the
+  default): its member is then refused for
   having its size in a pax header. A GNU
   sparse member in the old form (type `S`) whose real size is negative is
   refused with its name. The text of a `tarfile.ReadError` depends on the
@@ -319,7 +320,8 @@ the record of what a bump would carry.
   other than Windows, a library caller can still give `pack` names that
   contain NUL. Readers cut each name field at the NUL, so `unpack` writes
   such a member under another name, refuses it if nothing is left
-  (`PX_E_6006`), and refuses two that become one (`PX_E_6007`). File
+  (`PX_E_6006`) or what is left has a `..` segment (`PX_E_6001`), and
+  refuses two that become one (`PX_E_6007`). File
   names cannot contain NUL, so `aphe pack` never writes one.
 - **`aphe sign --signer-id` must be a single path component.** An empty id,
   `.`, `..`, or an id containing `/`, `\` or NUL is refused (`PX_E_6001`)
@@ -329,8 +331,9 @@ the record of what a bump would carry.
   `spec/validator.md` requires**, so a package that passed before can now
   fail: a `claim_instance_id` used by two manifest entries or emitted by two
   provenance events (`PX_E_4011`, ERR-SEM-005); an `event_id` used twice
-  (`PX_E_4012`, ERR-SEM-006); a manifest state that disagrees with the
-  claim's last event (`PX_E_5005`, ERR-SEM-013); a
+  (`PX_E_4012`, ERR-SEM-006); a superseded or withdrawn manifest state
+  that disagrees with the claim's last event, or a last supersede or
+  withdraw without that state (`PX_E_5005`, ERR-SEM-013); a
   `target_claim_instance_id` that is not the instance in force at that
   event, or a manifest `claim_instance_id` its claim's provenance never
   emitted (`PX_E_5004`); a manifest path other than `claims/<claim_id>.md`
@@ -460,27 +463,34 @@ the record of what a bump would carry.
   Windows creates a file only up to 259 characters and a directory only
   up to 247 (a member is staged 28 characters deeper, and an existing
   destination's backup directory is 53 characters longer than its path).
-  So these fail where they worked before:
+  So these fail, or leave files behind, where they worked before:
   - `unpack` of a member whose final path is a file of 232 to 259
-    characters, or a directory of 220 to 247 characters (with any file in
-    it), and of any archive into a new destination of 220 characters or
-    more or into an existing one of 195 or more, with `FileNotFoundError`
-    (`PX_E_2005` at the command line);
+    characters, or that is or lies in a directory of 220 to 247
+    characters, and of any archive into a new destination of 220
+    characters or more or into an existing one of 195 or more, with
+    `FileNotFoundError` (`PX_E_2005` at the command line);
+  - `verify_package` (`aphe verify` on a package file), which has the
+    same limits with its temporary directory as an existing destination:
+    every package fails when the directory for temporary files has a path
+    of 183 characters or more (so the directory it makes there has 195 or
+    more), with `FileNotFoundError` (`PX_E_2005`);
   - migrating a directory whose new tree would hold such a file or
     directory path, with `shutil.Error`, which the command line reports
-    as `PX_E_9001` (exit 1) with a message listing each file it could not
-    copy, and migrating one to a new destination of 220 characters or
-    more, with `FileNotFoundError` (`PX_E_2005`);
+    as `PX_E_9001` (exit 1) with a message listing each file or directory
+    it could not copy, and migrating one to a destination of 220
+    characters or more (new, or existing with `--force`), with
+    `FileNotFoundError` (`PX_E_2005`);
   - `migrate --force` over a destination that holds a file or directory
     path of 231 characters or more puts the new tree in place, but leaves
     the old one in `.<dst>.replaced-*`, with a warning naming it.
-- **A destination whose name (its last path component) is within 28
-  characters of the filesystem's 255-character name limit (255 bytes on
-  Linux) cannot be staged**, on every platform: `unpack` into a new
-  destination of such a name, and migrating a directory to one, with or
-  without `--force`, fail with `OSError` (`PX_E_9001` at the command
-  line; on Windows without long-path support such a path already fails
-  as above), and `migrate` also warns that it could not remove a staging
+- **A destination whose name (its last path component) is 228
+  characters or longer (bytes on Linux), within 27 of the 255 limit,
+  cannot be staged**, on every platform: `unpack` into a new destination
+  of such a name, and migrating a directory to one, with or without
+  `--force`, fail with `OSError` (`PX_E_9001` at the command line; on
+  Windows without long-path support such a destination's path is over
+  220 characters and already fails as above), and `migrate` also warns
+  that it could not remove a staging
   directory it never created. This limit does not apply to `unpack` into
   an existing destination.
 

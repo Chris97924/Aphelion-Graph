@@ -540,7 +540,7 @@ def test_force_does_not_follow_symlinks_inside_the_destination(tmp_path: Path) -
 @pytest.mark.skipif(
     not shutil.rmtree.avoids_symlink_attacks,
     reason=(
-        "known residual: where shutil.rmtree.avoids_symlink_attacks is false "
+        "known limit: where shutil.rmtree.avoids_symlink_attacks is false "
         "(Windows), rmtree cannot detect a directory replaced mid-removal"
     ),
 )
