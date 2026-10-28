@@ -17,12 +17,14 @@ import base64
 import hashlib
 import io
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from aphelion.canonical_json import dumps as canonical_dumps
 from aphelion.canonical_json import normalize
+from aphelion.error_codes import ErrorCode
 from aphelion.signer import (
     HMACSigner,
     SignatureEnvelope,
@@ -578,7 +580,9 @@ def test_validate_signatures_non_regular_manifest_member(tmp_path: Path) -> None
     assert not isinstance(exc_info.value, AttributeError)
 
     # Verify under -O semantics: assert statements are stripped, so the guard
-    # must hold without relying on `assert`. Re-import the validator under -O.
+    # must hold without relying on `assert`. Re-import the validator under -O,
+    # from where this process imports it (the package need not be installed).
+    import os
     import subprocess
     import sys
     import textwrap
@@ -600,6 +604,7 @@ def test_validate_signatures_non_regular_manifest_member(tmp_path: Path) -> None
         [sys.executable, "-O", "-c", script],
         capture_output=True,
         text=True,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(str(p) for p in sys.path if p)},
     )
     assert proc.returncode == 0, (
         f"under -O expected typed AphelionError (rc=0), got rc={proc.returncode}\n"
@@ -747,6 +752,38 @@ def test_verify_with_require_signed_rejects_unsigned(tmp_path: Path) -> None:
     with pytest.raises(SignerVerificationError) as exc_info:
         verify_package(tar_path, require_signed=True)
     assert exc_info.value.code == "E_SIGNER_REQUIRED"
+
+
+@pytest.mark.integration
+def test_verify_with_require_notary_alone_rejects_unsigned(tmp_path: Path) -> None:
+    """require_notary=True implies require_signed, as ``aphe verify
+    --require-notary`` does: an unsigned package → E_SIGNER_REQUIRED."""
+    from aphelion.verifier import verify_package
+
+    src = tmp_path / "src"
+    _build_minimal_source(src)
+    tar_path = tmp_path / "pkg.tar"
+    _pack_source(src, tar_path)
+
+    with pytest.raises(SignerVerificationError) as exc_info:
+        verify_package(tar_path, require_notary=True)
+    assert exc_info.value.code == "E_SIGNER_REQUIRED"
+    assert "--require-notary" in str(exc_info.value)
+
+
+@pytest.mark.integration
+def test_require_notary_alone_on_a_signed_package_checks_its_attestation(
+    tmp_path: Path,
+) -> None:
+    """require_notary=True without require_signed on a signed package: the
+    attestation is checked as before (local only → E_SIGNER_NOTARY_REQUIRED)."""
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+
+    with pytest.raises(SignerVerificationError) as exc_info:
+        verify_package(tar_path, require_notary=True)
+    assert exc_info.value.code == "E_SIGNER_NOTARY_REQUIRED"
 
 
 @pytest.mark.integration
@@ -1061,6 +1098,7 @@ def test_validate_signatures_algorithm_mismatch_envelope_ed25519_manifest_hmac(
 @pytest.mark.integration
 def test_cli_sign_twice_same_signer_preserves_both_envelopes(tmp_path: Path) -> None:
     """Re-signing with the same signer_id appends rather than replacing prior envelope."""
+    pytest.importorskip("cryptography", reason="aphe sign uses ed25519")
     import contextlib
 
     src = tmp_path / "src"
@@ -1082,7 +1120,7 @@ def test_cli_sign_twice_same_signer_preserves_both_envelopes(tmp_path: Path) -> 
             "sign",
             "--package", str(tar_path),
             "--signer-id", SIGNER_ID,
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(key_file),
             "--out", str(signed_v1),
         ])
@@ -1094,7 +1132,7 @@ def test_cli_sign_twice_same_signer_preserves_both_envelopes(tmp_path: Path) -> 
             "sign",
             "--package", str(signed_v1),
             "--signer-id", SIGNER_ID,
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(key_file),
             "--out", str(signed_v2),
         ])
@@ -1237,6 +1275,7 @@ def test_verify_package_extracts_signer_manifests_once(
 @pytest.mark.integration
 def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
     """aphe sign then aphe verify --require-signed → success end-to-end."""
+    pytest.importorskip("cryptography", reason="aphe sign uses ed25519")
     import contextlib
 
     src = tmp_path / "src"
@@ -1244,7 +1283,7 @@ def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
     tar_path = tmp_path / "pkg.tar"
     _pack_source(src, tar_path)
 
-    # Write HMAC key to file
+    # SHARED_SECRET is 32 bytes: a valid raw Ed25519 private key.
     key_file = tmp_path / "key.bin"
     key_file.write_bytes(SHARED_SECRET)
 
@@ -1259,7 +1298,7 @@ def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
             "sign",
             "--package", str(tar_path),
             "--signer-id", SIGNER_ID,
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(key_file),
             "--out", str(signed_path),
         ])
@@ -1270,3 +1309,332 @@ def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
     with contextlib.redirect_stdout(out2), contextlib.redirect_stderr(err2):
         code2 = main(["verify", str(signed_path), "--require-signed"])
     assert code2 == 0, f"aphe verify --require-signed failed: {err2.getvalue()}"
+
+
+# ---------------------------------------------------------------------------
+# Member names that collide after normalisation are rejected before
+# verification and before extraction.
+# ---------------------------------------------------------------------------
+
+
+def _append_members(tar_path: Path, members: list[tuple[str, bytes]]) -> None:
+    """Append raw members after the existing ones, not through canonical_tar."""
+    import tarfile
+
+    with tarfile.open(tar_path, mode="a", format=tarfile.USTAR_FORMAT) as tar:
+        for name, data in members:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(data))
+
+
+def _replacement_manifest_and_claim() -> tuple[bytes, bytes]:
+    """A self-consistent manifest + claim that differ from the signed ones."""
+    claim = _claim_bytes(title="Replaced Claim")
+    manifest = {
+        "aphelion_spec_version": "0.4.0",
+        "claims": [
+            {
+                "claim_id": UUID_CLAIM_A,
+                "claim_instance_id": UUID_INSTANCE_A,
+                "hash": hashlib.sha256(claim).hexdigest(),
+                "path": f"claims/{UUID_CLAIM_A}.md",
+                "state": "active",
+            }
+        ],
+        "created_at": "2026-04-21T00:00:00Z",
+        "format_version": "2.0",
+        "license": "Apache-2.0",
+        "package_id": UUID_PKG,
+        "producer": "aphelion-test",
+        "provenance_path": "provenance.jsonl",
+    }
+    return canonical_dumps(normalize(manifest)), claim
+
+
+@pytest.mark.parametrize(
+    "manifest_name, claim_name",
+    [
+        ("./manifest.json", f"./claims/{UUID_CLAIM_A}.md"),
+        ("Manifest.json", f"Claims/{UUID_CLAIM_A}.md"),
+        ("MANIFEST.JSON", f"claims//{UUID_CLAIM_A}.md"),
+        ("./manifest.json", f"claims/./{UUID_CLAIM_A}.md"),
+        pytest.param(
+            "manifest.json.",
+            f"claims/{UUID_CLAIM_A}.md ",
+            marks=pytest.mark.skipif(
+                sys.platform != "win32", reason="only Win32 drops trailing dots and spaces"
+            ),
+        ),
+    ],
+)
+def test_signed_package_with_colliding_second_manifest_rejected(
+    tmp_path: Path, manifest_name: str, claim_name: str
+) -> None:
+    """Appending a second manifest + claim under a name that only differs by
+    a leading ./, a doubled or ./ separator, case, or a Windows-stripped
+    trailing dot/space must not pass signed verification."""
+    from aphelion.errors import SecurityError
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    assert verify_package(tar_path, require_signed=True).envelopes  # sanity
+
+    manifest, claim = _replacement_manifest_and_claim()
+    _append_members(tar_path, [(manifest_name, manifest), (claim_name, claim)])
+
+    with pytest.raises(SecurityError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+
+
+def test_validate_signatures_rejects_colliding_member_names(tmp_path: Path) -> None:
+    """validate_signatures is public and reads the tar directly, so it must
+    apply the same collision check rather than trust getmember()."""
+    from aphelion.errors import SecurityError
+    from aphelion.validator import validate_signatures
+
+    tar_path = _make_signed_tar(tmp_path)
+    manifest, _ = _replacement_manifest_and_claim()
+    _append_members(tar_path, [("./manifest.json", manifest)])
+
+    with pytest.raises(SecurityError) as exc:
+        validate_signatures(tar_path)
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
+
+
+# ---------------------------------------------------------------------------
+# Malformed signer input yields typed errors, never raw TypeError /
+# ValueError, and base64 is decoded strictly.
+# ---------------------------------------------------------------------------
+
+
+def _rewrite_member(tar_path: Path, name: str, data: bytes) -> None:
+    from aphelion.canonical_tar import TarMember, read_members
+    from aphelion.canonical_tar import pack as tar_pack
+
+    members = [m for m in read_members(tar_path.read_bytes()) if m.path != name]
+    members.append(TarMember(path=name, data=data, is_dir=False))
+    tar_path.write_bytes(tar_pack(members))
+
+
+def _signer_manifest_dict(tar_path: Path) -> dict:
+    from aphelion.canonical_tar import read_members
+
+    member = next(
+        m for m in read_members(tar_path.read_bytes())
+        if m.path == f"signers/{SIGNER_ID}.json"
+    )
+    assert member.data is not None
+    return json.loads(member.data)
+
+
+def _with_signer_fields(tar_path: Path, **fields: object) -> None:
+    raw = _signer_manifest_dict(tar_path)
+    raw.update(fields)
+    _rewrite_member(
+        tar_path,
+        f"signers/{SIGNER_ID}.json",
+        json.dumps(raw, sort_keys=True).encode("utf-8"),
+    )
+
+
+def _with_envelope_fields(tar_path: Path, **fields: str) -> None:
+    from aphelion.canonical_tar import read_members
+
+    member = next(
+        m for m in read_members(tar_path.read_bytes()) if m.path == "signatures.jsonl"
+    )
+    assert member.data is not None
+    raw = json.loads(member.data)
+    raw.update(fields)
+    _rewrite_member(
+        tar_path,
+        "signatures.jsonl",
+        json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n",
+    )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"public_key_b64": 12345},
+        {"public_key_b64": None},
+        {"public_key_b64": ["AAAA"]},
+        {"key_fingerprint": 12345},
+        {"key_fingerprint": "é" * 64},
+        {"key_fingerprint": "A" * 64},  # upper-case hex is not §2.3 form
+        {"signer_id": 7},
+        {"algorithm": ["hmac-sha256"]},
+        {"notary_uri": 42},
+    ],
+    ids=[
+        "pubkey-int", "pubkey-null", "pubkey-list", "fp-int", "fp-non-ascii",
+        "fp-uppercase", "signer-id-int", "algorithm-list", "notary-uri-int",
+    ],
+)
+def test_malformed_signer_manifest_fields_raise_signer_malformed(
+    tmp_path: Path, fields: dict
+) -> None:
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    _with_signer_fields(tar_path, **fields)
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"[]", b"null", b'"x"', b"42"],
+    ids=["list", "null", "string", "number"],
+)
+def test_signer_manifest_that_is_not_an_object_raises_signer_malformed(
+    tmp_path: Path, payload: bytes
+) -> None:
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    _rewrite_member(tar_path, f"signers/{SIGNER_ID}.json", payload)
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+@pytest.mark.parametrize("junk", ["!!", "\n", " ", "*"])
+def test_public_key_b64_with_trailing_junk_rejected(tmp_path: Path, junk: str) -> None:
+    """A lenient decoder drops non-alphabet characters, so the fingerprint would
+    still recompute; the spec requires base64-standard, so reject."""
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    raw = _signer_manifest_dict(tar_path)
+    _with_signer_fields(tar_path, public_key_b64=raw["public_key_b64"] + junk)
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+def test_signature_b64_with_trailing_junk_rejected(tmp_path: Path) -> None:
+    from aphelion.verifier import verify_package
+
+    from aphelion.canonical_tar import read_members
+
+    tar_path = _make_signed_tar(tmp_path)
+
+    env = json.loads(next(
+        m.data for m in read_members(tar_path.read_bytes()) if m.path == "signatures.jsonl"
+    ))
+    _with_envelope_fields(tar_path, signature_b64=env["signature_b64"] + "!!")
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+def test_non_ascii_envelope_hash_raises_signature_malformed(tmp_path: Path) -> None:
+    """hmac.compare_digest raises TypeError on non-ASCII str input."""
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    _with_envelope_fields(tar_path, package_canonical_hash="é" * 64)
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNATURE_MALFORMED"
+
+
+def test_ed25519_public_key_of_wrong_length_raises_signer_malformed(
+    tmp_path: Path,
+) -> None:
+    """A 31-byte key with a matching fingerprint reaches from_public_bytes,
+    which raises a raw ValueError."""
+    pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
+    from aphelion.signer import Ed25519Signer
+    from aphelion.verifier import verify_package
+
+    signer = Ed25519Signer(
+        signer_id=SIGNER_ID,
+        private_key_b64=base64.standard_b64encode(SHARED_SECRET).decode("ascii"),
+    )
+    tar_path = _make_signed_tar(tmp_path, signer=signer)  # type: ignore[arg-type]
+    short = b"\x01" * 31
+    _with_signer_fields(
+        tar_path,
+        public_key_b64=base64.standard_b64encode(short).decode("ascii"),
+        key_fingerprint=compute_key_fingerprint(short),
+    )
+
+    with pytest.raises(SignerVerificationError) as exc:
+        verify_package(tar_path, require_signed=True)
+    assert exc.value.code == "E_SIGNER_MALFORMED"
+
+
+# ---------------------------------------------------------------------------
+# Each call reads the package a fixed number of times.
+# ---------------------------------------------------------------------------
+
+
+def _count_passes(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Every reader tarfile reads a package through from now on, one per pass."""
+    import aphelion.unpacker as unpacker
+
+    made: list = []
+    real_init = unpacker._ForwardReader.__init__
+
+    def init(self: object, *args: object, **kwargs: object) -> None:
+        real_init(self, *args, **kwargs)
+        made.append(self)
+
+    monkeypatch.setattr(unpacker._ForwardReader, "__init__", init)
+    return made
+
+
+@pytest.mark.integration
+def test_signature_checks_read_the_package_a_fixed_number_of_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """validate_signatures reads a signed package once and verify_package
+    twice (the unpack's two passes, the second also collecting what the
+    signature checks read), each pass handing tarfile no more than the
+    package holds."""
+    from aphelion.validator import validate_signatures
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    size = tar_path.stat().st_size
+    passes = _count_passes(monkeypatch)
+
+    assert len(validate_signatures(tar_path)) == 1
+    assert len(passes) == 1
+    passes.clear()
+    assert len(verify_package(tar_path, require_signed=True).envelopes) == 1
+    assert len(passes) == 2
+    assert all(reader.handed <= size for reader in passes)
+
+
+@pytest.mark.integration
+def test_data_after_the_end_of_a_package_fails_the_signature_checks(tmp_path: Path) -> None:
+    """Non-zero bytes right after the end of the last member make
+    validate_signatures and verify_package fail with tarfile.ReadError
+    rather than check the package as if it ended there."""
+    import tarfile
+
+    from aphelion.validator import validate_signatures
+    from aphelion.verifier import verify_package
+
+    tar_path = _make_signed_tar(tmp_path)
+    raw = tar_path.read_bytes()
+    with tarfile.open(tar_path) as tar:
+        last = tar.getmembers()[-1]
+    end = last.offset_data + -(-last.size // 512) * 512
+    tar_path.write_bytes(raw[:end] + bytes(512) + b"\x01" * 512 + bytes(1024))
+
+    for call in (lambda: validate_signatures(tar_path), lambda: verify_package(tar_path)):
+        with pytest.raises(tarfile.ReadError, match="after the end"):
+            call()

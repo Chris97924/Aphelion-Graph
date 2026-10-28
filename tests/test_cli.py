@@ -169,6 +169,93 @@ def test_main_generic_exception_emits_unknown(
     assert "RuntimeError" in payload["msg"]
 
 
+# ---------- main(): the error line carries the error's notes ----------
+
+
+@pytest.mark.parametrize(
+    "error, code",
+    [
+        (SchemaError(code=ErrorCode.TYPE_MISMATCH, msg="boom"), ErrorCode.TYPE_MISMATCH),
+        (FileNotFoundError("gone"), ErrorCode.MISSING_FILE),
+        (RuntimeError("unexpected"), ErrorCode.UNKNOWN),
+    ],
+    ids=["aphelion-error", "file-not-found", "unexpected"],
+)
+def test_main_error_line_carries_the_error_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, code: ErrorCode
+) -> None:
+    """All platforms: notes on the error, which name what a failed call left
+    behind, appear in the JSON error line, whichever branch of main() emits
+    it."""
+    src = _minimal_source(tmp_path / "pkg")
+    note = f"could not remove {tmp_path / '.unpacking-0'}; delete it by hand"
+    error.__notes__ = [note]  # what add_note does on Python 3.11+
+
+    def _fail(_manifest: dict, _events: list, **_kwargs) -> None:
+        raise error
+
+    import aphelion.validator as validator_mod
+
+    monkeypatch.setattr(validator_mod, "validate_package", _fail)
+    _, _, err = _run(["validate", str(src)])
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == code.value
+    assert payload["notes"] == [note]
+
+
+def test_canonicalize_error_line_carries_the_error_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms: `aphe canonicalize` wraps an I/O error in a JSON error
+    line of its own, and keeps the error's notes there as main() does."""
+    note = f"could not remove {tmp_path / 'x.md.tmp'}; delete it by hand"
+    error = OSError("simulated I/O error")
+    error.__notes__ = [note]  # what add_note does on Python 3.11+
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    import aphelion.canonicalize as canonicalize_mod
+
+    monkeypatch.setattr(canonicalize_mod, "canonicalize_path", _fail)
+    code, _, err = _run(["canonicalize", str(tmp_path / "x.md")])
+    payload = _error_payload(err)
+    assert code == 1
+    assert payload is not None
+    assert payload["code"] == ErrorCode.MISSING_FILE.value
+    assert payload["notes"] == [note]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="exception notes exist from Python 3.11")
+def test_unpack_error_line_names_a_staging_dir_it_could_not_remove(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All platforms (Python 3.11+): a failed `aphe unpack` that cannot remove
+    its staging directory names it in the JSON error line, not only in a
+    warning that a warnings filter may turn off or into an error."""
+    import warnings
+
+    from test_unpacker import _fail_to_unlink, _fails_after_first_member
+
+    archive, _ = _fails_after_first_member(tmp_path, monkeypatch)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    _fail_to_unlink(monkeypatch, "manifest.json")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        code, _, err = _run(["unpack", str(archive), str(dest), "--max-file-bytes", "1024"])
+    monkeypatch.undo()
+
+    assert code == 3, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.ARCHIVE_BOMB.value
+    (leftover,) = [p for p in dest.resolve().iterdir() if p.name.startswith(".unpacking-")]
+    assert any(str(leftover) in note for note in payload["notes"])
+
+
 # ---------- SchemaError SystemExit handling preserves exit code ----------
 
 
@@ -259,10 +346,12 @@ def test_canonicalize_dry_run_stdout_is_only_document(tmp_path: Path) -> None:
 #   * unknown --algorithm value         -> EXIT_VALIDATION + ENUM_INVALID
 #   * signer-layer error surfaced       -> EXIT_VALIDATION + algorithm code
 #   * manifest.json absent in archive   -> EXIT_VALIDATION + MISSING_FILE
-#   * hmac-sha256 / ed25519 round trips  -> exit 0 + a verifiable signed tar
+#   * ed25519 round trip                 -> exit 0 + a verifiable signed tar
+#   * hmac-sha256 refused                -> its manifest would carry the secret
 # ===========================================================================
 
 
+# 32 bytes, so it is also a valid raw Ed25519 private key.
 HMAC_KEY = b"test-hmac-key-cli-sign-32bytes!!"
 
 
@@ -309,7 +398,7 @@ def test_sign_package_not_found_emits_missing_file(tmp_path: Path) -> None:
             "sign",
             "--package", str(tmp_path / "does-not-exist.aphelion.tar"),
             "--signer-id", "s1",
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(key_file),
             "--out", str(out),
         ]
@@ -338,7 +427,7 @@ def test_sign_key_file_missing_emits_missing_file(tmp_path: Path) -> None:
             "sign",
             "--package", str(pkg),
             "--signer-id", "s1",
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(tmp_path / "no-such-key.bin"),
             "--out", str(out),
         ]
@@ -366,14 +455,14 @@ def test_sign_key_file_empty_emits_missing_file(tmp_path: Path) -> None:
             "sign",
             "--package", str(pkg),
             "--signer-id", "s1",
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(empty_key),
             "--out", str(out),
         ]
     )
 
     # Strong teeth: without the `or stat().st_size == 0` guard, an empty key
-    # would build a valid HMACSigner and SUCCEED (exit 0, signed tar written).
+    # would reach the signer instead of the MISSING_FILE guard.
     assert code == EXIT_VALIDATION, err
     payload = _error_payload(err)
     assert payload is not None
@@ -494,6 +583,7 @@ def test_sign_ed25519_algorithm_unavailable_surfaces_json_error(
 
 
 def test_sign_manifest_absent_in_archive_emits_missing_file(tmp_path: Path) -> None:
+    pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
     from aphelion.canonical_tar import read_members
     from aphelion.canonical_tar import pack as tar_pack
 
@@ -512,7 +602,7 @@ def test_sign_manifest_absent_in_archive_emits_missing_file(tmp_path: Path) -> N
             "sign",
             "--package", str(pkg),
             "--signer-id", "s1",
-            "--algorithm", "hmac-sha256",
+            "--algorithm", "ed25519",
             "--key-file", str(key_file),
             "--out", str(out),
         ]
@@ -531,18 +621,18 @@ def test_sign_manifest_absent_in_archive_emits_missing_file(tmp_path: Path) -> N
 # ---------- successful round trips (lines 299-306) ----------
 
 
-@pytest.mark.filterwarnings(
-    "ignore:hmac-sha256 envelopes have zero non-repudiation:UserWarning"
-)
-def test_sign_hmac_round_trip_produces_verifiable_tar(tmp_path: Path) -> None:
-    from aphelion.verifier import verify_package
+def test_sign_hmac_is_refused_and_writes_nothing(tmp_path: Path) -> None:
+    """All platforms: `aphe sign` refuses hmac-sha256 and writes nothing.
 
+    hmac-sha256 stores its shared secret as public_key_b64 (spec §3.2), so
+    `aphe sign` does not offer it: a signed package would hand the signing key
+    to every reader. (This test used to assert an hmac round trip.)"""
     pkg = _packed_tar(tmp_path)
     key_file = tmp_path / "key.bin"
     key_file.write_bytes(HMAC_KEY)
     out = tmp_path / "signed.tar"
 
-    code, _, err = _run(
+    code, _, _ = _run(
         [
             "sign",
             "--package", str(pkg),
@@ -553,13 +643,8 @@ def test_sign_hmac_round_trip_produces_verifiable_tar(tmp_path: Path) -> None:
         ]
     )
 
-    assert code == 0, err
-    assert out.exists()
-    # Teeth: the emitted tar must actually verify (require_signed forces §5).
-    result = verify_package(out, require_signed=True)
-    assert len(result.envelopes) == 1
-    assert result.envelopes[0].signer_id == "hmac-signer"
-    assert result.envelopes[0].algorithm == "hmac-sha256"
+    assert code == 2  # argparse usage error: not a valid choice
+    assert not out.exists()
 
 
 def test_sign_ed25519_round_trip_produces_verifiable_tar(tmp_path: Path) -> None:
@@ -596,3 +681,229 @@ def test_sign_ed25519_round_trip_produces_verifiable_tar(tmp_path: Path) -> None
     assert result.envelopes[0].signer_id == "ed-signer"
     assert result.envelopes[0].algorithm == "ed25519"
     assert result.envelopes[0].package_canonical_hash == _pkg_canonical_hash(pkg)
+
+
+# ---------- signing never writes secret key material ----------
+
+
+def _sign_algorithm_choices() -> list[str]:
+    from aphelion.cli import _build_parser
+
+    parser = _build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    sign = sub.choices["sign"]
+    algo = next(a for a in sign._actions if a.dest == "algorithm")
+    return list(algo.choices)
+
+
+def _secret_forms(key: bytes) -> list[bytes]:
+    import base64
+
+    return [
+        key,
+        base64.standard_b64encode(key),
+        base64.urlsafe_b64encode(key),
+        base64.standard_b64encode(key).rstrip(b"="),
+        key.hex().encode("ascii"),
+    ]
+
+
+@pytest.mark.parametrize("algorithm", _sign_algorithm_choices())
+def test_sign_never_writes_key_file_contents_into_package(
+    tmp_path: Path, algorithm: str
+) -> None:
+    """All platforms: whatever `aphe sign` accepts, the key file's bytes must
+    not end up in the signed package in any encoding: anyone holding the
+    package could otherwise sign as that signer."""
+    if algorithm == "ed25519":
+        pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(HMAC_KEY)
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "s1",
+            "--algorithm", algorithm,
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    assert code == 0, err
+    blob = out.read_bytes()
+    for form in _secret_forms(HMAC_KEY):
+        assert form not in blob
+
+
+def test_sign_cmd_refuses_hmac_even_when_called_directly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """All platforms: the handler itself fails closed, not just the argparse
+    choices."""
+    from aphelion.cli import _cmd_sign
+    from aphelion.output import Writer
+
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(HMAC_KEY)
+    out = tmp_path / "signed.tar"
+    args = argparse.Namespace(
+        package=str(pkg),
+        signer_id="s1",
+        algorithm="hmac-sha256",
+        key_file=str(key_file),
+        out=str(out),
+    )
+
+    code = _cmd_sign(args, Writer(json_mode=False, color=False, stdout=sys.stdout))
+
+    assert code == EXIT_VALIDATION
+    payload = _error_payload(capsys.readouterr().err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.ENUM_INVALID.value
+    assert not out.exists()
+
+
+# ---------- malformed signer key -> typed error ----------
+
+
+@pytest.mark.parametrize("key", [b"x" * 31, b"x" * 33], ids=["short", "long"])
+def test_sign_malformed_ed25519_key_emits_signer_malformed(
+    tmp_path: Path, key: bytes
+) -> None:
+    """All platforms: an ed25519 key file of the wrong length fails with
+    E_SIGNER_MALFORMED and writes nothing."""
+    pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(key)
+    out = tmp_path / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", "s1",
+            "--algorithm", "ed25519",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    assert code == EXIT_VALIDATION, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == "E_SIGNER_MALFORMED"
+    assert not out.exists()
+
+
+# ---------- --signer-id must name a file inside signers/ ----------
+
+
+@pytest.mark.parametrize(
+    "signer_id",
+    ["../x", "../../x", "..", ".", "", "a/b", "a\\b", "/abs", "sub/../../x"],
+)
+def test_sign_rejects_signer_id_that_is_not_a_single_path_component(
+    tmp_path: Path, signer_id: str
+) -> None:
+    """All platforms: a --signer-id that would name a file outside signers/
+    fails with PX_E_6001 and writes nothing."""
+    pkg = _packed_tar(tmp_path)
+    key_file = tmp_path / "key.bin"
+    key_file.write_bytes(HMAC_KEY)
+    out = tmp_path / "out" / "signed.tar"
+
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(pkg),
+            "--signer-id", signer_id,
+            "--algorithm", "ed25519",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+
+    assert code == EXIT_VALIDATION, err
+    payload = _error_payload(err)
+    assert payload is not None
+    assert payload["code"] == ErrorCode.PATH_TRAVERSAL.value
+    assert not out.exists()
+
+
+# ---------- verify: signatures are required only where they can be checked ----------
+
+
+def _signed_tar(tmp_path: Path) -> Path:
+    """A package signed by ``aphe sign`` with a fresh Ed25519 key (local only,
+    no notary)."""
+    pytest.importorskip("cryptography", reason="ed25519 requires the cryptography extra")
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key_file = tmp_path / "ed.key"
+    key_file.write_bytes(Ed25519PrivateKey.generate().private_bytes_raw())
+    out = tmp_path / "signed.tar"
+    code, _, err = _run(
+        [
+            "sign",
+            "--package", str(_packed_tar(tmp_path)),
+            "--signer-id", "ed-signer",
+            "--algorithm", "ed25519",
+            "--key-file", str(key_file),
+            "--out", str(out),
+        ]
+    )
+    assert code == 0, err
+    return out
+
+
+@pytest.mark.parametrize("flag", ["--require-signed", "--require-notary"])
+def test_verify_refuses_a_directory_when_a_signature_is_required(
+    tmp_path: Path, flag: str
+) -> None:
+    """All platforms: an unpacked directory carries no signature verify can
+    check, so with --require-signed or --require-notary it fails with
+    E_SIGNER_REQUIRED instead of passing on the semantic checks alone."""
+    src = _minimal_source(tmp_path / "pkg")
+
+    code, out, err = _run(["verify", str(src), flag])
+
+    assert code == EXIT_VALIDATION, (out, err)
+    payload = _error_payload(err)
+    assert payload is not None, err
+    assert payload["code"] == "E_SIGNER_REQUIRED"
+    assert "package file" in payload["msg"]
+    assert "OK" not in out
+
+
+def test_verify_of_a_directory_without_signature_flags_is_unchanged(tmp_path: Path) -> None:
+    """All platforms: without the flags, an unpacked directory still gets the
+    semantic cross-reference check and passes."""
+    src = _minimal_source(tmp_path / "pkg")
+
+    code, out, err = _run(["verify", str(src)])
+
+    assert code == 0, err
+    assert "semantic cross-reference OK" in out
+
+
+def test_verify_of_a_signed_package_with_signature_flags_is_unchanged(tmp_path: Path) -> None:
+    """All platforms (with the cryptography extra): a signed package file still
+    passes --require-signed, and --require-notary still refuses a signature
+    attested only locally (E_SIGNER_NOTARY_REQUIRED)."""
+    signed = _signed_tar(tmp_path)
+
+    code, out, err = _run(["verify", str(signed), "--require-signed"])
+    assert code == 0, err
+    assert "semantic + signature OK (1 envelope(s))" in out
+
+    code, out, err = _run(["verify", str(signed), "--require-notary"])
+    assert code == EXIT_VALIDATION, (out, err)
+    payload = _error_payload(err)
+    assert payload is not None, err
+    assert payload["code"] == "E_SIGNER_NOTARY_REQUIRED"

@@ -11,9 +11,6 @@ All raised codes come from :class:`aphelion.error_codes.ErrorCode`.
 
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 import re
 from pathlib import Path
 from typing import Any
@@ -329,57 +326,69 @@ def _validate_signatures_full(
     keyed by ``signer_id``. The verifier reuses this mapping for notary
     resolution so signer manifests are neither re-extracted from the tar nor
     re-parsed once per envelope.
+
+    Reads the archive once: the header checks of
+    :func:`aphelion.unpacker.check_member_names`, collecting
+    ``signatures.jsonl``, the signer manifests and ``manifest.json`` on the
+    way. Everything below looks members up by name, and archives whose
+    member names collide after normalization are refused first, so the
+    manifest read here is the one an extraction of the same archive would
+    produce.
     """
-    from aphelion.unpacker import extract_signatures_jsonl, extract_signer_manifests
+    from aphelion.unpacker import _read_signature_members
+
+    return _check_signatures(_read_signature_members(tar_path))
+
+
+def _check_signatures(
+    members: Any,
+) -> "tuple[tuple[Any, ...], dict[str, Any]]":
+    """The §5 checks of :func:`_validate_signatures_full`, on the members
+    collected from a package (``aphelion.unpacker._SignatureMembers``)."""
     from aphelion.sig_pack import read_signatures_jsonl
     from aphelion.signer import (
         HMACVerifier,
-        SignerManifest,
         SignerVerificationError,
         _REGISTRY,
+        _b64decode_strict,
+        _require_hex64,
         compute_key_fingerprint,
         compute_package_canonical_hash,
+        parse_signer_manifest,
     )
 
     # §5 rule 2 (implicit): read signatures.jsonl; if absent → unsigned-valid
-    sig_content = extract_signatures_jsonl(tar_path)
+    sig_content = members.signatures
     if sig_content is None:
         return (), {}
 
     # Parse and validate sort order (raises E_SIGNATURE_MALFORMED / E_SIGNATURE_ORDER)
     envelopes = read_signatures_jsonl(sig_content)
 
-    signer_manifests_raw = extract_signer_manifests(tar_path)
+    signer_manifests_raw = members.signers
 
     # Load package canonical hash from manifest inside the tar
-    import tarfile
     from aphelion.errors import SecurityError
-    archive = Path(tar_path)
-    with tarfile.open(archive, mode="r") as tar:
-        try:
-            manifest_info = tar.getmember("manifest.json")
-        except KeyError as exc:
-            raise SchemaError(
-                code=ErrorCode.MISSING_FILE,
-                msg="manifest.json is missing from the archive",
-                path="manifest.json",
-            ) from exc
-        # A directory/symlink/non-regular member named manifest.json makes
-        # extractfile() return None. Guard explicitly rather than relying on
-        # ``assert`` (stripped under ``python -O``) so a crafted archive yields
-        # a typed validation error instead of a raw AttributeError.
-        manifest_member = tar.extractfile(manifest_info)
-        if manifest_member is None:
-            raise SecurityError(
-                code=ErrorCode.DISALLOWED_MEMBER_TYPE,
-                msg=(
-                    "manifest.json is not a regular file member "
-                    f"(type {manifest_info.type!r})"
-                ),
-                path="manifest.json",
-            )
-        manifest_bytes = manifest_member.read()
-        manifest_member.close()
+    if members.manifest is None:
+        raise SchemaError(
+            code=ErrorCode.MISSING_FILE,
+            msg="manifest.json is missing from the archive",
+            path="manifest.json",
+        )
+    # A directory member named manifest.json has no content. Guard
+    # explicitly rather than relying on ``assert`` (stripped under
+    # ``python -O``) so a malformed archive yields a typed validation error
+    # instead of a raw AttributeError.
+    manifest_type, manifest_bytes = members.manifest
+    if manifest_bytes is None:
+        raise SecurityError(
+            code=ErrorCode.DISALLOWED_MEMBER_TYPE,
+            msg=(
+                "manifest.json is not a regular file member "
+                f"(type {manifest_type!r})"
+            ),
+            path="manifest.json",
+        )
 
     from aphelion.canonical_json import loads as cj_loads, normalize
     manifest_obj = normalize(cj_loads(manifest_bytes))
@@ -404,40 +413,16 @@ def _validate_signatures_full(
                 f"no signer manifest found for signer_id={signer_id!r}",
             )
 
-        # Parse signer manifest
-        try:
-            raw = json.loads(signer_manifests_raw[signer_id].decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise SignerVerificationError(
-                "E_SIGNER_MALFORMED",
-                f"signers/{signer_id}.json is not valid JSON: {exc}",
-            ) from exc
-
-        try:
-            sm = SignerManifest(
-                signer_id=raw["signer_id"],
-                algorithm=raw["algorithm"],
-                public_key_b64=raw["public_key_b64"],
-                key_fingerprint=raw["key_fingerprint"],
-                notary_uri=raw.get("notary_uri"),
-            )
-        except (KeyError, TypeError) as exc:
-            raise SignerVerificationError(
-                "E_SIGNER_MALFORMED",
-                f"signers/{signer_id}.json missing required fields: {exc}",
-            ) from exc
-
+        # Parse signer manifest strictly (§2.3): wrong JSON types, a
+        # non-hex fingerprint or non-standard base64 are E_SIGNER_MALFORMED,
+        # never a raw TypeError/ValueError.
+        sm = parse_signer_manifest(signer_manifests_raw[signer_id], signer_id=signer_id)
         signer_manifests_by_id[signer_id] = sm
 
         # §5 rule: key_fingerprint recomputes
-        try:
-            pub_raw = base64.standard_b64decode(sm.public_key_b64)
-        except (ValueError, binascii.Error) as exc:
-            raise SignerVerificationError(
-                "E_SIGNER_MALFORMED",
-                f"public_key_b64 not valid base64: {exc}",
-            ) from exc
-
+        pub_raw = _b64decode_strict(
+            sm.public_key_b64, code="E_SIGNER_MALFORMED", label="public_key_b64"
+        )
         recomputed_fp = compute_key_fingerprint(pub_raw)
         import hmac as _hmac
         if not _hmac.compare_digest(recomputed_fp, sm.key_fingerprint):
@@ -446,7 +431,13 @@ def _validate_signatures_full(
                 f"recomputed fingerprint {recomputed_fp!r} != declared {sm.key_fingerprint!r}",
             )
 
-        # §5 rule: package_canonical_hash recomputes
+        # §5 rule: package_canonical_hash recomputes (format first: §2.2 says
+        # 64 lowercase hex, and compare_digest rejects non-ASCII with TypeError)
+        _require_hex64(
+            envelope.package_canonical_hash,
+            code="E_SIGNATURE_MALFORMED",
+            label="package_canonical_hash",
+        )
         if not _hmac.compare_digest(envelope.package_canonical_hash, expected_hash):
             raise SignerVerificationError(
                 "E_SIGNATURE_HASH_MISMATCH",

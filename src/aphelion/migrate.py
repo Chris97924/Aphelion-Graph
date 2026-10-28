@@ -16,7 +16,9 @@ from __future__ import annotations
 import copy
 import io
 import os
+import secrets
 import shutil
+import stat
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,16 @@ from aphelion.canonical_json import loads as canonical_loads
 from aphelion.canonical_json import normalize
 from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
+from aphelion.unpacker import (
+    _absent,
+    _discard_backup,
+    _lstat,
+    _maybe_present,
+    _remove_or_warn,
+    _Replacement,
+    _report,
+    _resolve_existing,
+)
 
 TARGET_FORMAT_VERSION = "2.0"
 TARGET_SPEC_VERSION = "0.4.0"
@@ -94,31 +106,145 @@ def migrate_directory(src: Path, dst: Path, *, force: bool = False) -> Path:
     ``manifest.json`` is rewritten through :func:`migrate_v03_to_v04` +
     canonical JSON. Refuses to overwrite a non-empty ``dst`` unless
     ``force`` is True.
+
+    Every check (source manifest, destination overlap, existing destination)
+    runs before anything is written or removed. The new tree is built next
+    to ``dst`` and only then swapped in. An existing ``dst`` (or the link
+    that is ``dst``) is first renamed into a backup directory beside it and
+    deleted, without following links, only once the new tree is in place;
+    if that fails, the backup is named in a RuntimeWarning. Until the new
+    tree is in place, any exception, an interrupt such as KeyboardInterrupt
+    included, leaves ``dst`` as it was, or the error names the backup
+    directory that still holds it; on failure that directory is deleted only
+    once it is empty. Once the new tree is in place the migration has
+    succeeded, and an interrupt while the old ``dst`` is deleted propagates
+    with a note saying so and naming the backup directory left over. Where
+    no note can name a leftover (Python 3.10, or a call that succeeded),
+    its RuntimeWarning is shown even where warnings are ignored or turned
+    into errors. A new ``dst`` is put in place by a rename that replaces
+    nothing on Windows and elsewhere only an empty directory.
+
+    The known limits are those of
+    :class:`aphelion.unpacker._Replacement`: no recovery after a killed
+    process or power loss, Windows files held open, one filesystem only.
+    Every check goes by path: a process that can replace ``dst``, one of its
+    parents or ``src`` while migrate runs can still redirect the copy or the
+    swap, a window that path-based checks cannot close. Resolving ``src``
+    and ``dst`` for the overlap check (``Path.resolve``; strict for ``src``,
+    which must exist, except on a volume that cannot report a final path)
+    and creating ``dst``'s parents
+    (``Path.mkdir(exist_ok=True)``) keep their standard-library behaviour.
     """
     src_path = Path(src)
     dst_path = Path(dst)
     manifest_in = src_path / "manifest.json"
-    if not manifest_in.is_file():
+    if not _is_file(manifest_in):
         raise SchemaError(
             code=ErrorCode.MISSING_FILE,
             msg=f"source {src_path} does not contain manifest.json",
             path=str(manifest_in),
         )
-    if dst_path.exists():
-        if not force:
+    new_manifest = migrate_v03_to_v04(canonical_loads(manifest_in.read_bytes()))
+    _refuse_overlap(src_path, dst_path)
+    dst_present = _lstat(dst_path) is not None  # an unreadable entry is not "absent"
+    if dst_present and not force:
+        raise SchemaError(
+            code=ErrorCode.INIT_REFUSES_EXISTING,
+            msg=f"destination {dst_path} already exists; pass force=True to overwrite",
+            path=str(dst_path),
+        )
+    # Absolute, so a destination spelled "." still has a name to stage beside.
+    dst_abs = Path(os.path.abspath(dst_path))
+    dst_abs.parent.mkdir(parents=True, exist_ok=True)
+    staging = dst_abs.with_name(f".{dst_abs.name}.migrating-{secrets.token_hex(8)}")
+    replacement = None
+    renaming = False
+    try:
+        shutil.copytree(src_path, staging)
+        (staging / "manifest.json").write_bytes(canonical_dumps(normalize(new_manifest)))
+        if dst_present:
+            replacement = _Replacement(
+                dst_abs.with_name(f".{dst_abs.name}.replaced-{secrets.token_hex(8)}")
+            )
+            replacement.backup.mkdir()
+            try:
+                replacement.replace_entry(staging, dst_abs)
+                replacement.complete = True  # last: anything raised before it is undone
+            except BaseException as exc:
+                replacement.rollback(exc)
+                raise
+            # The new tree is in place; what follows only deletes the old one.
+            replacement.commit()
+        else:
+            renaming = True  # on record before the rename, as _Replacement logs its steps
+            # Not os.replace, which on Windows replaces a file there by now.
+            os.rename(staging, dst_abs)
+    except BaseException as exc:
+        if (replacement is not None and replacement.complete) or (
+            renaming and not _maybe_present(staging)
+        ):
+            # The migration succeeded; only deleting the old dst was cut short.
+            left = ""
+            if replacement is not None and _maybe_present(replacement.backup):
+                left = f"; the old one is left over in {replacement.backup}, which can go"
+            _report(f"migrate completed: {dst_path} holds the new tree{left}", exc)
+            raise
+        # First, so a backup still holding the old dst is named even if the
+        # staging cleanup below is interrupted; it is deleted only if empty.
+        if replacement is not None:
+            _discard_backup(replacement.backup, exc)
+        _remove_or_warn(staging, exc)
+        raise
+    return dst_path
+
+
+def _is_file(path: Path) -> bool:
+    # Path.is_file, but strict: an error other than "no such file" raises.
+    st = _lstat(path, follow_symlinks=True)
+    return st is not None and stat.S_ISREG(st.st_mode)
+
+
+def _same_entry(a: Path, b: Path) -> bool:
+    """Whether two paths name one directory entry.
+
+    ``samefile`` compares device and inode, so it also catches spellings a
+    string comparison misses: case variants on NTFS / APFS, and names that
+    reach the entry through a symlink or junction.
+    """
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except (FileNotFoundError, NotADirectoryError) as err:
+        if _absent(err):
+            return False
+        raise  # any other error fails the check
+
+
+def _refuse_overlap(src: Path, dst: Path) -> None:
+    """Refuse a ``dst`` that is ``src``, contains it, or lies inside it.
+
+    Both are resolved first. ``dst`` is also checked as the entry itself
+    (parents resolved, last component not), so a symlink sitting inside the
+    source is refused even when it points elsewhere: replacing it would
+    modify the source.
+    """
+    src_resolved = _resolve_existing(src)  # src exists: both callers checked it
+    dst_abs = Path(os.path.abspath(dst))
+    for candidate in (dst_abs.resolve(), dst_abs.parent.resolve() / dst_abs.name):
+        if (
+            _same_entry(candidate, src_resolved)
+            or any(_same_entry(candidate, parent) for parent in src_resolved.parents)
+            or any(_same_entry(src_resolved, parent) for parent in candidate.parents)
+        ):
             raise SchemaError(
                 code=ErrorCode.INIT_REFUSES_EXISTING,
-                msg=f"destination {dst_path} already exists; pass force=True to overwrite",
-                path=str(dst_path),
+                msg=(
+                    f"destination {dst} is, contains, or lies inside the source "
+                    f"{src}; refusing to migrate onto it"
+                ),
+                path=str(dst),
             )
-        if dst_path.is_dir():
-            shutil.rmtree(dst_path)
-        else:
-            dst_path.unlink()
-    shutil.copytree(src_path, dst_path)
-    new_manifest = migrate_v03_to_v04(canonical_loads(manifest_in.read_bytes()))
-    (dst_path / "manifest.json").write_bytes(canonical_dumps(normalize(new_manifest)))
-    return dst_path
 
 
 def migrate_archive(src: Path, dst: Path, *, force: bool = False) -> Path:
@@ -131,13 +257,14 @@ def migrate_archive(src: Path, dst: Path, *, force: bool = False) -> Path:
     """
     src_path = Path(src)
     dst_path = Path(dst)
-    if not src_path.is_file():
+    if not _is_file(src_path):
         raise SchemaError(
             code=ErrorCode.MISSING_FILE,
             msg=f"source archive {src_path} not found",
             path=str(src_path),
         )
-    if dst_path.exists() and not force:
+    _refuse_overlap(src_path, dst_path)
+    if _lstat(dst_path) is not None and not force:
         raise SchemaError(
             code=ErrorCode.INIT_REFUSES_EXISTING,
             msg=f"destination {dst_path} already exists; pass force=True to overwrite",
@@ -227,11 +354,12 @@ def migrate(opts: MigrateOptions) -> Path:
     """
     src = Path(opts.src)
     dst = Path(opts.dst)
-    src_is_archive = src.is_file() and src.suffix == ".tar"
+    src_st = _lstat(src, follow_symlinks=True)
+    src_is_archive = src_st is not None and stat.S_ISREG(src_st.st_mode) and src.suffix == ".tar"
     dst_is_archive = dst.suffix == ".tar"
     if src_is_archive and dst_is_archive:
         return migrate_archive(src, dst, force=opts.force)
-    if src.is_dir() and not dst_is_archive:
+    if src_st is not None and stat.S_ISDIR(src_st.st_mode) and not dst_is_archive:
         return migrate_directory(src, dst, force=opts.force)
     raise SchemaError(
         code=ErrorCode.TYPE_MISMATCH,

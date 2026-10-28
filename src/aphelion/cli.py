@@ -169,7 +169,7 @@ def _cmd_canonicalize(args: argparse.Namespace, writer: Writer) -> int:
         result = canonicalize_path(src, out=out, in_place=in_place)
     except OSError as exc:
         # FileNotFoundError and other I/O errors are exit code 1 per spec §9.1.
-        emit_error(SchemaError(code=ErrorCode.MISSING_FILE, msg=str(exc)))
+        emit_error(_with_notes(SchemaError(code=ErrorCode.MISSING_FILE, msg=str(exc)), exc))
         return 1
     except SchemaError as exc:
         # Map exit codes per spec §9.1: PARSE_ERROR / UTF8_INVALID / file
@@ -244,6 +244,19 @@ def _cmd_verify(args: argparse.Namespace, writer: Writer) -> int:
             summary=f"{target}: semantic + signature OK ({len(result.envelopes)} envelope(s))",
             data=data,
         )
+    elif require_signed:
+        # The directory check below verifies no signature, so it must not pass
+        # for one: only the package file carries signatures verify can check.
+        from aphelion.errors import EXIT_VALIDATION
+        import sys
+        import json
+        exc = SignerVerificationError(
+            "E_SIGNER_REQUIRED",
+            f"signatures can only be checked on the package file (.aphelion.tar), not on {target}",
+        )
+        sys.stderr.write(json.dumps({"code": exc.code, "severity": "error", "msg": str(exc)}, sort_keys=True) + "\n")
+        sys.stderr.flush()
+        return EXIT_VALIDATION
     else:
         do_verify(args.dir)
         writer.success(
@@ -257,22 +270,47 @@ def _cmd_verify(args: argparse.Namespace, writer: Writer) -> int:
 def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
     """Pack a signed .aphelion.tar from an existing package tar.
 
-    Reads the HMAC key (or Ed25519 private key) from --key-file,
-    computes the canonical package hash, produces a SignatureEnvelope,
-    writes/merges signatures.jsonl and signers/<signer_id>.json,
-    then repacks into --out.
+    Reads the raw Ed25519 private key from --key-file, computes the
+    canonical package hash, produces a SignatureEnvelope, writes/merges
+    signatures.jsonl and signers/<signer_id>.json, then repacks into --out.
+
+    hmac-sha256 is not offered: its signer manifest carries the shared
+    secret as public_key_b64 (spec/v0.5-signer-trust.md §3.2), so a package
+    signed with it would hand the signing key to every reader. The algorithm
+    stays available to library callers for test fixtures only.
     """
     from pathlib import Path as _Path
     from aphelion.canonical_tar import read_members, TarMember
     from aphelion.canonical_tar import pack as tar_pack
     from aphelion.canonical_json import loads as cj_loads, normalize, dumps as cj_dumps
     from aphelion.signer import (
-        HMACSigner,
         SignerVerificationError,
         compute_package_canonical_hash,
     )
     from aphelion.sig_pack import write_signatures_jsonl, read_signatures_jsonl
     import datetime
+
+    # signers/<signer_id>.json must stay one file inside signers/ (spec v0.5
+    # §2.3: signer_id is the path stem), so the id is a single path component.
+    signer_id = args.signer_id
+    if (
+        not signer_id
+        or signer_id in (".", "..")
+        or any(sep in signer_id for sep in ("/", "\\", "\0"))
+    ):
+        # Local imports, like the guards below: those make these names
+        # function-local for the whole of _cmd_sign.
+        from aphelion.errors import SchemaError, EXIT_VALIDATION
+        from aphelion.error_codes import ErrorCode
+        from aphelion.errors import emit_error
+        emit_error(SchemaError(
+            code=ErrorCode.PATH_TRAVERSAL,
+            msg=(
+                f"--signer-id {signer_id!r} must be a single path component "
+                "(no '/', '\\', NUL, and not '.' or '..')"
+            ),
+        ))
+        return EXIT_VALIDATION
 
     pkg_path = _Path(args.package)
     if not pkg_path.exists():
@@ -292,18 +330,18 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
 
     key_bytes = key_path.read_bytes()
     algorithm = args.algorithm
-    signer_id = args.signer_id
 
     # Build the signer
     try:
-        if algorithm == "hmac-sha256":
-            signer = HMACSigner(signer_id=signer_id, secret=key_bytes)
-        elif algorithm == "ed25519":
+        if algorithm == "ed25519":
             import base64 as _base64
             from aphelion.signer import Ed25519Signer, _require_cryptography
             _require_cryptography()
             priv_b64 = _base64.standard_b64encode(key_bytes).decode("ascii")
             signer = Ed25519Signer(signer_id=signer_id, private_key_b64=priv_b64)
+            # Derives the public key, so a key file that is not a raw 32-byte
+            # Ed25519 key fails here with E_SIGNER_MALFORMED.
+            manifest_record = signer.manifest()
         else:
             from aphelion.errors import SchemaError, EXIT_VALIDATION
             from aphelion.error_codes import ErrorCode
@@ -352,7 +390,6 @@ def _cmd_sign(args: argparse.Namespace, writer: Writer) -> int:
 
     signed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     envelope = signer.sign(package_canonical_hash=pkg_hash, signed_at_iso=signed_at)
-    manifest_record = signer.manifest()
 
     # Merge with existing signatures if present
     existing_sigs_bytes: bytes | None = None
@@ -500,9 +537,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sign.add_argument("--signer-id", dest="signer_id", required=True, help="signer identity string")
     p_sign.add_argument(
         "--algorithm",
-        choices=["hmac-sha256", "ed25519"],
+        choices=["ed25519"],
         required=True,
-        help="signing algorithm",
+        help="signing algorithm (hmac-sha256 is test-only and cannot be used here)",
     )
     p_sign.add_argument("--key-file", dest="key_file", required=True, help="raw key bytes file")
     p_sign.add_argument("--out", required=True, help="output .aphelion.tar path")
@@ -570,14 +607,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return exit_code_for(err)
     except FileNotFoundError as err:
         emit_error(
-            SchemaError(code=ErrorCode.MISSING_FILE, msg=str(err))
+            _with_notes(SchemaError(code=ErrorCode.MISSING_FILE, msg=str(err)), err)
         )
         return EXIT_VALIDATION
     except Exception as err:  # unexpected — still surface machine-readably
         emit_error(
-            SchemaError(code=ErrorCode.UNKNOWN, msg=f"{type(err).__name__}: {err}")
+            _with_notes(
+                SchemaError(code=ErrorCode.UNKNOWN, msg=f"{type(err).__name__}: {err}"), err
+            )
         )
         return 1
+
+
+def _with_notes(wrapper: SchemaError, err: BaseException) -> SchemaError:
+    # The wrapper is what gets emitted: keep the notes of the error it reports.
+    notes = getattr(err, "__notes__", None)
+    if notes:
+        wrapper.__notes__ = list(notes)
+    return wrapper
 
 
 if __name__ == "__main__":

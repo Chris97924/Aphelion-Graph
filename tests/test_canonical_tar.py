@@ -7,6 +7,7 @@ import hashlib
 import pytest
 
 from aphelion.canonical_tar import MODE_DIR, MODE_FILE, TarMember, pack, read_members
+from aphelion.error_codes import ErrorCode
 from aphelion.errors import SchemaError
 
 
@@ -90,3 +91,52 @@ def test_roundtrip_preserves_bytes() -> None:
     back = read_members(b1)
     b2 = pack(back)
     assert b1 == b2
+
+
+# ---------- member paths may not escape the archive root ----------
+
+
+@pytest.mark.parametrize(
+    "path, code",
+    [
+        ("../x.json", ErrorCode.PATH_TRAVERSAL),
+        ("signers/../x.json", ErrorCode.PATH_TRAVERSAL),
+        ("signers/../../x.json", ErrorCode.PATH_TRAVERSAL),
+        ("..", ErrorCode.PATH_TRAVERSAL),
+        ("/etc/x.json", ErrorCode.ABSOLUTE_PATH),
+        ("C:/x.json", ErrorCode.WINDOWS_DRIVE),
+        ("c:x.json", ErrorCode.WINDOWS_DRIVE),
+        ("signers\\..\\x.json", ErrorCode.WINDOWS_BACKSLASH),
+        ("", ErrorCode.EMPTY_MEMBER_NAME),
+    ],
+)
+def test_pack_rejects_member_paths_that_escape(path: str, code: ErrorCode) -> None:
+    """All platforms: pack refuses a member path that names something outside
+    the archive root, with the code unpack would use."""
+    with pytest.raises(SchemaError) as exc:
+        pack([TarMember(path=path, data=b"x", is_dir=False)])
+    assert exc.value.code == code
+
+
+def test_pack_rejects_directory_member_that_escapes() -> None:
+    """All platforms: the same holds for a directory member."""
+    with pytest.raises(SchemaError) as exc:
+        pack([TarMember(path="a/../..", data=None, is_dir=True)])
+    assert exc.value.code == ErrorCode.PATH_TRAVERSAL
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [("signers/A.json", "signers/a.json"), ("x.json", "./x.json"), ("a/b", "a//b")],
+)
+def test_pack_rejects_paths_that_unpack_would_reject_as_colliding(
+    first: str, second: str
+) -> None:
+    """All platforms: pack refuses two paths that collide once normalized,
+    as unpack does."""
+    with pytest.raises(SchemaError) as exc:
+        pack([
+            TarMember(path=first, data=b"1", is_dir=False),
+            TarMember(path=second, data=b"2", is_dir=False),
+        ])
+    assert exc.value.code == ErrorCode.DUPLICATE_MEMBER_PATH
