@@ -51,6 +51,14 @@ the record of what a bump would carry.
   notes (Python 3.11+), such as one naming a directory a failed `unpack` or
   `migrate --force` left behind, the line includes them as a `"notes"` list
   of strings. Lines for errors without notes are unchanged.
+- **New public names.** In `aphelion.unpacker`: `check_member_names`,
+  which runs the header checks of `unpack` without extracting anything,
+  and the name checks `unpack` and `pack` share: `MemberNames` (finds the
+  first collision), `member_path_key` (the collision key), `path_parts`,
+  `non_portable_component`, `WINDOWS_RESERVED_CHARS` and
+  `WINDOWS_DEVICE_RE`. In `aphelion.signer` (and its `__all__`):
+  `parse_signer_manifest`, which checks a signer manifest against spec
+  v0.5 §2.3.
 
 ### Changed
 
@@ -94,9 +102,14 @@ the record of what a bump would carry.
   - two members that reach one entry on the target filesystem, for instance
     by a Windows 8.3 short name (`PX_E_6007`). `pack` does not see such
     aliases;
-  - on a filesystem that reports no file identity (inode number 0), an
-    archive that would replace or merge into an existing entry, since
-    whether two members reach that entry cannot be checked there.
+  - on a filesystem that reports no file identity (inode number 0), most
+    archives into an existing destination (see Known limits below).
+- **`migrate` refuses a destination that is, contains or lies inside the
+  source** (`PX_E_2006`), before anything is written. So migrating an
+  archive in place (`aphe migrate pkg.aphelion.tar pkg.aphelion.tar
+  --force`) and migrating a directory into a subdirectory of itself no
+  longer run, and `--force` no longer removes a source that lies inside
+  the destination.
 - **On Windows, `pack`, `unpack`, signature validation
   (`validate_signatures`) and `verify_package` (`aphe verify` on a package
   file) refuse member names Win32 cannot create**: device names such as
@@ -108,10 +121,11 @@ the record of what a bump would carry.
   by `pack`, `unpack`, signature validation (`validate_signatures`) and
   `verify_package` (`aphe verify` on a package file), before anything is
   written. Names are compared without a leading `./` or empty and `.`
-  segments, after NFC normalisation and case folding (on Windows also
-  without trailing dots and spaces), so two spellings of one file or
-  directory, or a file and a directory of one name, can no longer share an
-  archive.
+  segments, after NFC normalisation and full Unicode case folding (on
+  Windows also without trailing dots and spaces), so two spellings of one
+  file or directory, or a file and a directory of one name, can no longer
+  share an archive. Full case folding also refuses pairs that NTFS keeps
+  apart, such as `ß` and `ss`, `ﬁ` and `fi`, or `ς` and `σ`.
 - **Signature validation (`validate_signatures`) refuses an archive whose
   members declare sizes `unpack` would refuse**, with the same codes: a
   member over the per-file limit (`PX_E_6010`), or a running total over the
@@ -135,7 +149,7 @@ the record of what a bump would carry.
   more for global pax headers in front of it. A member whose header blocks
   take more is refused (`PX_E_6013`), so at the default policy so is a
   member whose pax header holds larger records, such as an extended
-  attribute of about 3 KB or more (`tar --xattrs`). `max_path_length`
+  attribute of about 3 KB or more. `max_path_length`
   counts characters after NFC normalisation, so a name stored decomposed
   (NFD, as HFS+ stores names) can need more than four bytes per counted
   character, and a member whose header blocks then take more than H is
@@ -182,8 +196,9 @@ the record of what a bump would carry.
   gives (`PX_E_6013`). A pax header here is any before the member, local
   or global, the first or a later one (`tarfile` may take a member's size
   from a later one). A negative size, and then a pax header that a Python
-  release stops reading the archive at (below), come first; then reading
-  past what the header allowance lets `tarfile` read (`PX_E_6013`); then a
+  release stops reading the archive at (below), in the header blocks read
+  before the allowance is passed, come first; then reading past what the
+  header allowance lets `tarfile` read (`PX_E_6013`); then a
   pax header that releases only read differently (below); then the
   member's other refusals. A member past `max_files` is refused as a
   release that stops at its headers reports it (a negative size, then a
@@ -200,12 +215,19 @@ the record of what a bump would carry.
   on, and whichever type it gives such a header. So is the code, but for
   two cases: a pax header that a release stops at, followed later in the
   same header blocks by a negative size, can be `tarfile.ReadError` on
-  some releases and `PX_E_6010` on others; and on Python 3.10.0 to 3.10.6 a
-  GNU sparse 0.0 value of more than 4,300 digits (below) is `PX_E_6008`.
-  The `PX_E_6008` refusals of a header whose name field ends in `/` and
-  the `PX_E_6010` refusals of a negative size in the header blocks give
-  the header's place in the archive (and the name field), not the
-  member's name, so their message is the same on every release; a GNU
+  some releases and `PX_E_6010` on others; and a number in a
+  `GNU.sparse.*` value (a size, an offset or length, or a map entry) with
+  more digits than `int()` reads from a string is `tarfile.ReadError`,
+  while one it reads is refused as above (`PX_E_6008`, or `PX_E_6010` for
+  a negative size). That digit limit is 4,300 by default, can be changed,
+  and does not exist before Python 3.10.7; at 4,300, a value that long
+  fits in the header allowance only with a `max_path_length` above the
+  default. The `PX_E_6008` refusals of a header whose name field ends in
+  `/` and the `PX_E_6010` refusals of a negative size in the header blocks
+  give the header's place in the archive (and the name field), not the
+  member's name, so their message is the same on every release, unless a
+  negative pax `size` has more digits than `int()` reads: its member is
+  then refused for having its size in a pax header. A GNU
   sparse member in the old form (type `S`) whose real size is negative is
   refused with its name. The text of a `tarfile.ReadError` depends on the
   release. A package never has any of these. A directory's size, if not
@@ -232,12 +254,12 @@ the record of what a bump would carry.
   ones the record); a global pax header with a `hdrcharset` record or
   line, which earlier releases apply to the headers after it, so an
   archive whose global pax header carries one is refused, as is one whose
-  global pax values are not UTF-8 (its writer then adds a global
-  `hdrcharset`); and, for a GNU sparse 0.0 member, an `offset` or
-  `numbytes` value that `int()` cannot read, on which later releases fail
-  (other sparse headers stay refused as sparse, `PX_E_6008`, and so does
-  a value of more than 4,300 digits on Python 3.10.0 to 3.10.6, whose
-  `int()` reads it). Any other local pax header with a `hdrcharset` (its
+  writer adds a global `hdrcharset` because its global values are not
+  UTF-8; and, for a GNU sparse 0.0 member, an `offset` or `numbytes` value
+  that `int()` cannot read, on which later releases fail only after
+  reading the headers after it (other sparse headers stay refused as
+  sparse, `PX_E_6008`, and so does a value `int()` reads; how many digits
+  it reads is above). Any other local pax header with a `hdrcharset` (its
   line's value UTF-8, and its line and first record agreeing on whether
   the names are `BINARY`) is read as before.
 - **What `tarfile` or the decompressor raises for a damaged archive is
@@ -275,8 +297,9 @@ the record of what a bump would carry.
   decompressed with the library's default limit on the window size, 128
   MiB, so decoding one may take that much memory; one whose frame needs a
   larger window fails with `tarfile.ReadError`.
-- **`unpack`, `check_member_names` and the accessors tell a compressed
-  archive by its first bytes**, as `tarfile`'s stream mode does: gzip,
+- **`unpack`, `check_member_names`, the accessors, signature validation
+  (`validate_signatures`) and `verify_package` tell a compressed archive
+  by its first bytes**, as `tarfile`'s stream mode does: gzip,
   bzip2, xz, zstd (Python 3.14 and later) and LZMA-alone whose header
   starts `5d 00 00 80` (the default properties, and a dictionary of 8 MiB
   or 8 MiB plus a multiple of 16 MiB); anything else is read as an
@@ -285,17 +308,18 @@ the record of what a bump would carry.
   fails with `tarfile.ReadError`. A package, an uncompressed or
   gzip-compressed ustar archive, is not affected.
 - **Recommended Python versions for reading archives**: 3.10.21, 3.11.16,
-  3.12.14, 3.13.15 or 3.14.7 and later. Their `tarfile` carries the fixes
-  for CVE-2024-6232 (from 3.10.15, 3.11.10 and 3.12.6), CVE-2025-8194
-  (from 3.10.19, 3.11.14, 3.12.12, 3.13.6 and 3.14.0rc2) and
-  CVE-2026-11972 (from 3.10.21, 3.11.16, 3.12.14, 3.13.15 and 3.14.7). The
-  limits above hold on earlier releases too; there, parsing a member's
-  headers can take longer.
+  3.12.14, 3.13.15 or 3.14.7 and later. The limits above hold on earlier
+  releases too; there, reading some archive headers can take longer.
 - **`pack` refuses the member paths `unpack` refuses**: empty (`PX_E_6006`),
   absolute (`PX_E_6002`), containing a backslash (`PX_E_6004`),
   drive-prefixed such as `a:b.md` (`PX_E_6003`, on every platform), or with
   a `..` segment (`PX_E_6001`). It no longer writes member paths that
-  `unpack` on the same platform refuses.
+  `unpack` on the same platform refuses, but for one case: on platforms
+  other than Windows, a library caller can still give `pack` names that
+  contain NUL. Readers take such a name only up to the NUL, so `unpack`
+  writes it under that shorter name, and refuses two that become one
+  (`PX_E_6007`). File names cannot contain NUL, so `aphe pack` never
+  writes one.
 - **`aphe sign --signer-id` must be a single path component.** An empty id,
   `.`, `..`, or an id containing `/`, `\` or NUL is refused (`PX_E_6001`)
   before any file is read or written; the id names
@@ -311,6 +335,8 @@ the record of what a bump would carry.
   emitted (`PX_E_5004`); a manifest path other than `claims/<claim_id>.md`
   (`PX_E_5002`). `spec/error-codes.md` gains `PX_E_4011`, `PX_E_4012` and
   `PX_E_5005`. Every sample and valid fixture in the repository passes.
+  `pack` does not run these checks, so a package `pack` writes can fail
+  `verify`.
 - **`aphe verify --require-signed` and `--require-notary` need the package
   file.** Given an unpacked directory (which passed on the semantic checks
   alone) or any other path that is not a file, they now fail with
@@ -405,6 +431,36 @@ the record of what a bump would carry.
   already paid for under a pre-branch revision has to be re-extracted.
 - The benchmark harness is additive and imports nothing into the shipped
   package; `src/aphelion/` is untouched by it.
+
+### Known limits
+
+- **On a filesystem that reports no file identity** (inode number 0 for
+  every file), any two of its entries look like one entry, so these fail
+  where they worked before:
+  - `unpack` into an existing destination, even an empty one, with
+    `FileExistsError` (`PX_E_9001` at the command line): "cannot unpack
+    over the backup directory" when two members share a top-level entry
+    (a package with two or more claims, or a directory and a file in it),
+    and "cannot unpack over the staging directory" when the archive would
+    replace an entry the destination has or add into one of its
+    directories;
+  - `verify_package` (`aphe verify` on a package file) of a package with
+    two or more claims, the same way, when the temporary directory is on
+    such a filesystem;
+  - `migrate`, with `PX_E_2006`, when the source and the destination are
+    both on it.
+
+  Still working there: `unpack` into a new destination, and into an
+  existing one when the archive only adds new top-level entries of one
+  member each; `check_member_names`, `validate_signatures` and `pack`;
+  and `migrate` from or to another filesystem.
+- **On Windows without long-path support, a final path within 28
+  characters of the 260-character limit (232 to 259 characters) no longer
+  unpacks** (`FileNotFoundError`, `PX_E_2005` at the command line):
+  `unpack` first writes each member in a staging directory whose path is
+  28 characters longer. Migrating a directory, with or without `--force`,
+  loses the same 28 characters, as it builds the new tree beside the
+  destination under a longer name.
 
 ### Tests
 

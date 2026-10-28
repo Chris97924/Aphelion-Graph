@@ -147,9 +147,11 @@ def path_parts(normalized: str) -> list[str]:
 def member_path_key(parts: list[str]) -> str:
     """Collision key for a member path, as a case-insensitive filesystem sees it.
 
-    Two members with the same key land on the same file on at least one
-    supported platform: NTFS and APFS compare names case-insensitively, and
-    APFS is also normalization-insensitive. On Windows, where Win32 drops
+    Names are compared after NFC normalisation and full Unicode case folding
+    (``str.casefold``), as NTFS and APFS compare names case-insensitively and
+    APFS is also normalization-insensitive. Full case folding goes further
+    than those filesystems: pairs that NTFS keeps apart, such as ``ß`` and
+    ``ss``, get one key too, so they are refused. On Windows, where Win32 drops
     trailing dots and spaces from each component, those are dropped too;
     elsewhere ``trail.`` and ``trail`` are two files.
     """
@@ -1119,9 +1121,11 @@ def unpack(
     and writes the member, refusing with ARCHIVE_BOMB, before writing it,
     a member that differs (and an archive with more or fewer members).
     Whatever the member headers say, each pass hands
-    tarfile at most ``max_total_bytes`` plus 4,607 bytes per ``max_files``
-    member plus 5,120 bytes (150,932,720 bytes at the default policy; see
-    :func:`_members` for what each pass refuses), and a decompressing file
+    tarfile at most ``max_total_bytes`` plus ``H + 511`` bytes per
+    ``max_files`` member plus ``H + 1,024`` bytes, where ``H`` is the header
+    allowance of :func:`_members` (4,096 bytes at the default
+    ``max_path_length``, so 150,932,720 bytes in all at the default policy;
+    see :func:`_members` for what each pass refuses), and a decompressing file
     object may decompress up to ``io.DEFAULT_BUFFER_SIZE`` (8 KiB, or
     128 KiB from Python 3.14) more ahead of that.
 
@@ -1145,9 +1149,12 @@ def unpack(
     one file are two entries, each replaced on its own. An alias the merge
     itself creates (Windows gives a new file or directory a short name
     another member spells) is found during the merge, which is then undone.
-    Where the filesystem reports no file identity (inode number 0) that
-    check cannot run, so an entry the archive would replace or merge into
-    is refused.
+    Where the filesystem reports no file identity (inode number 0), any two
+    of its entries look like one, so an unpack into an existing
+    ``dest_dir`` there fails (FileExistsError) when the archive would
+    replace an entry or add into a directory ``dest_dir`` has, or has two
+    members under one new top-level entry; one into a new ``dest_dir``, or
+    that only adds new top-level entries of one member each, works.
 
     Until every entry is in place, any exception, an interrupt such as
     KeyboardInterrupt included, leaves the contents of ``dest_dir`` as they
@@ -2125,8 +2132,7 @@ def extract_signatures_jsonl(tar_path: Path | str) -> bytes | None:
 
     Spec §5: presence of signatures.jsonl opts the package into v0.5 verification.
     This is a read-only accessor that does NOT run the name checks of
-    :func:`unpack` — it is only used after a package has already been
-    trust-verified at the tar level. It makes one pass over the archive with
+    :func:`unpack`. It makes one pass over the archive with
     the other header checks of :func:`unpack` at the default policy (see
     :func:`_members`). When several members have the name, the last one counts;
     if that is a directory, the result is ``None``.

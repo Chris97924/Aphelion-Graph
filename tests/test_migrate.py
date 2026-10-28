@@ -572,9 +572,9 @@ def test_force_does_not_follow_a_directory_replaced_by_a_symlink_during_removal(
             return
         if os.path.basename(os.fspath(path)) == "swapped":
             swaps.append(path)
-            victim = next(tmp_path.rglob("swapped"))  # wherever the old tree is now
-            os.rename(victim, tmp_path / "moved-aside")
-            os.symlink(elsewhere, victim, target_is_directory=True)
+            old_tree = next(tmp_path.rglob("swapped"))  # wherever the old tree is now
+            os.rename(old_tree, tmp_path / "moved-aside")
+            os.symlink(elsewhere, old_tree, target_is_directory=True)
 
     def open_(path: object, *args: object, **kwargs: object) -> int:
         swap_before_listing(path)

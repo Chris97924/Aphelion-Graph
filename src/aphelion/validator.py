@@ -377,7 +377,7 @@ def _check_signatures(
         )
     # A directory member named manifest.json has no content. Guard
     # explicitly rather than relying on ``assert`` (stripped under
-    # ``python -O``) so a crafted archive yields a typed validation error
+    # ``python -O``) so a malformed archive yields a typed validation error
     # instead of a raw AttributeError.
     manifest_type, manifest_bytes = members.manifest
     if manifest_bytes is None:

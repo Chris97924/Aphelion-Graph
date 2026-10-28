@@ -1318,7 +1318,7 @@ def test_cli_aphe_sign_then_verify(tmp_path: Path) -> None:
 
 
 def _append_members(tar_path: Path, members: list[tuple[str, bytes]]) -> None:
-    """Append raw members after the existing ones (bypasses canonical_tar)."""
+    """Append raw members after the existing ones, not through canonical_tar."""
     import tarfile
 
     with tarfile.open(tar_path, mode="a", format=tarfile.USTAR_FORMAT) as tar:

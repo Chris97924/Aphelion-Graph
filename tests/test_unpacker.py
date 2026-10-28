@@ -2198,7 +2198,7 @@ def test_ordinary_archives_are_read_in_full(
 ) -> None:
     """All platforms: archives tarfile writes in each format and compression,
     with directories, an empty file, nested and non-ASCII names, long names
-    (pax and GNU) and a global pax header such as git archive writes (pax),
+    (pax and GNU) and a global pax header with a comment record (pax),
     unpack in full; every pass hands tarfile at most the archive's bytes."""
     from aphelion.unpacker import check_member_names, extract_signatures_jsonl
 
@@ -3651,10 +3651,12 @@ def test_short_name_of_a_hard_linked_file_in_dest_is_refused_before_anything_mov
 def test_existing_entries_are_refused_where_the_filesystem_reports_no_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """All platforms (simulated): where the filesystem reports inode number 0,
-    whether two members reach one entry in dest cannot be checked, so an
-    unpack that would replace or merge into an existing entry fails closed;
-    one that only adds new entries still works."""
+    """All platforms (simulated): os.lstat reports inode number 0 for the
+    entries in dest, but not for staging, so whether two members reach one
+    entry in dest cannot be checked. Adding a new top-level file still
+    works; replacing an existing file fails closed, and dest is left as it
+    was. (Where os.stat reports inode number 0 too, an unpack into an
+    existing dest fails earlier, with FileExistsError, in more cases.)"""
     dest = tmp_path / "dest"
     dest.mkdir()
     (dest / "keep.md").write_bytes(b"keep")
@@ -4097,7 +4099,7 @@ def test_merge_moves_only_what_is_a_regular_file_right_before_the_move(
     monkeypatch.setattr(secrets, "token_hex", lambda nbytes: "00" * nbytes)
     archive, dest, before = _merge_archive(tmp_path)
     staging = dest.resolve() / STAGING_NAME
-    victim = dest.resolve() / "z.md" if changed == "file-in-dest" else staging / "z.md"
+    entry = dest.resolve() / "z.md" if changed == "file-in-dest" else staging / "z.md"
     changes: list[str] = []
     real_lstat, real_scandir = os.lstat, os.scandir
 
@@ -4108,11 +4110,11 @@ def test_merge_moves_only_what_is_a_regular_file_right_before_the_move(
         return frame is not None
 
     def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
-        if not changes and Path(os.fspath(path)) == victim and moving():
+        if not changes and Path(os.fspath(path)) == entry and moving():
             changes.append(os.fspath(path))
-            victim.unlink()
-            victim.mkdir()
-            (victim / "precious.md").write_bytes(b"precious")
+            entry.unlink()
+            entry.mkdir()
+            (entry / "precious.md").write_bytes(b"precious")
         return real_lstat(path, *args, **kwargs)
 
     def scandir(path: object = ".") -> object:
@@ -4168,17 +4170,17 @@ def test_entry_wrongly_found_absent_is_never_replaced(
     (winerror 53) is no "not found" at all, and fails the call."""
     archive, dest, _ = _merge_archive(tmp_path)
     if found_absent == "file":
-        victim = dest / "z.md"  # after a.md was replaced, so that is undone too
+        entry = dest / "z.md"  # after a.md was replaced, so that is undone too
     elif found_absent == "directory":
-        victim = dest / "new"
-        victim.mkdir()
-        (victim / "old.md").write_bytes(b"old")
+        entry = dest / "new"
+        entry.mkdir()
+        (entry / "old.md").write_bytes(b"old")
     else:
         shutil.rmtree(dest)
         dest.write_bytes(b"a file of the user's")
-        victim = dest
+        entry = dest
     before = dest.read_bytes() if dest.is_file() else _tree(dest)
-    want = os.path.normcase(os.path.abspath(victim.resolve()))
+    want = os.path.normcase(os.path.abspath(entry.resolve()))
     real_lstat = os.lstat
 
     def lstat(path: str, *args: object, **kwargs: object) -> os.stat_result:
@@ -4779,7 +4781,7 @@ def test_unpack_refuses_a_junction_to_a_drive_root_as_destination(tmp_path: Path
 
 
 NON_PORTABLE_NAMES = [
-    "old.txt:evil",  # NTFS alternate data stream
+    "old.txt:stream",  # NTFS alternate data stream
     "a<b", "a>b", 'a"b', "a|b", "a?b", "a*b",
     "a\x01b", "a\x1fb",
     "CON", "con.txt", "Nul.tar.gz", "AUX", "PRN", "COM1", "com9.md", "LPT1", "lpt9",
@@ -4890,7 +4892,7 @@ def test_names_differing_by_a_trailing_dot_or_space_are_two_files_elsewhere(
 def test_stream_name_does_not_replace_an_existing_file(tmp_path: Path) -> None:
     """Windows only: a member named like a stream of an existing file is
     refused, and the file keeps its content."""
-    archive = _write_tar(tmp_path / "a.tar", [(_reg("old.txt:evil"), b"x")])
+    archive = _write_tar(tmp_path / "a.tar", [(_reg("old.txt:stream"), b"x")])
     dest = tmp_path / "dest"
     dest.mkdir()
     (dest / "old.txt").write_bytes(b"old")

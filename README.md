@@ -123,14 +123,24 @@ Budget flags (conservative defaults):
 
 Post-unpack semantic cross-reference:
 
-1. Every manifest claim hash matches the actual claim file bytes
-   (`PX_E_5001` / `HASH_MISMATCH`).
-2. Archive file set matches the manifest exactly
+1. Every `claim_instance_id` and every `event_id` is used once
+   (`PX_E_4011` / `DUPLICATE_CLAIM_INSTANCE_ID`,
+   `PX_E_4012` / `DUPLICATE_EVENT_ID`).
+2. Each claim's file is `claims/<claim_id>.md`
    (`PX_E_5002` / `FILESET_DIVERGENCE`).
-3. Provenance events form a valid chain per claim
+3. Every manifest claim hash matches the actual claim file bytes
+   (`PX_E_5001` / `HASH_MISMATCH`).
+4. Archive file set matches the manifest exactly
+   (`PX_E_5002` / `FILESET_DIVERGENCE`).
+5. Provenance events form a valid chain per claim
    (`PX_E_5003` / `CHAIN_BROKEN`).
-4. Every event references a known claim
+6. Every event references a known claim
    (`PX_E_5004` / `DANGLING_REFERENCE`).
+7. Each event's `target_claim_instance_id` is the instance in force at
+   that event, and each manifest `claim_instance_id` was emitted by its
+   claim's provenance (`PX_E_5004` / `DANGLING_REFERENCE`).
+8. Each manifest state matches the claim's last provenance event
+   (`PX_E_5005` / `MANIFEST_STATE_MISMATCH`).
 
 ```bash
 aphelion verify UNPACKED_DIR/

@@ -119,7 +119,7 @@ def _b64decode_strict(value: object, *, code: str, label: str) -> bytes:
     ``validate=True``: the default decoder silently drops characters outside
     the alphabet, so a key or signature with trailing junk would still decode
     to the genuine bytes. Non-``str`` input (a JSON number, list or null from
-    a crafted file) is rejected here instead of surfacing as ``TypeError``.
+    a malformed file) is rejected here instead of surfacing as ``TypeError``.
     """
     if not isinstance(value, str):
         raise SignerVerificationError(
