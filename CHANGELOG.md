@@ -1,10 +1,6 @@
 # Changelog
 
-## [Unreleased]
-
-Everything below has landed on `main` since the 0.6.0 release. No version has
-been bumped: the release number is a maintainer decision, and this section is
-the record of what a bump would carry.
+## [0.7.0] — 2026-10-29
 
 ### Added
 
