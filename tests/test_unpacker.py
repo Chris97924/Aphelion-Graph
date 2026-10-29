@@ -707,6 +707,19 @@ def _entries(archive: Path, dest: Path, policy: ExtractPolicy) -> dict[str, Call
 
 
 MIB = 1024 * 1024
+# What the reader raises at the first read that finds the end of an archive
+# before the end of a member's data, padded to a whole block.
+CUT_SHORT = "the archive ends before the end of a member's data, padded to a whole block"
+
+
+def _cut_in_the_data() -> bytes:
+    """A 1 MiB member with 4,096 bytes of its data in the archive."""
+    return _raw_header(b"cut.bin", MIB) + bytes(4096)
+
+
+def _cut_by_less_than_a_block() -> bytes:
+    """A 1,000-byte signatures.jsonl with 512 bytes of its data in the archive."""
+    return _raw_header(b"signatures.jsonl", 1000) + bytes(512)
 
 
 def _bounded_cases() -> list:
@@ -790,11 +803,11 @@ def _bounded_cases() -> list:
             id="pax-size-under-the-header",
         ),
         pytest.param(
-            lambda: _raw_header(b"cut.bin", MIB) + bytes(4096), "tar", lax,
+            _cut_in_the_data, "tar", lax,
             "ReadError", 512 + 4096, policy_bound, id="cut-short-in-the-data",
         ),
         pytest.param(
-            lambda: _raw_header(b"signatures.jsonl", 1000) + bytes(512), "tar", None,
+            _cut_by_less_than_a_block, "tar", None,
             "ReadError", 1024, every, id="cut-short-by-less-than-a-block",
         ),
         pytest.param(
@@ -890,6 +903,61 @@ def test_an_archive_whose_last_member_ends_where_the_archive_ends_is_read(
             assert reader.handed == len(raw), (entry, reader.handed)
             assert reader._eof_reads == eof_reads, (entry, reader._eof_reads)
     assert (tmp_path / "dest" / "a.md").read_bytes()[:1] == b"a"
+
+
+@pytest.mark.parametrize(
+    "build, policy, entries",
+    [
+        pytest.param(
+            _cut_in_the_data, ExtractPolicy(max_compression_ratio=10_000),
+            ("unpack", "check_member_names"), id="cut-short-in-the-data",
+        ),
+        pytest.param(
+            _cut_by_less_than_a_block, None,
+            ("unpack", "check_member_names", "extract_signatures_jsonl", "extract_signer_manifests"),
+            id="cut-short-by-less-than-a-block",
+        ),
+    ],
+)
+def test_an_archive_that_ends_inside_a_members_data_fails_at_the_first_read_past_its_end(
+    tmp_path: Path,
+    passes: list,
+    build: Callable[[], bytes],
+    policy: ExtractPolicy | None,
+    entries: tuple[str, ...],
+) -> None:
+    """All platforms and Python versions: an archive that ends before the
+    end of a member's data, padded to a whole block, fails with the
+    reader's own tarfile.ReadError at the first read that finds the end of
+    the archive, whatever this release's tarfile does at the end of a
+    stream: the one pass made finds the end once."""
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(build())
+    calls = _entries(archive, tmp_path / "dest", policy or ExtractPolicy.default())
+    for entry in entries:
+        passes.clear()
+        with pytest.raises(tarfile.ReadError) as exc:
+            calls[entry]()
+        assert str(exc.value) == CUT_SHORT, entry
+        assert [reader._eof_reads for reader in passes] == [1], entry
+
+
+def test_reading_on_past_the_end_of_the_archive_more_than_8_times_is_refused() -> None:
+    """All platforms: once the reader has handed out the whole archive, 8
+    reads that find its end return nothing, and the next one is refused
+    (PX_E_6013) without handing out anything."""
+    from aphelion.unpacker import _MAX_EOF_READS, _ForwardReader
+
+    assert _MAX_EOF_READS == 8
+    reader = _ForwardReader(io.BytesIO(b"x" * 10), 4096)
+    assert reader.read(100) == b"x" * 10
+    for _ in range(_MAX_EOF_READS):
+        assert reader.read(100) == b""
+    with pytest.raises(SecurityError) as exc:
+        reader.read(100)
+    assert exc.value.code == ErrorCode.ARCHIVE_BOMB
+    assert exc.value.msg == "reading goes on past the end of the archive more than 8 times"
+    assert (reader.handed, reader._eof_reads) == (10, 9)
 
 
 def test_xz_archive_needing_more_decoder_memory_than_the_limit_is_refused(

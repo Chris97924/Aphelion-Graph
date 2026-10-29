@@ -158,7 +158,8 @@ the record of what a bump would carry.
   another byte is handed out. An archive that ends before the end of a
   member's data, padded to a whole 512-byte block (inside the data or the
   padding after it), fails with `tarfile.ReadError` at the first read that
-  finds its end, whatever is missing, on every Python release; for a
+  finds its end, whatever is missing (unless its declared sizes are
+  refused first), on every Python release; for a
   compressed archive, this is when its decompressed content ends there.
   So one pass hands `tarfile` at most
   `max_total_bytes` plus H + 511 bytes per `max_files` member plus H +

@@ -333,7 +333,8 @@ class _ForwardReader:
                 )
             if self._eof_reads > _MAX_EOF_READS:
                 raise _archive_bomb(
-                    "the archive ends before the data its headers declare"
+                    "reading goes on past the end of the archive more than "
+                    f"{_MAX_EOF_READS} times"
                 )
             return b""
         start = self.handed
