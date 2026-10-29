@@ -155,9 +155,11 @@ the record of what a bump would carry.
   character, and a member whose header blocks then take more than H is
   refused (`PX_E_6013`) too. Asking for more, or
   reading on after reaching the end of the archive 8 times, fails before
-  another byte is handed out. An archive that ends before the end of the
-  data a member's header declares fails (`PX_E_6013`) at the first read
-  that finds its end, however much is missing, on every Python release.
+  another byte is handed out. An archive that ends before the end of a
+  member's data, padded to a whole 512-byte block (inside the data or the
+  padding after it), fails with `tarfile.ReadError` at the first read that
+  finds its end, whatever is missing, on every Python release; for a
+  compressed archive, this is when its decompressed content ends there.
   So one pass hands `tarfile` at most
   `max_total_bytes` plus H + 511 bytes per `max_files` member plus H +
   1,024 bytes: 150,932,720 bytes at the default policy. A decompressing
@@ -274,7 +276,9 @@ the record of what a bump would carry.
   what the decompressor raises for a compressed archive that is damaged or
   cut short (`EOFError`, gzip's `BadGzipFile`, `zlib.error`,
   `lzma.LZMAError`, zstd's `ZstdError`, and the `OSError` without an
-  errno that the bz2 module raises for invalid data). An operating-system
+  errno that the bz2 module raises for invalid data). So is an archive, or
+  the content of a compressed one, that ends inside a member's data or the
+  padding after it (above). An operating-system
   error reading the archive file (an `OSError` with an errno) is raised
   unchanged, whatever the compression. The refusals above keep their
   codes. The command line reports `tarfile.ReadError`, like any error
