@@ -707,6 +707,19 @@ def _entries(archive: Path, dest: Path, policy: ExtractPolicy) -> dict[str, Call
 
 
 MIB = 1024 * 1024
+# What the reader raises at the first read that finds the end of an archive
+# before the end of a member's data, padded to a whole block.
+CUT_SHORT = "the archive ends before the end of a member's data, padded to a whole block"
+
+
+def _cut_in_the_data() -> bytes:
+    """A 1 MiB member with 4,096 bytes of its data in the archive."""
+    return _raw_header(b"cut.bin", MIB) + bytes(4096)
+
+
+def _cut_by_less_than_a_block() -> bytes:
+    """A 1,000-byte signatures.jsonl with 512 bytes of its data in the archive."""
+    return _raw_header(b"signatures.jsonl", 1000) + bytes(512)
 
 
 def _bounded_cases() -> list:
@@ -790,8 +803,12 @@ def _bounded_cases() -> list:
             id="pax-size-under-the-header",
         ),
         pytest.param(
-            lambda: _raw_header(b"cut.bin", MIB) + bytes(4096), "tar", lax,
-            ErrorCode.ARCHIVE_BOMB, 512 + 4096, policy_bound, id="cut-short-in-the-data",
+            _cut_in_the_data, "tar", lax,
+            "ReadError", 512 + 4096, policy_bound, id="cut-short-in-the-data",
+        ),
+        pytest.param(
+            _cut_by_less_than_a_block, "tar", None,
+            "ReadError", 1024, every, id="cut-short-by-less-than-a-block",
         ),
         pytest.param(
             lambda: _raw_header(b"a.bin", 25 * MIB) + bytes(512), "tar", None,
@@ -833,6 +850,114 @@ def test_a_pass_over_an_archive_hands_tarfile_a_bounded_number_of_bytes(
             assert reader.handed <= limit, (entry, reader.handed)
             assert reader._eof_reads <= 9, (entry, reader._eof_reads)
     assert sorted(p.name for p in tmp_path.iterdir()) == [archive.name]
+
+
+def _ends_at_the_end_cases() -> list:
+    """(build, format, reads that find the end of the archive per pass) per case."""
+    cases = [
+        ("member-ending-on-a-block-no-end-blocks", lambda: _file(b"a.md", b"a" * 512), 2),
+        ("padded-member-no-end-blocks", lambda: _file(b"a.md", b"a" * 1000), 2),
+        ("one-end-block-only", lambda: _file(b"a.md", b"a") + bytes(512), 1),
+    ]
+    return [
+        *[
+            pytest.param(build, fmt, eof_reads, id=f"{name}-{fmt}")
+            for fmt in ("tar", "gz")
+            for name, build, eof_reads in cases
+        ],
+        pytest.param(
+            lambda: _file(b"a.md", b"a") + _raw_header(b"b.md", 0), "tar", 2,
+            id="empty-last-member-no-end-blocks-tar",
+        ),
+        pytest.param(
+            lambda: _file(b"a.md", b"a") + _raw_header(b"d/", 0, b"5"), "tar", 2,
+            id="directory-last-no-end-blocks-tar",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("build, fmt, eof_reads", _ends_at_the_end_cases())
+def test_an_archive_whose_last_member_ends_where_the_archive_ends_is_read(
+    tmp_path: Path,
+    passes: list,
+    build: Callable[[], bytes],
+    fmt: str,
+    eof_reads: int,
+) -> None:
+    """All platforms and Python versions: an archive whose last member's
+    data, padded to a whole block, ends where the archive ends, with no
+    end-of-archive block or only one, is read by every entry point. Each
+    pass hands tarfile the whole archive and nothing more, and finds the
+    end of the archive ``eof_reads`` times: when tarfile looks for another
+    header (only with no end block), and when the bytes after the last
+    member are checked."""
+    raw = build()
+    archive = tmp_path / f"a.tar.{fmt}"
+    archive.write_bytes(_compress(raw, fmt))
+    calls = _entries(archive, tmp_path / "dest", ExtractPolicy.default())
+    for entry, call in calls.items():
+        passes.clear()
+        assert _outcome(call) == "ok", entry
+        assert passes, entry
+        for reader in passes:
+            assert reader.handed == len(raw), (entry, reader.handed)
+            assert reader._eof_reads == eof_reads, (entry, reader._eof_reads)
+    assert (tmp_path / "dest" / "a.md").read_bytes()[:1] == b"a"
+
+
+@pytest.mark.parametrize(
+    "build, policy, entries",
+    [
+        pytest.param(
+            _cut_in_the_data, ExtractPolicy(max_compression_ratio=10_000),
+            ("unpack", "check_member_names"), id="cut-short-in-the-data",
+        ),
+        pytest.param(
+            _cut_by_less_than_a_block, None,
+            ("unpack", "check_member_names", "extract_signatures_jsonl", "extract_signer_manifests"),
+            id="cut-short-by-less-than-a-block",
+        ),
+    ],
+)
+def test_an_archive_that_ends_inside_a_members_data_fails_at_the_first_read_past_its_end(
+    tmp_path: Path,
+    passes: list,
+    build: Callable[[], bytes],
+    policy: ExtractPolicy | None,
+    entries: tuple[str, ...],
+) -> None:
+    """All platforms and Python versions: an archive that ends before the
+    end of a member's data, padded to a whole block, fails with the
+    reader's own tarfile.ReadError at the first read that finds the end of
+    the archive, whatever this release's tarfile does at the end of a
+    stream: the one pass made finds the end once."""
+    archive = tmp_path / "a.tar"
+    archive.write_bytes(build())
+    calls = _entries(archive, tmp_path / "dest", policy or ExtractPolicy.default())
+    for entry in entries:
+        passes.clear()
+        with pytest.raises(tarfile.ReadError) as exc:
+            calls[entry]()
+        assert str(exc.value) == CUT_SHORT, entry
+        assert [reader._eof_reads for reader in passes] == [1], entry
+
+
+def test_reading_on_past_the_end_of_the_archive_more_than_8_times_is_refused() -> None:
+    """All platforms: once the reader has handed out the whole archive, 8
+    reads that find its end return nothing, and the next one is refused
+    (PX_E_6013) without handing out anything."""
+    from aphelion.unpacker import _MAX_EOF_READS, _ForwardReader
+
+    assert _MAX_EOF_READS == 8
+    reader = _ForwardReader(io.BytesIO(b"x" * 10), 4096)
+    assert reader.read(100) == b"x" * 10
+    for _ in range(_MAX_EOF_READS):
+        assert reader.read(100) == b""
+    with pytest.raises(SecurityError) as exc:
+        reader.read(100)
+    assert exc.value.code == ErrorCode.ARCHIVE_BOMB
+    assert exc.value.msg == "reading goes on past the end of the archive more than 8 times"
+    assert (reader.handed, reader._eof_reads) == (10, 9)
 
 
 def test_xz_archive_needing_more_decoder_memory_than_the_limit_is_refused(
