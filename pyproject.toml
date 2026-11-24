@@ -25,6 +25,16 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
+# -ra: the summary lists every skipped, xfailed and xpassed test with its reason, so a
+# skip no longer hides as one "s" in the progress line.
+# Strict markers are set twice on purpose. dev only says pytest>=7.0 and CI installs
+# whatever is newest, and no single spelling covers every release: pytest 7 and 8 have
+# no `strict_markers` ini key (unknown-option warning, not enforced), and 9.0.x ignores
+# --strict-markers when it comes from addopts. 9.1 and 9.2 honour both.
+addopts = ["-ra", "--strict-markers"]
+strict_markers = true
+# An xfail test that starts passing fails the run instead of reporting XPASS.
+xfail_strict = true
 markers = [
     "unit: fast unit tests with no I/O",
     "integration: tests that require external resources",
